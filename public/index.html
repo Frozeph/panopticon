@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PANOPTICON // GLOBAL INTELLIGENCE SYSTEM</title>
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
+  <link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="scanlines"></div>
+  <div id="vignette"></div>
+  <div id="noise-overlay"></div>
+  <div id="cesiumContainer"></div>
+
+  <!-- TOP BAR -->
+  <div id="topbar">
+    <div class="tb-left">
+      <span class="sys-label">PANOPTICON</span>
+      <span class="sys-sublabel">GLOBAL INTELLIGENCE SYSTEM // v2.0</span>
+    </div>
+    <div class="tb-center">
+      <div class="status-row">
+        <span class="status-dot active"></span>
+        <span class="status-text">UPLINK ACTIVE</span>
+        <span class="divider">|</span>
+        <span id="clock"></span>
+        <span class="divider">|</span>
+        <span id="utc-clock"></span> UTC
+      </div>
+      <div class="threat-row"><span class="threat-label">THREAT LEVEL: </span><span class="threat-val">GUARDED</span></div>
+    </div>
+    <div class="tb-right">
+      <div class="coord-display">
+        <span class="coord-label">LAT</span><span id="lat-display">---.---</span>
+        <span class="coord-label">LON</span><span id="lon-display">---.---</span>
+        <span class="coord-label">ALT</span><span id="alt-display">---</span><span class="coord-unit">km</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- LEFT PANEL (tabbed) -->
+  <div id="left-panel">
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="layers">LAYERS</button>
+      <button class="tab-btn" data-tab="shodan">SHODAN</button>
+      <button class="tab-btn" data-tab="playback">PLAYBACK</button>
+    </div>
+
+    <!-- TAB: LAYERS -->
+    <div class="tab-pane" id="tab-layers">
+      <div class="panel-header">DATA LAYERS</div>
+
+      <div class="layer-group">
+        <div class="layer-group-title">// ORBITAL</div>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-satellites" checked>
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">SATELLITES</span>
+          <span class="layer-count" id="sat-count">0</span>
+        </label>
+      </div>
+
+      <div class="layer-group">
+        <div class="layer-group-title">// AVIATION</div>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-flights">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">COMMERCIAL</span>
+          <span class="layer-count" id="flight-count">0</span>
+        </label>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-military">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">MILITARY</span>
+          <span class="layer-count" id="mil-count">0</span>
+        </label>
+        <div id="filter-stats" class="filter-stats-mini"></div>
+        <button class="mini-btn" onclick="document.getElementById('filter-panel').classList.toggle('hidden')">⚙ FLIGHT FILTERS [F]</button>
+      </div>
+
+      <div class="layer-group">
+        <div class="layer-group-title">// GROUND</div>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-traffic">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">STREET TRAFFIC</span>
+          <span class="layer-count" id="traffic-count">0</span>
+        </label>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-quakes">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">SEISMIC</span>
+          <span class="layer-count" id="quake-count">0</span>
+        </label>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-shodan">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">SHODAN DEVICES</span>
+          <span class="layer-count" id="shodan-count">0</span>
+        </label>
+      </div>
+
+      <div class="panel-section-gap"></div>
+      <div class="panel-header">DETECTION MODE</div>
+      <div class="detection-mode-group">
+        <button class="det-btn active" data-mode="sparse">SPARSE</button>
+        <button class="det-btn" data-mode="full">FULL</button>
+      </div>
+
+      <div class="panel-section-gap"></div>
+      <div class="panel-header">TRACKING</div>
+      <div id="tracking-info"><div class="no-track">NO TARGET LOCKED</div></div>
+      <button id="clear-track-btn" style="display:none">RELEASE TARGET</button>
+    </div>
+
+    <!-- TAB: SHODAN -->
+    <div class="tab-pane hidden" id="tab-shodan">
+      <div class="panel-header">SHODAN INTELLIGENCE</div>
+
+      <!-- API Key prompt -->
+      <div id="shodan-key-prompt" style="display:none; margin-bottom:10px">
+        <div class="shodan-warn">⚠ API KEY REQUIRED</div>
+        <input type="password" id="shodan-key-input" class="text-input" placeholder="Enter Shodan API key...">
+        <button id="shodan-save-key-btn" class="action-btn" style="width:100%;margin-top:4px">SAVE KEY</button>
+      </div>
+
+      <div class="panel-header" style="margin-top:4px">PRESET QUERIES</div>
+      <select id="shodan-preset-select" class="text-select">
+        <option value="">— Select preset —</option>
+      </select>
+
+      <div class="panel-header" style="margin-top:8px">CUSTOM QUERY</div>
+      <input type="text" id="shodan-query-input" class="text-input" placeholder='e.g. port:8080 country:GB'>
+      <button id="shodan-search-btn" class="action-btn" style="width:100%;margin-top:4px">▶ EXECUTE SCAN</button>
+      <div id="shodan-result-count" class="result-count"></div>
+
+      <div class="panel-section-gap"></div>
+      <div class="panel-header">
+        API CREDIT USAGE
+        <button id="shodan-credit-refresh" class="inline-btn">↺</button>
+      </div>
+      <div id="shodan-credit-display" class="credit-display">
+        <span style="color:var(--text-muted);font-size:9px">Loading...</span>
+      </div>
+
+      <div class="panel-section-gap"></div>
+      <div class="shodan-note">
+        ⚡ Results cached 1hr. Each search = 1 query credit. Key stored in browser.
+      </div>
+    </div>
+
+    <!-- TAB: PLAYBACK -->
+    <div class="tab-pane hidden" id="tab-playback">
+      <div class="panel-header">TIME MACHINE</div>
+
+      <div class="pb-status-row">
+        <span class="pb-label">STATUS</span>
+        <span id="playback-status" class="pb-val">NOT INITIALISED</span>
+      </div>
+      <div class="pb-status-row">
+        <span class="pb-label">CURRENT</span>
+        <span id="playback-time" class="pb-val">—</span>
+      </div>
+
+      <button id="pb-init-btn" class="action-btn" style="width:100%;margin-top:6px">⟳ LOAD TIMELINE</button>
+
+      <div class="panel-section-gap"></div>
+      <div class="panel-header">TIMELINE</div>
+      <canvas id="timeline-canvas" width="196" height="50" style="width:100%;cursor:crosshair;display:block;border:1px solid var(--panel-border)"></canvas>
+      <input type="range" id="pb-scrubber" min="0" max="100" value="100" step="0.1" style="width:100%;margin-top:4px">
+
+      <div class="pb-controls">
+        <button id="pb-play-btn" class="action-btn">▶ PLAY</button>
+        <select id="pb-speed" class="text-select" style="flex:1">
+          <option value="1">1× SPEED</option>
+          <option value="4">4× SPEED</option>
+          <option value="12">12× SPEED</option>
+          <option value="60">60× SPEED</option>
+          <option value="360">360× SPEED</option>
+        </select>
+      </div>
+
+      <div class="panel-section-gap"></div>
+      <div class="panel-header">
+        STORAGE STATS
+        <button id="storage-refresh-btn" class="inline-btn">↺</button>
+      </div>
+      <div id="storage-stats" class="storage-stats">Loading...</div>
+      <div class="storage-note">7-day retention · Delta compressed · Auto-prune</div>
+    </div>
+  </div>
+
+  <!-- RIGHT PANEL -->
+  <div id="right-panel">
+    <div class="panel-header">VISION MODE</div>
+    <div class="vision-modes">
+      <button class="vision-btn active" data-mode="normal"><span class="vkey">1</span>STANDARD</button>
+      <button class="vision-btn" data-mode="crt"><span class="vkey">2</span>CRT</button>
+      <button class="vision-btn" data-mode="nvg"><span class="vkey">3</span>NVG</button>
+      <button class="vision-btn" data-mode="flir"><span class="vkey">4</span>FLIR</button>
+      <button class="vision-btn" data-mode="radar"><span class="vkey">5</span>RADAR</button>
+    </div>
+
+    <div class="panel-section-gap"></div>
+    <div class="panel-header">POST-PROCESSING</div>
+    <div class="slider-group"><label>SCANLINES<span id="scanline-val">60</span>%</label><input type="range" id="scanline-intensity" min="0" max="100" value="60"></div>
+    <div class="slider-group"><label>BLOOM<span id="bloom-val">40</span>%</label><input type="range" id="bloom-intensity" min="0" max="100" value="40"></div>
+    <div class="slider-group"><label>NOISE<span id="noise-val">20</span>%</label><input type="range" id="noise-intensity" min="0" max="100" value="20"></div>
+    <div class="slider-group"><label>VIGNETTE<span id="vignette-val">50</span>%</label><input type="range" id="vignette-intensity" min="0" max="100" value="50"></div>
+
+    <div class="panel-section-gap"></div>
+    <div class="panel-header">CAMERA PRESETS</div>
+    <div class="preset-grid">
+      <button class="preset-btn" data-preset="global">GLOBAL</button>
+      <button class="preset-btn" data-preset="london">LONDON</button>
+      <button class="preset-btn" data-preset="nyc">NEW YORK</button>
+      <button class="preset-btn" data-preset="dc">WASHINGTON</button>
+      <button class="preset-btn" data-preset="moscow">MOSCOW</button>
+      <button class="preset-btn" data-preset="beijing">BEIJING</button>
+      <button class="preset-btn" data-preset="dubai">DUBAI</button>
+      <button class="preset-btn" data-preset="sydney">SYDNEY</button>
+    </div>
+  </div>
+
+  <!-- FLIGHT FILTER PANEL (floating) -->
+  <div id="filter-panel" class="floating-panel hidden">
+    <div class="fp-header">
+      <span>✈ FLIGHT FILTERS</span>
+      <button onclick="document.getElementById('filter-panel').classList.add('hidden')" class="fp-close">✕</button>
+    </div>
+    <div class="fp-grid">
+      <div class="fp-group">
+        <label>MIN ALT (m)</label>
+        <input type="number" id="f-min-alt" class="text-input" value="0" min="0" max="45000">
+      </div>
+      <div class="fp-group">
+        <label>MAX ALT (m)</label>
+        <input type="number" id="f-max-alt" class="text-input" value="45000" min="0" max="45000">
+      </div>
+      <div class="fp-group">
+        <label>MIN SPEED (m/s)</label>
+        <input type="number" id="f-min-spd" class="text-input" value="0" min="0" max="1200">
+      </div>
+      <div class="fp-group">
+        <label>MAX SPEED (m/s)</label>
+        <input type="number" id="f-max-spd" class="text-input" value="1200" min="0" max="1200">
+      </div>
+      <div class="fp-group" style="grid-column:span 2">
+        <label>COUNTRY CODE (e.g. GB, US, DE)</label>
+        <input type="text" id="f-country" class="text-input" placeholder="All countries">
+      </div>
+      <div class="fp-group" style="grid-column:span 2">
+        <label>CALLSIGN CONTAINS</label>
+        <input type="text" id="f-callsign" class="text-input" placeholder="e.g. BAW, UNITED">
+      </div>
+      <div class="fp-group" style="grid-column:span 2">
+        <label class="layer-toggle" style="padding:0">
+          <input type="checkbox" id="f-show-unknown" checked>
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span style="margin-left:6px">SHOW UNKNOWN CALLSIGNS</span>
+        </label>
+      </div>
+    </div>
+    <div class="fp-actions">
+      <button id="filter-apply-btn" class="action-btn">APPLY</button>
+      <button id="filter-reset-btn" class="action-btn action-btn-dim">RESET</button>
+    </div>
+  </div>
+
+  <!-- BOTTOM BAR -->
+  <div id="bottombar">
+    <div class="log-strip" id="event-log">
+      <span class="log-label">EVT //</span>
+      <span class="log-item">SYSTEM INITIALISED</span>
+    </div>
+    <div class="bb-right">
+      <span class="data-source">CELESTRAK · OPENSKY · USGS · OSM · SHODAN</span>
+    </div>
+  </div>
+
+  <!-- TOKEN MODAL -->
+  <div id="token-modal" class="modal-overlay">
+    <div class="modal-box">
+      <div class="modal-title">⚡ PANOPTICON INITIALISATION</div>
+      <div class="modal-subtitle">Enter your Cesium Ion Access Token to enable photorealistic 3D tiles.</div>
+      <div class="modal-hint">Free token at <strong>ion.cesium.com</strong> → Access Tokens</div>
+      <input type="text" id="cesium-token-input" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6Ikp..." spellcheck="false">
+      <div class="modal-actions">
+        <button id="token-submit-btn">INITIALISE SYSTEM</button>
+        <button id="token-skip-btn" class="skip-btn">USE DEFAULT (LIMITED)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- DETAIL PANEL -->
+  <div id="detail-panel" class="hidden">
+    <div class="dp-header">
+      <span id="dp-type-badge">UNK</span>
+      <span id="dp-title">TARGET DETAILS</span>
+      <button id="dp-close">✕</button>
+    </div>
+    <div id="dp-content"></div>
+    <button id="dp-track-btn">🎯 LOCK TRACK</button>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

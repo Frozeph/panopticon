@@ -1,0 +1,98 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# PANOPTICON // ZimaOS Dashboard Install
+#
+# PASTE THIS INTO: ZimaOS Dashboard → [+] → Install customized app
+#                  → Import → Docker Compose tab → Submit
+#
+# ⚠️  BEFORE PASTING: replace YOUR_GITHUB_USERNAME below with your actual
+#     GitHub username (the one that owns the repo you pushed to).
+#     e.g. if your repo is github.com/alice/panopticon, use: alice
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: panopticon
+
+services:
+  panopticon:
+    image: ghcr.io/YOUR_GITHUB_USERNAME/panopticon:latest
+    container_name: panopticon
+    restart: unless-stopped
+
+    ports:
+      - target: 3000
+        published: "3000"
+        protocol: tcp
+
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATA_DIR=/app/data
+      # Optional: paste your Shodan API key here (or enter it in the UI later)
+      - SHODAN_API_KEY=
+
+    volumes:
+      - type: bind
+        source: /DATA/AppData/panopticon/data
+        target: /app/data
+
+    cpu_shares: 90
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    security_opt:
+      - no-new-privileges=true
+    privileged: false
+    cap_drop:
+      - ALL
+    cap_add: []
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    network_mode: bridge
+    devices: []
+
+    labels:
+      icon: https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f30d.svg
+
+x-casaos:
+  author: self
+  category: Network
+  hostname: ""
+  icon: https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f30d.svg
+  index: /
+  is_uncontrolled: false
+  port_map: "3000"
+  scheme: http
+  store_app_id: panopticon
+  title:
+    custom: PANOPTICON
+    en_us: Panopticon — Global Intelligence Dashboard
+  description:
+    en_us: >
+      Real-time 3D geospatial intelligence dashboard. Live satellite tracking,
+      commercial & military flights, seismic activity, Shodan device overlay,
+      and 7-day playback. Powered by CesiumJS.
+  tips:
+    before_install:
+      en_us: |
+        You need a free Cesium Ion token to enable 3D globe tiles.
+        Get one at: https://ion.cesium.com → Access Tokens → Create token
+
+        A Shodan API key is optional — for the OSINT device overlay feature.
+        You can enter both in the dashboard UI after install.
+
+        Data stored at: /DATA/AppData/panopticon/data (~50–200 MB, 7-day history)
