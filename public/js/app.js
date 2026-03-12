@@ -96,10 +96,14 @@ function setupTokenModal() {
   input.addEventListener('keydown', e => { if (e.key==='Enter') document.getElementById('token-submit-btn').click(); });
 }
 
-function initCesium(token) {
+async function initCesium(token) {
   Cesium.Ion.defaultAccessToken = token;
+
+  // createWorldTerrainAsync replaces createWorldTerrain (removed in 1.107)
+  const terrainProvider = await Cesium.createWorldTerrainAsync().catch(() => undefined);
+
   S.viewer = new Cesium.Viewer('cesiumContainer', {
-    terrainProvider: Cesium.createWorldTerrain(),
+    terrainProvider,
     imageryProvider: false, baseLayerPicker: false,
     geocoder: false, homeButton: false, sceneModePicker: false,
     navigationHelpButton: false, animation: false, timeline: false,
@@ -110,13 +114,13 @@ function initCesium(token) {
   scene.globe.enableLighting = true;
   scene.globe.atmosphereLightIntensity = 10.0;
 
-  // Try Google 3D tiles
+  // Try Google Photorealistic 3D Tiles
   try {
-    const ts = S.viewer.scene.primitives.add(new Cesium.Cesium3DTileset({
-      url: Cesium.IonResource.fromAssetId(2275207),
+    const ts = await Cesium.Cesium3DTileset.fromIonAssetId(2275207, {
       maximumScreenSpaceError: 16,
-    }));
-    ts.readyPromise.then(() => addLog('GOOGLE 3D TILES ONLINE')).catch(() => loadFallback());
+    });
+    S.viewer.scene.primitives.add(ts);
+    addLog('GOOGLE 3D TILES ONLINE');
   } catch { loadFallback(); }
 
   S.viewer.camera.setView({ destination: Cesium.Cartesian3.fromDegrees(0, 20, 18000000),
@@ -128,9 +132,18 @@ function initCesium(token) {
   loadSatellites();
 }
 
-function loadFallback() {
-  S.viewer.imageryLayers.addImageryProvider(new Cesium.IonImageryProvider({ assetId: 3 }));
-  Cesium.createOsmBuildings().then(t => { S.viewer.scene.primitives.add(t); addLog('OSM BUILDINGS LOADED'); }).catch(()=>{});
+async function loadFallback() {
+  // IonImageryProvider.fromAssetId replaces constructor (removed in 1.104)
+  try {
+    const provider = await Cesium.IonImageryProvider.fromAssetId(3);
+    S.viewer.imageryLayers.addImageryProvider(provider);
+  } catch {}
+  // createOsmBuildingsAsync replaces createOsmBuildings (removed in 1.107)
+  try {
+    const osm = await Cesium.createOsmBuildingsAsync();
+    S.viewer.scene.primitives.add(osm);
+    addLog('OSM BUILDINGS LOADED');
+  } catch {}
   addLog('CESIUM WORLD IMAGERY');
 }
 
