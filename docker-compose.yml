@@ -1,11 +1,11 @@
 version: '3.9'
 
 services:
-  panopticon:
+  argus:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: panopticon
+    container_name: argus
     restart: unless-stopped
     ports:
       - "3000:3000"
@@ -17,7 +17,7 @@ services:
       - SHODAN_API_KEY=${SHODAN_API_KEY:-}
     volumes:
       # Persist database across container restarts / rebuilds
-      - panopticon_data:/app/data
+      - argus_data:/app/data
     deploy:
       resources:
         limits:
@@ -37,5 +37,5 @@ services:
         max-file: "3"
 
 volumes:
-  panopticon_data:
+  argus_data:
     driver: local

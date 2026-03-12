@@ -1,16 +1,38 @@
 /**
- * PANOPTICON // GLOBAL INTELLIGENCE SYSTEM v2
- * Real-time geospatial dashboard
+ * ARGUS // GLOBAL INTELLIGENCE SYSTEM v3
+ * All-seeing adaptive geospatial surveillance dashboard
+ * Zoom-adaptive LOD: global → regional → city → street
  */
 'use strict';
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-const CONFIG = {
-  satelliteUpdateInterval: 5000,
-  flightUpdateInterval: 15000,
-  quakeUpdateInterval: 60000,
-  trafficParticleCount: 500,
+// ─── LOD ZONES (camera altitude in metres) ────────────────────────────────
+// GLOBAL  > 5,000km : flights worldwide, satellites, quakes, GPS jam
+// REGIONAL 500-5,000km : + ships (bbox), weather grid, wildfires
+// CITY     50-500km  : + CCTV, roads, local weather stations, radio towers
+// STREET   < 50km    : + OSM full detail, individual weather points
+const LOD = {
+  GLOBAL:   5_000_000,
+  REGIONAL:   500_000,
+  CITY:        50_000,
 };
+
+const CONFIG = {
+  satelliteUpdateInterval:  5_000,
+  flightUpdateInterval:     8_000,
+  militaryUpdateInterval:  12_000,
+  shipUpdateInterval:      10_000,
+  quakeUpdateInterval:     60_000,
+  gpsjamUpdateInterval:   300_000,
+  weatherUpdateInterval:   60_000,
+  fireUpdateInterval:     120_000,
+  lodDebounce:              2_000,   // ms to wait after camera stops before re-fetching
+};
+
+// Current LOD level (updated on camera move)
+let currentLOD = 'GLOBAL';
+let lodDebounceTimer = null;
+let lastViewBbox = null;   // {minLat,maxLat,minLon,maxLon}
 
 const PRESETS = {
   global:  { lon:0,       lat:20,       alt:18000000, pitch:-90 },
@@ -24,14 +46,40 @@ const PRESETS = {
 };
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
+// ── SVG ICON FACTORIES ──────────────────────────────────────────────────────
+function planeIconSvg(color, isMil) {
+  const body = isMil
+    ? `<polygon points="12,2 15,10 22,10 17,15 19,22 12,17 5,22 7,15 2,10 9,10" fill="${color}"/>` // star-ish military
+    : `<path d="M12 2 L14 8 L22 11 L14 14 L12 22 L10 14 L2 11 L10 8 Z" fill="${color}"/>`;      // commercial diamond
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">${body}<circle cx="12" cy="11" r="2" fill="white" opacity="0.8"/></svg>`)}`;
+}
+
+function shipIconSvg(color) {
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18"><polygon points="12,2 20,18 12,14 4,18" fill="${color}" stroke="white" stroke-width="1"/></svg>`)}`;
+}
+
+function cctvIconSvg() {
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="12" r="10" fill="#ff6600" opacity="0.85"/><circle cx="12" cy="12" r="5" fill="white" opacity="0.5"/><circle cx="12" cy="12" r="2" fill="#ff6600"/></svg>`)}`;
+}
+
+function jamIconSvg(level) {
+  const c = level >= 3 ? '#ff0000' : level >= 2 ? '#ff8800' : '#ffff00';
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20"><circle cx="12" cy="12" r="10" fill="${c}" opacity="0.35"/><text x="12" y="17" text-anchor="middle" font-size="12" fill="${c}">⚡</text></svg>`)}`;
+}
+
 const S = {
   viewer: null,
   layers: {
     satellites: { on: true,  ds: null },
     flights:    { on: false, ds: null },
     military:   { on: false, ds: null },
-    traffic:    { on: false, ds: null, particles: [], interval: null },
+    ships:      { on: false, ds: null },
+    traffic:    { on: false, ds: null, polylines: null, interval: null },
     quakes:     { on: false, ds: null },
+    gpsjam:     { on: false, ds: null },
+    cctv:       { on: false, ds: null },
+    weather:    { on: false, ds: null },
+    wildfires:  { on: false, ds: null },
     shodan:     { on: false, ds: null, results: [] },
   },
   tleData: [],
@@ -403,80 +451,497 @@ function renderQuakes(features) {
 }
 
 // ─── STREET TRAFFIC ───────────────────────────────────────────────────────────
+// Road type → Google Maps style color + width
+const ROAD_STYLE = {
+  motorway:     { color: '#ff6666', width: 4.5 },
+  trunk:        { color: '#ff9933', width: 4.0 },
+  primary:      { color: '#ffcc00', width: 3.5 },
+  secondary:    { color: '#99cc33', width: 3.0 },
+  tertiary:     { color: '#aaaaaa', width: 2.0 },
+  residential:  { color: '#888888', width: 1.5 },
+  unclassified: { color: '#777777', width: 1.2 },
+};
+
 async function loadTraffic() {
   clearTraffic();
   const cam = S.viewer.camera.positionCartographic;
   const lat = Cesium.Math.toDegrees(cam.latitude);
   const lon = Cesium.Math.toDegrees(cam.longitude);
+  addLog('LOADING ROAD NETWORK...');
   try {
     const r = await fetch(`/api/osm/roads?lat=${lat}&lon=${lon}&radius=4000`);
     if (!r.ok) throw new Error();
     const data = await r.json();
-    spawnParticles(data.elements||[], lat, lon);
-  } catch { spawnDemoParticles(lat, lon); }
+    renderTrafficPolylines(data.elements||[], lat, lon);
+  } catch { renderTrafficPolylines([], lat, lon); }
 }
 
-function spawnParticles(roads, clat, clon) {
-  const segs = [];
-  for (const el of roads) {
-    if (el.type!=='way'||!el.geometry) continue;
-    for (let i=0;i<el.geometry.length-1;i++) segs.push([el.geometry[i],el.geometry[i+1]]);
-  }
-  if (!segs.length) { spawnDemoParticles(clat,clon); return; }
-  _buildParticles(segs);
-}
+function renderTrafficPolylines(elements, clat, clon) {
+  if (!S.viewer) return;
+  if (S.layers.traffic.polylines) S.viewer.scene.primitives.remove(S.layers.traffic.polylines);
 
-function spawnDemoParticles(clat, clon) {
-  const segs=[];
-  for(let i=-6;i<=6;i++){
-    segs.push([{lat:clat+i*0.003,lon:clon-0.025},{lat:clat+i*0.003,lon:clon+0.025}]);
-    segs.push([{lat:clat-0.025,lon:clon+i*0.003},{lat:clat+0.025,lon:clon+i*0.003}]);
-  }
-  _buildParticles(segs);
-}
+  // Use PolylineCollection for performance (thousands of road segments)
+  const collection = new Cesium.PolylineCollection();
+  let segCount = 0;
 
-function _buildParticles(segs) {
-  const ds = new Cesium.CustomDataSource('traffic');
-  const count = Math.min(CONFIG.trafficParticleCount, segs.length*2);
-  for(let i=0;i<count;i++){
-    const seg=segs[Math.floor(Math.random()*segs.length)];
-    const t=Math.random();
-    const e=ds.entities.add({
-      position: Cesium.Cartesian3.fromDegrees(
-        seg[0].lon+(seg[1].lon-seg[0].lon)*t,
-        seg[0].lat+(seg[1].lat-seg[0].lat)*t, 5),
-      point:{pixelSize:2, color:Cesium.Color.fromCssColorString('#ffff00').withAlpha(0.8),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND},
-      properties:{seg,t,spd:0.00015+Math.random()*0.0003,dir:Math.random()>0.5?1:-1},
+  for (const el of elements) {
+    if (el.type !== 'way' || !el.geometry || el.geometry.length < 2) continue;
+    const highway = el.tags?.highway || 'residential';
+    const style   = ROAD_STYLE[highway] || ROAD_STYLE.residential;
+    const color   = Cesium.Color.fromCssColorString(style.color).withAlpha(0.85);
+
+    // Build positions array
+    const positions = el.geometry.map(n => Cesium.Cartesian3.fromDegrees(n.lon, n.lat, 2));
+
+    collection.add({
+      positions,
+      width: style.width,
+      material: Cesium.Material.fromType('Color', { color }),
+      followSurface: true,
+      clampToGround: false,
     });
-    S.layers.traffic.particles.push(e);
+    segCount++;
   }
-  S.viewer.dataSources.add(ds);
-  S.layers.traffic.ds = ds;
-  document.getElementById('traffic-count').textContent = count;
-  addLog(`${count} TRAFFIC PARTICLES ACTIVE`);
-  S.layers.traffic.interval = setInterval(()=>_animParticles(segs), 100);
-}
 
-function _animParticles(segs) {
-  for(const e of S.layers.traffic.particles){
-    const p=e.properties;
-    let t=p.t._value+p.spd._value*p.dir._value;
-    if(t>1||t<0){p.dir._value*=-1;t=Math.max(0,Math.min(1,t));}
-    p.t._value=t;
-    const seg=p.seg._value;
-    e.position=Cesium.Cartesian3.fromDegrees(
-      seg[0].lon+(seg[1].lon-seg[0].lon)*t,
-      seg[0].lat+(seg[1].lat-seg[0].lat)*t, 5);
+  // Fallback grid if no OSM data
+  if (segCount === 0) {
+    for (let i = -5; i <= 5; i++) {
+      const style = i % 3 === 0 ? ROAD_STYLE.primary : ROAD_STYLE.residential;
+      const color = Cesium.Color.fromCssColorString(style.color).withAlpha(0.7);
+      collection.add({ positions: [
+        Cesium.Cartesian3.fromDegrees(clon - 0.03, clat + i*0.003, 2),
+        Cesium.Cartesian3.fromDegrees(clon + 0.03, clat + i*0.003, 2),
+      ], width: style.width, material: Cesium.Material.fromType('Color', { color }), followSurface: true });
+      collection.add({ positions: [
+        Cesium.Cartesian3.fromDegrees(clon + i*0.003, clat - 0.03, 2),
+        Cesium.Cartesian3.fromDegrees(clon + i*0.003, clat + 0.03, 2),
+      ], width: style.width, material: Cesium.Material.fromType('Color', { color }), followSurface: true });
+    }
+    segCount = 20;
   }
+
+  S.viewer.scene.primitives.add(collection);
+  S.layers.traffic.polylines = collection;
+  document.getElementById('traffic-count').textContent = segCount;
+  addLog(`${segCount} ROAD SEGMENTS RENDERED`);
 }
 
 function clearTraffic() {
-  if (S.layers.traffic.ds) S.viewer?.dataSources.remove(S.layers.traffic.ds,true);
+  if (S.layers.traffic.polylines) S.viewer?.scene.primitives.remove(S.layers.traffic.polylines);
+  if (S.layers.traffic.ds) S.viewer?.dataSources.remove(S.layers.traffic.ds, true);
   if (S.layers.traffic.interval) clearInterval(S.layers.traffic.interval);
-  S.layers.traffic.particles=[];
-  S.layers.traffic.ds=null;
+  S.layers.traffic.polylines = null;
+  S.layers.traffic.ds = null;
 }
+
+// ─── NASA GIBS SATELLITE IMAGERY ──────────────────────────────────────────────
+const GIBS_LAYERS = {
+  'MODIS Terra (True Color)': {
+    url: 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.jpg',
+    tileMatrixSetID: 'GoogleMapsCompatible', format: 'image/jpeg', maximumLevel: 9,
+  },
+  'VIIRS Nighttime Lights': {
+    url: 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_Black_Marble/default/2016-01-01/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.jpg',
+    tileMatrixSetID: 'GoogleMapsCompatible', format: 'image/jpeg', maximumLevel: 8,
+  },
+  'MODIS Sea Surface Temp': {
+    url: 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_Land_Surface_Temp_Day/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.png',
+    tileMatrixSetID: 'GoogleMapsCompatible', format: 'image/png', maximumLevel: 7,
+  },
+  'Suomi VIIRS (True Color)': {
+    url: 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.jpg',
+    tileMatrixSetID: 'GoogleMapsCompatible', format: 'image/jpeg', maximumLevel: 9,
+  },
+};
+
+let gibsLayer = null;
+
+async function setGibsLayer(name) {
+  if (!S.viewer) return;
+  // Remove existing GIBS layer
+  if (gibsLayer) {
+    S.viewer.imageryLayers.remove(gibsLayer, true);
+    gibsLayer = null;
+  }
+  if (!name || name === 'none') { addLog('SAT IMAGERY: OFF'); return; }
+  const def = GIBS_LAYERS[name];
+  if (!def) return;
+
+  const today = new Date().toISOString().slice(0,10);
+  const url   = def.url.replace('{Time}', today);
+
+  try {
+    const provider = await Cesium.WebMapTileServiceImageryProvider.fromUrl(url, {
+      layer:          name,
+      style:          'default',
+      tileMatrixSetID: def.tileMatrixSetID,
+      format:         def.format,
+      maximumLevel:   def.maximumLevel,
+      credit:         new Cesium.Credit('NASA GIBS / Earthdata'),
+    });
+    gibsLayer = S.viewer.imageryLayers.addImageryProvider(provider);
+    gibsLayer.alpha = 0.85;
+    addLog(`SAT IMAGERY: ${name.toUpperCase()}`);
+  } catch(e) {
+    addLog(`GIBS ERROR: ${e.message.substring(0,30)}`);
+  }
+}
+
+// ─── WEATHER (Open-Meteo, no key) ────────────────────────────────────────────
+async function refreshWeather(bbox, lod) {
+  if (!S.viewer || !bbox) return;
+  if (S.layers.weather.ds) S.viewer.dataSources.remove(S.layers.weather.ds, true);
+  const ds = new Cesium.CustomDataSource('weather');
+
+  // At GLOBAL/REGIONAL: sample a grid. At CITY/STREET: single point with full detail.
+  const points = [];
+  if (lod === 'GLOBAL') {
+    // Wide 5° grid
+    for (let lat = Math.max(-80, Math.round(bbox.minLat/5)*5); lat <= Math.min(80, bbox.maxLat); lat += 5)
+      for (let lon = Math.round(bbox.minLon/5)*5; lon <= bbox.maxLon; lon += 5)
+        points.push({ lat, lon });
+  } else if (lod === 'REGIONAL') {
+    // 2° grid
+    for (let lat = Math.round(bbox.minLat/2)*2; lat <= bbox.maxLat; lat += 2)
+      for (let lon = Math.round(bbox.minLon/2)*2; lon <= bbox.maxLon; lon += 2)
+        points.push({ lat, lon });
+  } else {
+    // Single point: camera centre, maximum detail
+    points.push({ lat: bbox.centerLat, lon: bbox.centerLon, detail: true });
+  }
+
+  const limited = points.slice(0, 25); // cap API calls
+  let cnt = 0;
+
+  await Promise.all(limited.map(async ({ lat, lon, detail }) => {
+    const vars = detail
+      ? 'temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,wind_speed_10m,wind_direction_10m,weather_code,visibility,surface_pressure,uv_index,cloud_cover'
+      : 'temperature_2m,weather_code,wind_speed_10m';
+    try {
+      const r = await fetch(
+        `/api/weather?lat=${lat.toFixed(2)}&lon=${lon.toFixed(2)}&vars=${vars}`
+      );
+      if (!r.ok) return;
+      const d = await r.json();
+      if (!d.current) return;
+
+      const cur    = d.current;
+      const temp   = cur.temperature_2m ?? '?';
+      const wcode  = cur.weather_code ?? 0;
+      const wind   = cur.wind_speed_10m ?? 0;
+      const wdir   = cur.wind_direction_10m ?? 0;
+      const emoji  = weatherEmoji(wcode);
+      const color  = tempColor(temp);
+
+      let label = detail
+        ? `${emoji} ${temp}°C  💨${wind}km/h
+` +
+          `💧${cur.relative_humidity_2m ?? '?'}%  ☁${cur.cloud_cover ?? '?'}%
+` +
+          `👁${((cur.visibility??10000)/1000).toFixed(1)}km  UV:${cur.uv_index??'?'}
+` +
+          `🌡${cur.surface_pressure??'?'}hPa`
+        : `${emoji}${Math.round(temp)}°`;
+
+      ds.entities.add({
+        id: `wx_${lat.toFixed(1)}_${lon.toFixed(1)}`,
+        position: Cesium.Cartesian3.fromDegrees(lon, lat, 500),
+        label: {
+          text: label,
+          font: detail ? '10px Share Tech Mono' : '9px Share Tech Mono',
+          fillColor: Cesium.Color.fromCssColorString(color),
+          outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          showBackground: true,
+          backgroundColor: Cesium.Color.BLACK.withAlpha(0.6),
+          backgroundPadding: new Cesium.Cartesian2(4, 3),
+          translucencyByDistance: new Cesium.NearFarScalar(1e5, 1, 8e6, 0.3),
+          scaleByDistance: new Cesium.NearFarScalar(1e4, 1.2, 5e6, 0.6),
+          horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+        properties: { type: 'weather', data: cur, lat, lon },
+      });
+      cnt++;
+    } catch {}
+  }));
+
+  S.viewer.dataSources.add(ds);
+  S.layers.weather.ds = ds;
+  document.getElementById('weather-count').textContent = cnt;
+  addLog(`WEATHER: ${cnt} NODES (${lod})`);
+}
+
+function weatherEmoji(code) {
+  if (code === 0) return '☀️';
+  if (code <= 3)  return '⛅';
+  if (code <= 48) return '🌫️';
+  if (code <= 67) return '🌧️';
+  if (code <= 77) return '❄️';
+  if (code <= 82) return '🌦️';
+  if (code <= 99) return '⛈️';
+  return '🌡️';
+}
+
+function tempColor(c) {
+  if (c < -20) return '#88aaff';
+  if (c < 0)   return '#aaccff';
+  if (c < 10)  return '#88ffee';
+  if (c < 20)  return '#aaffaa';
+  if (c < 30)  return '#ffee44';
+  if (c < 40)  return '#ff8800';
+  return '#ff2222';
+}
+
+// ─── WILDFIRES (NASA FIRMS, no key for basic access) ─────────────────────────
+async function refreshWildfires(bbox) {
+  if (!S.viewer || !bbox) return;
+  if (S.layers.wildfires.ds) S.viewer.dataSources.remove(S.layers.wildfires.ds, true);
+
+  try {
+    const r = await fetch(
+      `/api/wildfires?minLat=${bbox.minLat.toFixed(2)}&maxLat=${bbox.maxLat.toFixed(2)}&minLon=${bbox.minLon.toFixed(2)}&maxLon=${bbox.maxLon.toFixed(2)}`
+    );
+    if (!r.ok) throw new Error();
+    const fires = await r.json();
+    renderWildfires(fires);
+  } catch { addLog('FIRMS: UNAVAILABLE'); }
+}
+
+function renderWildfires(fires) {
+  if (!S.viewer) return;
+  const ds = new Cesium.CustomDataSource('wildfires');
+
+  for (const f of fires) {
+    const frp = f.frp || 0; // fire radiative power (MW)
+    const size = Math.min(12, 4 + frp / 20);
+    const color = frp > 500 ? '#ff0000' : frp > 100 ? '#ff5500' : '#ff9900';
+
+    ds.entities.add({
+      id: `fire_${f.lat}_${f.lon}`,
+      position: Cesium.Cartesian3.fromDegrees(f.lon, f.lat, 100),
+      point: {
+        pixelSize: size,
+        color: Cesium.Color.fromCssColorString(color).withAlpha(0.9),
+        outlineColor: Cesium.Color.YELLOW.withAlpha(0.5),
+        outlineWidth: 2,
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+        scaleByDistance: new Cesium.NearFarScalar(1e3, 2, 5e6, 0.5),
+      },
+      label: {
+        text: `🔥 ${Math.round(frp)}MW\n${f.acq_date||''}`,
+        font: '8px Share Tech Mono',
+        fillColor: Cesium.Color.fromCssColorString(color),
+        outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        translucencyByDistance: new Cesium.NearFarScalar(5e3, 1, 1e6, 0),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(0.6),
+        backgroundPadding: new Cesium.Cartesian2(3, 2),
+        pixelOffset: new Cesium.Cartesian2(14, 0),
+      },
+      properties: { type: 'wildfire', data: f },
+    });
+  }
+
+  S.viewer.dataSources.add(ds);
+  S.layers.wildfires.ds = ds;
+  document.getElementById('fire-count').textContent = fires.length;
+  addLog(`FIRMS: ${fires.length} FIRE DETECTIONS`);
+}
+
+// ─── SHIPS with bbox ──────────────────────────────────────────────────────────
+async function refreshShipsBbox(bbox) {
+  if (!bbox) { loadShips(); return; }
+  try {
+    const pad = 2;
+    const r = await fetch(
+      `/api/ships?minLat=${(bbox.minLat-pad).toFixed(2)}&maxLat=${(bbox.maxLat+pad).toFixed(2)}&minLon=${(bbox.minLon-pad).toFixed(2)}&maxLon=${(bbox.maxLon+pad).toFixed(2)}`
+    );
+    if (!r.ok) throw new Error();
+    const ships = await r.json();
+    renderShips(ships);
+  } catch { loadShips(); }
+}
+
+// ─── SHIPS ────────────────────────────────────────────────────────────────────
+async function loadShips() {
+  addLog('FETCHING AIS SHIP DATA...');
+  try {
+    const r = await fetch('/api/ships');
+    if (!r.ok) throw new Error();
+    const ships = await r.json();
+    renderShips(ships);
+  } catch { addLog('AIS: FEED UNAVAILABLE'); renderShips([]); }
+}
+
+function renderShips(ships) {
+  if (!S.viewer) return;
+  if (S.layers.ships.ds) S.viewer.dataSources.remove(S.layers.ships.ds, true);
+  const ds = new Cesium.CustomDataSource('ships');
+
+  for (const s of ships) {
+    if (!s.lat || !s.lon) continue;
+    const sog     = +(s.sog || 0);
+    const cog     = +(s.cog || 0);
+    const name    = (s.name || s.mmsi || 'UNKNOWN').substring(0, 16);
+    // Color by ship type: tanker=red, cargo=blue, passenger=green, other=cyan
+    const t = +(s.type || 0);
+    const hexColor = t >= 80 ? '#ff4444' : t >= 70 ? '#4488ff' : t >= 60 ? '#44ff88' : '#00ffff';
+
+    ds.entities.add({
+      id: `ship_${s.mmsi}`, name,
+      position: Cesium.Cartesian3.fromDegrees(s.lon, s.lat, 10),
+      billboard: {
+        image: shipIconSvg(hexColor),
+        width: 16, height: 16,
+        rotation: Cesium.Math.toRadians(-cog),
+        alignedAxis: Cesium.Cartesian3.UNIT_Z,
+        scaleByDistance: new Cesium.NearFarScalar(1e3, 2, 5e6, 0.6),
+        translucencyByDistance: new Cesium.NearFarScalar(5e5, 1, 5e6, 0.2),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+      },
+      label: {
+        text: `${name}\n${sog.toFixed(1)}kt`,
+        font: '8px Share Tech Mono',
+        fillColor: Cesium.Color.fromCssColorString(hexColor),
+        outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        pixelOffset: new Cesium.Cartesian2(12, 0),
+        horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
+        translucencyByDistance: new Cesium.NearFarScalar(5e4, 1, 1e6, 0),
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(0.55),
+        backgroundPadding: new Cesium.Cartesian2(3, 2),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+      },
+      properties: { type: 'ship', data: s },
+    });
+  }
+
+  S.viewer.dataSources.add(ds);
+  S.layers.ships.ds = ds;
+  document.getElementById('ship-count').textContent = ships.length;
+  addLog(`${ships.length} VESSELS TRACKED`);
+}
+
+// ─── GPS JAMMING ──────────────────────────────────────────────────────────────
+async function loadGpsJam() {
+  addLog('FETCHING GPS JAMMING DATA...');
+  try {
+    const r = await fetch('/api/gpsjam');
+    if (!r.ok) throw new Error();
+    const data = await r.json();
+    renderGpsJam(data);
+  } catch { addLog('GPSJAM: UNAVAILABLE'); }
+}
+
+function renderGpsJam(geojson) {
+  if (!S.viewer) return;
+  if (S.layers.gpsjam.ds) S.viewer.dataSources.remove(S.layers.gpsjam.ds, true);
+  const ds = new Cesium.CustomDataSource('gpsjam');
+  const features = geojson.features || [];
+  let cnt = 0;
+
+  for (const f of features) {
+    const [lon, lat] = f.geometry?.coordinates || [];
+    if (!lon || !lat) continue;
+    const level = f.properties?.level || f.properties?.interference_level || 1;
+    const label = f.properties?.label || f.properties?.name || '';
+    if (level < 1) continue;
+
+    const hexColor = level >= 3 ? '#ff0000' : level >= 2 ? '#ff8800' : '#ffff00';
+    const radius   = (level * 60000); // km radius visualisation
+
+    ds.entities.add({
+      id: `jam_${cnt}`, name: `GPS JAM: ${label || `Level ${level}`}`,
+      position: Cesium.Cartesian3.fromDegrees(lon, lat, 1000),
+      ellipse: {
+        semiMajorAxis: radius, semiMinorAxis: radius,
+        material: Cesium.Color.fromCssColorString(hexColor).withAlpha(0.12),
+        outline: true,
+        outlineColor: Cesium.Color.fromCssColorString(hexColor).withAlpha(0.6),
+        outlineWidth: 1,
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+      },
+      label: {
+        text: `⚡ JAM L${level}\n${label.substring(0,16)}`,
+        font: '9px Share Tech Mono',
+        fillColor: Cesium.Color.fromCssColorString(hexColor),
+        outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        translucencyByDistance: new Cesium.NearFarScalar(1e5, 1, 5e6, 0),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+      },
+      properties: { type: 'gpsjam', level, label },
+    });
+    cnt++;
+  }
+
+  S.viewer.dataSources.add(ds);
+  S.layers.gpsjam.ds = ds;
+  document.getElementById('jam-count').textContent = cnt;
+  addLog(`${cnt} GPS JAM ZONES`);
+}
+
+// ─── CCTV ────────────────────────────────────────────────────────────────────
+async function loadCctv() {
+  const cam = S.viewer.camera.positionCartographic;
+  const lat = Cesium.Math.toDegrees(cam.latitude);
+  const lon = Cesium.Math.toDegrees(cam.longitude);
+  addLog('FETCHING CCTV NODES...');
+  try {
+    const r = await fetch(`/api/cctv?lat=${lat}&lon=${lon}&radius=${CONFIG.cctvRadius}`);
+    if (!r.ok) throw new Error();
+    const cameras = await r.json();
+    renderCctv(cameras);
+  } catch { addLog('CCTV: UNAVAILABLE'); }
+}
+
+function renderCctv(cameras) {
+  if (!S.viewer) return;
+  if (S.layers.cctv.ds) S.viewer.dataSources.remove(S.layers.cctv.ds, true);
+  const ds = new Cesium.CustomDataSource('cctv');
+
+  for (const c of cameras) {
+    ds.entities.add({
+      id: `cctv_${c.id}`, name: `CCTV #${c.id}`,
+      position: Cesium.Cartesian3.fromDegrees(c.lon, c.lat, 5),
+      billboard: {
+        image: cctvIconSvg(),
+        width: 14, height: 14,
+        scaleByDistance: new Cesium.NearFarScalar(100, 2, 5e4, 0.8),
+        translucencyByDistance: new Cesium.NearFarScalar(1e4, 1, 5e4, 0),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+      },
+      label: {
+        text: `📷 ${c.type||'CCTV'}\n${c.operator.substring(0,12)}`,
+        font: '8px Share Tech Mono',
+        fillColor: Cesium.Color.fromCssColorString('#ff6600'),
+        outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        pixelOffset: new Cesium.Cartesian2(10, 0),
+        horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
+        translucencyByDistance: new Cesium.NearFarScalar(500, 1, 5000, 0),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(0.55),
+        backgroundPadding: new Cesium.Cartesian2(3, 2),
+      },
+      properties: { type: 'cctv', data: c },
+    });
+  }
+
+  S.viewer.dataSources.add(ds);
+  S.layers.cctv.ds = ds;
+  document.getElementById('cctv-count').textContent = cameras.length;
+  addLog(`${cameras.length} CCTV NODES MAPPED`);
+}
+
+
 
 // ─── SHODAN LAYER ─────────────────────────────────────────────────────────────
 async function loadShodanPresets() {
@@ -815,6 +1280,26 @@ function showDetail(type, name, data, airline) {
       row('ORIGIN',s[2]||'N/A')+row('ALT',Math.round(s[7]||0)+' m')+
       row('SPEED',Math.round(s[9]||0)+' m/s')+row('TRACK',Math.round(s[10]||0)+'°')+
       row('LON',(+s[5]||0).toFixed(3)+'°')+row('LAT',(+s[6]||0).toFixed(3)+'°');
+  } else if (type === 'ship') {
+    const d = data||[];
+    const t = +(d.type||0);
+    const shipType = t>=80?'TANKER':t>=70?'CARGO':t>=60?'PASSENGER':t>=50?'HIGH-SPEED':'OTHER';
+    html = row('NAME',d.name||'UNKNOWN')+row('MMSI',d.mmsi||'N/A')+row('TYPE',shipType)+
+      row('FLAG',d.flag||'N/A')+row('SPEED',`${(+(d.sog||0)).toFixed(1)} kt`)+
+      row('COURSE',`${Math.round(d.cog||0)}°`)+
+      row('DEST',(d.dest||'UNKNOWN').substring(0,20))+
+      row('DRAUGHT',d.draught?`${d.draught}m`:'N/A')+
+      row('LON',(+d.lon||0).toFixed(4)+'°')+row('LAT',(+d.lat||0).toFixed(4)+'°');
+  } else if (type === 'gpsjam') {
+    const d = ent.properties.data?.getValue()||{};
+    html = row('TYPE','GPS INTERFERENCE')+row('LEVEL',`${data?.level||'?'}/3`)+
+      row('AREA',data?.label||'Unknown')+row('SOURCE','gpsjam.org / ADS-B derived');
+  } else if (type === 'cctv') {
+    const d = data||{};
+    html = row('TYPE',`${d.type||'fixed'} camera`)+row('MOUNT',d.mount||'pole')+
+      row('OPERATOR',d.operator||'Unknown')+row('ID',d.id||'N/A')+
+      row('LON',(+d.lon||0).toFixed(5)+'°')+row('LAT',(+d.lat||0).toFixed(5)+'°')+
+      (d.note?row('NOTE',d.note.substring(0,40)):'');
   } else if (type === 'quake') {
     html = row('MAG','M'+(data?.mag||0).toFixed(1))+row('LOCATION',data?.place||'Unknown')+
       row('TIME',data?.time?new Date(data.time).toUTCString():'N/A');
@@ -864,13 +1349,79 @@ function clearTrack() {
 }
 
 // ─── COORDS / CLOCK ──────────────────────────────────────────────────────────
+function getViewBbox() {
+  if (!S.viewer) return null;
+  try {
+    const rect = S.viewer.camera.computeViewRectangle();
+    if (!rect) return null;
+    return {
+      minLat: Cesium.Math.toDegrees(rect.south),
+      maxLat: Cesium.Math.toDegrees(rect.north),
+      minLon: Cesium.Math.toDegrees(rect.west),
+      maxLon: Cesium.Math.toDegrees(rect.east),
+      centerLat: Cesium.Math.toDegrees((rect.south+rect.north)/2),
+      centerLon: Cesium.Math.toDegrees((rect.west+rect.east)/2),
+    };
+  } catch { return null; }
+}
+
+function getCameraAltitude() {
+  if (!S.viewer) return 1e9;
+  return S.viewer.camera.positionCartographic.height;
+}
+
+function getLODLevel(altM) {
+  if (altM > LOD.GLOBAL)   return 'GLOBAL';
+  if (altM > LOD.REGIONAL) return 'REGIONAL';
+  if (altM > LOD.CITY)     return 'CITY';
+  return 'STREET';
+}
+
 function updateCoords() {
   if (!S.viewer) return;
-  const c = S.viewer.camera.positionCartographic;
+  const c   = S.viewer.camera.positionCartographic;
+  const alt = c.height;
+  const km  = alt / 1000;
+
   document.getElementById('lat-display').textContent = Cesium.Math.toDegrees(c.latitude).toFixed(3)+'°';
   document.getElementById('lon-display').textContent = Cesium.Math.toDegrees(c.longitude).toFixed(3)+'°';
-  const alt = c.height/1000;
-  document.getElementById('alt-display').textContent = alt>1000?(alt/1000).toFixed(1)+'M':Math.round(alt).toString();
+  document.getElementById('alt-display').textContent = km > 1000 ? (km/1000).toFixed(1)+'Mkm' : Math.round(km)+'km';
+
+  // LOD level indicator
+  const newLOD = getLODLevel(alt);
+  if (newLOD !== currentLOD) {
+    currentLOD = newLOD;
+    const el = document.getElementById('lod-indicator');
+    if (el) {
+      el.textContent = `LOD: ${newLOD}`;
+      el.className   = `lod-badge lod-${newLOD.toLowerCase()}`;
+    }
+    addLog(`LOD → ${newLOD}`);
+  }
+
+  // Debounced bbox-aware refresh when camera settles
+  lastViewBbox = getViewBbox();
+  clearTimeout(lodDebounceTimer);
+  lodDebounceTimer = setTimeout(onCameraSettled, CONFIG.lodDebounce);
+}
+
+function onCameraSettled() {
+  const bbox = lastViewBbox;
+  if (!bbox) return;
+  const alt  = getCameraAltitude();
+  const lod  = getLODLevel(alt);
+
+  // Re-fetch all active viewport-bounded layers
+  if (S.layers.flights.on)  refreshFlightsBbox(bbox, lod);
+  if (S.layers.military.on) refreshFlightsBbox(bbox, lod, true);
+  if (S.layers.ships.on && lod !== 'GLOBAL')   refreshShipsBbox(bbox);
+  if (S.layers.weather.on)  refreshWeather(bbox, lod);
+  if (S.layers.wildfires.on && lod !== 'STREET') refreshWildfires(bbox);
+  if (S.layers.cctv.on && (lod === 'CITY' || lod === 'STREET')) {
+    clearTimeout(S._cctvRefreshTimer);
+    S._cctvRefreshTimer = setTimeout(() => loadCctv(bbox), 500);
+  }
+  if (S.layers.traffic.on && (lod === 'CITY' || lod === 'STREET')) loadTraffic(bbox);
 }
 
 function startClock() {
@@ -939,6 +1490,34 @@ function setupUI() {
   );
   document.getElementById('toggle-shodan')?.addEventListener('change', e => {
     if (!e.target.checked) clearShodanLayer();
+  });
+
+  toggleLayer('toggle-ships','ships',
+    () => { loadShips(); S.intervals.ships = setInterval(loadShips, CONFIG.shipUpdateInterval); },
+    () => { if(S.layers.ships.ds) S.viewer?.dataSources.remove(S.layers.ships.ds,true); clearInterval(S.intervals.ships); }
+  );
+  toggleLayer('toggle-gpsjam','gpsjam',
+    () => { loadGpsJam(); S.intervals.gpsjam = setInterval(loadGpsJam, CONFIG.gpsjamUpdateInterval); },
+    () => { if(S.layers.gpsjam.ds) S.viewer?.dataSources.remove(S.layers.gpsjam.ds,true); clearInterval(S.intervals.gpsjam); }
+  );
+  toggleLayer('toggle-cctv','cctv',
+    () => loadCctv(lastViewBbox),
+    () => { if(S.layers.cctv.ds) S.viewer?.dataSources.remove(S.layers.cctv.ds,true); }
+  );
+
+  toggleLayer('toggle-weather','weather',
+    () => { refreshWeather(lastViewBbox||getViewBbox(), currentLOD); S.intervals.weather=setInterval(()=>refreshWeather(lastViewBbox||getViewBbox(), currentLOD), CONFIG.weatherUpdateInterval); },
+    () => { if(S.layers.weather.ds) S.viewer?.dataSources.remove(S.layers.weather.ds,true); clearInterval(S.intervals.weather); document.getElementById('weather-count').textContent='0'; }
+  );
+
+  toggleLayer('toggle-wildfires','wildfires',
+    () => { refreshWildfires(lastViewBbox||getViewBbox()); S.intervals.fires=setInterval(()=>refreshWildfires(lastViewBbox||getViewBbox()), CONFIG.fireUpdateInterval); },
+    () => { if(S.layers.wildfires.ds) S.viewer?.dataSources.remove(S.layers.wildfires.ds,true); clearInterval(S.intervals.fires); document.getElementById('fire-count').textContent='0'; }
+  );
+
+  // NASA GIBS satellite imagery selector
+  document.getElementById('gibs-select')?.addEventListener('change', e => {
+    setGibsLayer(e.target.value === 'none' ? null : e.target.value);
   });
 
   // Detection mode

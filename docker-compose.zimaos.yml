@@ -1,20 +1,20 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# PANOPTICON // ZimaOS Dashboard Install
+# ARGUS // ZimaOS Dashboard Install
 #
 # PASTE THIS INTO: ZimaOS Dashboard → [+] → Install customized app
 #                  → Import → Docker Compose tab → Submit
 #
 # ⚠️  BEFORE PASTING: replace YOUR_GITHUB_USERNAME below with your actual
 #     GitHub username (the one that owns the repo you pushed to).
-#     e.g. if your repo is github.com/alice/panopticon, use: alice
+#     e.g. if your repo is github.com/alice/argus, use: alice
 # ══════════════════════════════════════════════════════════════════════════════
 
-name: panopticon
+name: argus
 
 services:
-  panopticon:
-    image: ghcr.io/YOUR_GITHUB_USERNAME/panopticon:latest
-    container_name: panopticon
+  argus:
+    image: ghcr.io/YOUR_GITHUB_USERNAME/argus:latest
+    container_name: argus
     restart: unless-stopped
 
     ports:
@@ -31,7 +31,7 @@ services:
 
     volumes:
       - type: bind
-        source: /DATA/AppData/panopticon/data
+        source: /DATA/AppData/argus/data
         target: /app/data
 
     cpu_shares: 90
@@ -77,9 +77,9 @@ x-casaos:
   is_uncontrolled: false
   port_map: "3000"
   scheme: http
-  store_app_id: panopticon
+  store_app_id: argus
   title:
-    custom: PANOPTICON
+    custom: ARGUS
     en_us: Panopticon — Global Intelligence Dashboard
   description:
     en_us: >
@@ -95,4 +95,4 @@ x-casaos:
         A Shodan API key is optional — for the OSINT device overlay feature.
         You can enter both in the dashboard UI after install.
 
-        Data stored at: /DATA/AppData/panopticon/data (~50–200 MB, 7-day history)
+        Data stored at: /DATA/AppData/argus/data (~50–200 MB, 7-day history)

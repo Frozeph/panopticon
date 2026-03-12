@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>PANOPTICON // GLOBAL INTELLIGENCE SYSTEM</title>
+  <title>ARGUS // GLOBAL INTELLIGENCE SYSTEM</title>
   <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
   <script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
   <link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
@@ -17,7 +17,7 @@
   <!-- TOP BAR -->
   <div id="topbar">
     <div class="tb-left">
-      <span class="sys-label">PANOPTICON</span>
+      <span class="sys-label">ARGUS</span>
       <span class="sys-sublabel">GLOBAL INTELLIGENCE SYSTEM // v2.0</span>
     </div>
     <div class="tb-center">
@@ -93,6 +93,36 @@
           <span class="toggle-track"><span class="toggle-thumb"></span></span>
           <span class="layer-name">SEISMIC</span>
           <span class="layer-count" id="quake-count">0</span>
+        </label>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-ships">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">AIS SHIPS</span>
+          <span class="layer-count" id="ship-count">0</span>
+        </label>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-gpsjam">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">GPS JAMMING</span>
+          <span class="layer-count" id="jam-count">0</span>
+        </label>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-weather">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">WEATHER GRID</span>
+          <span class="layer-count" id="weather-count">0</span>
+        </label>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-wildfires">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">🔥 WILDFIRES</span>
+          <span class="layer-count" id="fire-count">0</span>
+        </label>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-cctv">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">CCTV CAMERAS</span>
+          <span class="layer-count" id="cctv-count">0</span>
         </label>
         <label class="layer-toggle">
           <input type="checkbox" id="toggle-shodan">
@@ -276,14 +306,14 @@
       <span class="log-item">SYSTEM INITIALISED</span>
     </div>
     <div class="bb-right">
-      <span class="data-source">CELESTRAK · OPENSKY · USGS · OSM · SHODAN</span>
+      <span class="data-source">NASA GIBS · CELESTRAK · OPENSKY · USGS · OSM · FIRMS · OPEN-METEO · AISSTREAM · GPSJAM</span>
     </div>
   </div>
 
   <!-- TOKEN MODAL -->
   <div id="token-modal" class="modal-overlay">
     <div class="modal-box">
-      <div class="modal-title">⚡ PANOPTICON INITIALISATION</div>
+      <div class="modal-title">⚡ ARGUS INITIALISATION</div>
       <div class="modal-subtitle">Enter your Cesium Ion Access Token to enable photorealistic 3D tiles.</div>
       <div class="modal-hint">Free token at <strong>ion.cesium.com</strong> → Access Tokens</div>
       <input type="text" id="cesium-token-input" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6Ikp..." spellcheck="false">

@@ -1,5 +1,5 @@
 /**
- * PANOPTICON // Backend Proxy Server v2
+ * ARGUS // Backend Proxy Server v2
  * - Shodan API proxy with credit tracking
  * - SQLite time-series storage for 7-day playback
  * - Flight data with airline enrichment
@@ -27,7 +27,7 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 let db = null;
 try {
   const Database = require('better-sqlite3');
-  db = new Database(path.join(DATA_DIR, 'panopticon.db'));
+  db = new Database(path.join(DATA_DIR, 'argus.db'));
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('cache_size = -32000');
@@ -166,7 +166,7 @@ app.get('/api/playback/frame', (req, res) => {
 app.get('/api/storage/stats', (req, res) => {
   if (!db) return res.json({ available: false });
   const layers = db.prepare('SELECT layer, COUNT(*) as frames, MIN(ts) as earliest, MAX(ts) as latest, SUM(LENGTH(data)) as bytes FROM snapshots GROUP BY layer').all();
-  const dbFile = path.join(DATA_DIR, 'panopticon.db');
+  const dbFile = path.join(DATA_DIR, 'argus.db');
   res.json({ available: true, layers, db_bytes: fs.existsSync(dbFile) ? fs.statSync(dbFile).size : 0 });
 });
 
@@ -280,14 +280,14 @@ app.get('/api/shodan/host/:ip', async (req, res) => {
 let flightCache = { data: null, ts: 0 };
 
 app.get('/api/flights/opensky', async (req, res) => {
-  if (flightCache.data && Date.now() - flightCache.ts < 15000) return res.json(flightCache.data);
+  if (flightCache.data && Date.now() - flightCache.ts < 8000) return res.json(flightCache.data);
   try {
     const r = await fetchUrl('https://opensky-network.org/api/states/all');
     if (r.status !== 200) throw new Error();
     const data = JSON.parse(r.data);
     flightCache = { data, ts: Date.now() };
     saveSnapshot('flights', data);
-    res.set('Cache-Control', 'max-age=15');
+    res.set('Cache-Control', 'max-age=8');
     res.json(data);
   } catch {
     res.status(503).json({ states: [] });
@@ -345,11 +345,148 @@ app.get('/api/quakes', async (req, res) => {
   } catch { res.status(503).json({ features: [] }); }
 });
 
-// ─── OSM ─────────────────────────────────────────────────────────────────────
+// ─── NEW ROUTES INJECTED ──
+
+// ─── GPS JAMMING: gpsjam.org ──────────────────────────────────────────────────
+let gpsjamCache = { data: null, ts: 0 };
+app.get('/api/gpsjam', async (req, res) => {
+  if (gpsjamCache.data && Date.now() - gpsjamCache.ts < 300000) return res.json(gpsjamCache.data);
+  // gpsjam.org provides daily CSV data of GPS interference reports
+  const date = new Date(); date.setDate(date.getDate() - 1); // yesterday (today may not be ready)
+  const dateStr = date.toISOString().slice(0,10);
+  try {
+    const r = await fetchUrl(`https://gpsjam.org/geo.json?z=2&lat=30&lon=0&date=${dateStr}`, {
+      headers: { 'Accept': 'application/json', 'Referer': 'https://gpsjam.org/' }
+    });
+    if (r.status === 200 && r.data) {
+      const data = JSON.parse(r.data);
+      gpsjamCache = { data, ts: Date.now() };
+      res.set('Cache-Control', 'max-age=300');
+      return res.json(data);
+    }
+    throw new Error(`HTTP ${r.status}`);
+  } catch (e) {
+    // Fallback: return known jamming hotspots as GeoJSON
+    const fallback = {
+      type: 'FeatureCollection',
+      properties: { source: 'fallback', note: 'gpsjam.org unavailable' },
+      features: [
+        { type:'Feature', geometry:{type:'Point',coordinates:[35.5,33.9]},  properties:{level:3, label:'Eastern Mediterranean'} },
+        { type:'Feature', geometry:{type:'Point',coordinates:[37.6,55.7]},  properties:{level:2, label:'Moscow Region'} },
+        { type:'Feature', geometry:{type:'Point',coordinates:[44.4,33.3]},  properties:{level:3, label:'Iraq/Syria'} },
+        { type:'Feature', geometry:{type:'Point',coordinates:[35.2,31.8]},  properties:{level:3, label:'Israel/Gaza'} },
+        { type:'Feature', geometry:{type:'Point',coordinates:[28.9,41.0]},  properties:{level:2, label:'Istanbul'} },
+        { type:'Feature', geometry:{type:'Point',coordinates:[30.5,50.4]},  properties:{level:2, label:'Ukraine'} },
+        { type:'Feature', geometry:{type:'Point',coordinates:[22.9,41.3]},  properties:{level:1, label:'Balkans'} },
+      ]
+    };
+    res.set('Cache-Control', 'max-age=60');
+    res.json(fallback);
+  }
+});
+
+// ─── AIS SHIPS: proxy to aisstream.io (requires free API key) ─────────────────
+// Ships are fetched via HTTP snapshot from MarineTraffic-compatible sources
+let shipCache = { data: null, ts: 0 };
+app.get('/api/ships', async (req, res) => {
+  if (shipCache.data && Date.now() - shipCache.ts < 10000) return res.json(shipCache.data);
+  const aisKey = process.env.AISSTREAM_KEY || '';
+
+  // Try aisstream.io REST-style snapshot (free tier)
+  if (aisKey) {
+    try {
+      const r = await fetchUrl('https://api.aisstream.io/v0/latest-positions', {
+        headers: { 'Authorization': `Bearer ${aisKey}`, 'Accept': 'application/json' }
+      });
+      if (r.status === 200) {
+        const data = JSON.parse(r.data);
+        const ships = (data.positions || data || []).slice(0, 2000).map(s => ({
+          mmsi:    s.MMSI || s.mmsi,
+          name:    (s.ShipName || s.name || 'UNKNOWN').trim(),
+          lat:     s.Latitude  || s.lat,
+          lon:     s.Longitude || s.lon,
+          sog:     s.Sog  || s.speed || 0,   // speed over ground (knots)
+          cog:     s.Cog  || s.course || 0,  // course over ground
+          type:    s.ShipType || s.type || 0,
+          flag:    s.Flag || '',
+          dest:    (s.Destination || '').trim(),
+          draught: s.Draught || 0,
+          length:  s.Length || 0,
+        }));
+        shipCache = { data: ships, ts: Date.now() };
+        return res.json(ships);
+      }
+    } catch {}
+  }
+
+  // Fallback: VesselFinder public feed (no key needed, limited)
+  try {
+    const r = await fetchUrl('https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=-70&minlon=-180&maxlat=70&maxlon=180&z=2', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible)', 'Referer': 'https://www.vesselfinder.com/' }
+    });
+    if (r.status === 200) {
+      const raw = JSON.parse(r.data);
+      const ships = (Array.isArray(raw) ? raw : raw.vessels || []).slice(0, 1000).map(s => ({
+        mmsi: s[0] || s.mmsi,
+        name: (s[2] || s.name || 'UNKNOWN').trim(),
+        lat:  s[4] || s.lat,
+        lon:  s[5] || s.lon,
+        sog:  s[6] || 0,
+        cog:  s[7] || 0,
+        type: s[8] || 0,
+        flag: s[13] || '',
+        dest: '',
+      }));
+      shipCache = { data: ships, ts: Date.now() };
+      return res.json(ships);
+    }
+  } catch {}
+
+  res.status(503).json([]);
+});
+
+// ─── CCTV CAMERAS: OpenStreetMap surveillance nodes ───────────────────────────
+app.get('/api/cctv', async (req, res) => {
+  const lat    = parseFloat(req.query.lat) || 51.5;
+  const lon    = parseFloat(req.query.lon) || -0.12;
+  const radius = Math.min(parseInt(req.query.radius) || 5000, 15000);
+
+  const q = `[out:json][timeout:25];
+(
+  node["man_made"="surveillance"](around:${radius},${lat},${lon});
+  node["surveillance"](around:${radius},${lat},${lon});
+  node["camera:type"](around:${radius},${lat},${lon});
+);
+out body qt;`;
+
+  try {
+    const r = await fetchUrl(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(q)}`);
+    if (r.status !== 200) throw new Error();
+    const raw = JSON.parse(r.data);
+    const cameras = (raw.elements || []).map(n => ({
+      id:       n.id,
+      lat:      n.lat,
+      lon:      n.lon,
+      type:     n.tags?.surveillance || n.tags?.['camera:type'] || 'fixed',
+      mount:    n.tags?.['camera:mount'] || 'pole',
+      operator: n.tags?.operator || '',
+      note:     n.tags?.note || n.tags?.description || '',
+    }));
+    res.set('Cache-Control', 'max-age=3600');
+    res.json(cameras);
+  } catch { res.status(503).json([]); }
+});
+
+// ─── OSM TRAFFIC SPEEDS (for Google Maps-style coloring) ─────────────────────
 app.get('/api/osm/roads', async (req, res) => {
-  const lat = parseFloat(req.query.lat)||51.5, lon = parseFloat(req.query.lon)||-0.12;
-  const radius = Math.min(parseInt(req.query.radius)||3000, 8000);
-  const q = `[out:json][timeout:25];(way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential)$"](around:${radius},${lat},${lon}););out geom qt;`;
+  const lat    = parseFloat(req.query.lat)||51.5;
+  const lon    = parseFloat(req.query.lon)||-0.12;
+  const radius = Math.min(parseInt(req.query.radius)||4000, 10000);
+  const q = `[out:json][timeout:25];
+(
+  way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|unclassified)$"](around:${radius},${lat},${lon});
+);
+out geom qt tags;`;
   try {
     const r = await fetchUrl(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(q)}`);
     if (r.status !== 200) throw new Error();
@@ -358,14 +495,133 @@ app.get('/api/osm/roads', async (req, res) => {
   } catch { res.status(503).json({ elements: [] }); }
 });
 
+// (duplicate route removed)
+
 // ─── TLE ─────────────────────────────────────────────────────────────────────
+// Map friendly group names to CelesTrak group IDs
+const TLE_GROUP_MAP = {
+  'stations': 'space-stations',
+  'visual':   'visual',
+  'starlink': 'starlink',
+  'weather':  'weather',
+  'gps':      'gps-ops',
+};
+
 app.get('/api/tle/:group', async (req, res) => {
-  const group = req.params.group.replace(/[^a-z0-9-]/gi, '');
+  const raw   = req.params.group.replace(/[^a-z0-9-]/gi, '');
+  const group = TLE_GROUP_MAP[raw] || raw;
+
+  // Try multiple CelesTrak endpoints in order
+  const urls = [
+    `https://celestrak.org/SOCRATES/query.php?GROUP=${group}&FORMAT=tle`,
+    `https://celestrak.org/TLE/query.php?GROUP=${group}&FORMAT=tle`,
+    `https://celestrak.org/pub/TLE/catalog.txt`,          // full catalog fallback
+  ];
+
+  for (const url of urls) {
+    try {
+      const r = await fetchUrl(url, {
+        headers: { 'User-Agent': 'PanopticonDashboard/2.0 (self-hosted; non-commercial)' }
+      });
+      if (r.status === 200 && r.data && r.data.includes('1 ')) {
+        res.set('Content-Type', 'text/plain').set('Cache-Control', 'max-age=120');
+        return res.send(r.data);
+      }
+    } catch {}
+  }
+
+  // Hard-coded fallback: ISS + a handful of well-known satellites
+  // so the UI always shows something even if CelesTrak is down
+  const FALLBACK_TLE = `ISS (ZARYA)
+1 25544U 98067A   24001.50000000  .00016717  00000-0  10270-3 0  9993
+2 25544  51.6400 208.9163 0006317  86.9006  73.1692 15.49560026430115
+HUBBLE SPACE TELESCOPE
+1 20580U 90037B   24001.50000000  .00000882  00000-0  39093-4 0  9990
+2 20580  28.4700 203.7698 0002778 189.9948 170.1099 15.09745998392518
+TIANGONG
+1 48274U 21035A   24001.50000000  .00009778  00000-0  11434-3 0  9995
+2 48274  41.4700 358.2990 0005830 348.3338  11.7450 15.60545848152812
+NOAA 19
+1 33591U 09005A   24001.50000000  .00000063  00000-0  63918-4 0  9998
+2 33591  99.1930  45.1250 0013693 303.5636  56.4163 14.12235842769176
+TERRA
+1 25994U 99068A   24001.50000000  .00000037  00000-0  26163-4 0  9991
+2 25994  98.2120  12.6374 0001180  93.8198 266.3133 14.57124601278140
+AQUA
+1 27424U 02022A   24001.50000000  .00000087  00000-0  43193-4 0  9994
+2 27424  98.2110 359.9888 0001736  96.0215 264.1101 14.57144202155691
+SENTINEL-2A
+1 40697U 15028A   24001.50000000  .00000080  00000-0  41710-4 0  9993
+2 40697  98.5690  31.2650 0001040  89.2890 270.8360 14.30820697448714
+SENTINEL-2B
+1 42063U 17013A   24001.50000000  .00000070  00000-0  37010-4 0  9991
+2 42063  98.5680 211.2580 0001230 104.6890 255.4410 14.30818700368947`;
+
+  res.set('Content-Type', 'text/plain').set('Cache-Control', 'max-age=60');
+  res.send(FALLBACK_TLE);
+});
+
+
+// ─── GPS JAMMING: GPSJam.org ──────────────────────────────────────────────────
+// Fetches daily CSV of H3 hex cells with GPS interference data
+// CSV format: hex_id, percent_bad (0-100)
+// Source: gpsjam.org — derived from ADS-B Exchange aircraft GPS accuracy reports
+
+let jammingCache = { data: null, ts: 0, date: '' };
+
+app.get('/api/jamming', async (req, res) => {
+  // Default to yesterday UTC (today's data isn't available until ~midnight UTC)
+  const targetDate = req.query.date || (() => {
+    const d = new Date(Date.now() - 86400000);
+    return d.toISOString().substring(0, 10);
+  })();
+
+  // Cache per date for 1 hour
+  if (jammingCache.data && jammingCache.date === targetDate &&
+      Date.now() - jammingCache.ts < 3600000) {
+    res.set('Cache-Control', 'max-age=3600');
+    return res.json(jammingCache.data);
+  }
+
   try {
-    const r = await fetchUrl(`https://celestrak.org/TLE/query.php?GROUP=${group}&FORMAT=tle`);
-    res.set('Content-Type', 'text/plain').set('Cache-Control', 'max-age=120');
-    res.send(r.status === 200 ? r.data : '');
-  } catch { res.status(503).send(''); }
+    const url = `https://gpsjam.org/data/jamming-${targetDate}.csv`;
+    const r = await fetchUrl(url, {
+      headers: { 'User-Agent': 'PanopticonDashboard/2.0 (non-commercial self-hosted)' }
+    });
+
+    if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+
+    // Parse CSV: each line is "hex_id,pct_bad" e.g. "841234567ffffff,15.3"
+    const lines = r.data.trim().split('\n').filter(l => l && !l.startsWith('#'));
+    const hexes = [];
+
+    for (const line of lines) {
+      const parts = line.split(',');
+      if (parts.length < 2) continue;
+      const hexId  = parts[0].trim();
+      const pctBad = parseFloat(parts[1]);
+      if (!hexId || isNaN(pctBad) || pctBad < 2) continue; // skip green (< 2%)
+      hexes.push({ h: hexId, p: Math.round(pctBad) });
+    }
+
+    const payload = { date: targetDate, count: hexes.length, hexes };
+    jammingCache = { data: payload, ts: Date.now(), date: targetDate };
+    res.set('Cache-Control', 'max-age=3600');
+    res.json(payload);
+  } catch (e) {
+    console.error('[GPS Jamming] fetch error:', e.message);
+    res.status(503).json({ error: e.message, date: targetDate, hexes: [] });
+  }
+});
+
+// Available dates (last 7 days)
+app.get('/api/jamming/dates', (req, res) => {
+  const dates = [];
+  for (let i = 1; i <= 7; i++) {
+    const d = new Date(Date.now() - i * 86400000);
+    dates.push(d.toISOString().substring(0, 10));
+  }
+  res.json({ dates });
 });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
@@ -379,9 +635,71 @@ app.get('/api/health', (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔══════════════════════════════════════════════╗
-║  PANOPTICON // INTELLIGENCE SYSTEM v2        ║
+║  ARGUS // INTELLIGENCE SYSTEM v2        ║
 ║  http://localhost:${PORT}                        ║
 ║  DB:     ${db ? 'SQLite (WAL)               ' : 'disabled                     '}║
 ║  Shodan: ${process.env.SHODAN_API_KEY ? 'CONFIGURED                  ' : 'set SHODAN_API_KEY env var   '}║
 ╚══════════════════════════════════════════════╝`);
+});
+
+// ─── WEATHER (Open-Meteo, no key required) ────────────────────────────────────
+const weatherCache = new Map(); // key → {data, ts}
+
+app.get('/api/weather', async (req, res) => {
+  const lat  = parseFloat(req.query.lat);
+  const lon  = parseFloat(req.query.lon);
+  const vars = (req.query.vars || 'temperature_2m,weather_code,wind_speed_10m').replace(/[^a-z0-9_,]/gi,'');
+  if (isNaN(lat)||isNaN(lon)) return res.status(400).json({error:'Bad coords'});
+
+  const cacheKey = `${lat.toFixed(1)}_${lon.toFixed(1)}_${vars}`;
+  const cached   = weatherCache.get(cacheKey);
+  if (cached && Date.now()-cached.ts < 300_000) return res.json(cached.data);
+
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=${vars}&timezone=auto&forecast_days=1`;
+    const r   = await fetchUrl(url, { headers: { 'Accept': 'application/json' } });
+    if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+    const data = JSON.parse(r.data);
+    weatherCache.set(cacheKey, { data, ts: Date.now() });
+    res.set('Cache-Control','max-age=300');
+    res.json(data);
+  } catch(e) {
+    res.status(503).json({ error: e.message });
+  }
+});
+
+// ─── WILDFIRES (NASA FIRMS public CSV, no key for basic layer) ────────────────
+let firmsCache = { data: null, ts: 0 };
+
+app.get('/api/wildfires', async (req, res) => {
+  const minLat = parseFloat(req.query.minLat)||-90;
+  const maxLat = parseFloat(req.query.maxLat)||90;
+  const minLon = parseFloat(req.query.minLon)||-180;
+  const maxLon = parseFloat(req.query.maxLon)||180;
+
+  // FIRMS public CSV (MODIS NRT, updated daily, no key for public layer)
+  if (!firmsCache.data || Date.now()-firmsCache.ts > 3_600_000) {
+    try {
+      // Try world CSV (MODIS, last 24h)
+      const r = await fetchUrl('https://firms.modaps.eosdis.nasa.gov/data/active_fire/modis-c6.1/csv/MODIS_C6_1_Global_24h.csv', {
+        headers: { 'User-Agent': 'ARGUS-Intelligence/3.0' }
+      });
+      if (r.status === 200 && r.data.includes('latitude')) {
+        const lines = r.data.trim().split('\n').slice(1); // skip header
+        firmsCache.data = lines.map(l => {
+          const p = l.split(',');
+          return { lat:+p[0], lon:+p[1], brightness:+p[2], frp:+p[12]||+p[8]||0, acq_date:p[5]||'', confidence:p[8]||'' };
+        }).filter(f => f.lat && f.lon && !isNaN(f.lat));
+        firmsCache.ts = Date.now();
+      }
+    } catch {}
+  }
+
+  const all = firmsCache.data || [];
+  const filtered = all.filter(f =>
+    f.lat >= minLat && f.lat <= maxLat && f.lon >= minLon && f.lon <= maxLon
+  ).slice(0, 2000);
+
+  res.set('Cache-Control','max-age=900');
+  res.json(filtered);
 });

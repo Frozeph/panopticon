@@ -802,3 +802,33 @@ body.mode-crt #cesiumContainer { animation: crt-flicker 0.1s infinite; }
 .dp-val { color:var(--green); font-family:var(--font-mono); max-width:220px; text-align:right; word-break:break-all; }
 #dp-track-btn { display:block;width:100%;background:rgba(0,255,65,.08);border:none;border-top:1px solid var(--panel-border);color:var(--green);font-family:var(--font-display);font-size:9px;font-weight:700;letter-spacing:.15em;padding:8px;cursor:pointer;transition:background .2s;position:sticky;bottom:0; }
 #dp-track-btn:hover { background:rgba(0,255,65,.18); }
+
+/* ── LEGEND: road colors ──────────────────────────────────────────────────── */
+.road-legend { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 0; }
+.road-legend-item { display: flex; align-items: center; gap: 3px; font-size: 8px; color: var(--text-muted); }
+.road-swatch { width: 18px; height: 3px; border-radius: 1px; }
+
+/* ── LAYER GROUP ICONS ────────────────────────────────────────────────────── */
+.layer-group-title { color: var(--text-muted); font-size: 8px; letter-spacing: 0.15em; padding: 6px 0 3px; border-top: 1px solid var(--panel-border); margin-top: 4px; }
+.layer-group-title:first-child { border-top: none; margin-top: 0; }
+
+/* ── LOD BADGE ───────────────────────────────────────────────────────────── */
+.lod-badge {
+  font-size: 9px; font-family: 'Share Tech Mono', monospace;
+  padding: 2px 6px; border-radius: 2px; letter-spacing: 0.1em;
+  font-weight: bold;
+}
+.lod-global   { background: rgba(0,200,255,0.15); color: #00ccff; border: 1px solid #00ccff44; }
+.lod-regional { background: rgba(0,255,100,0.15); color: #00ff64; border: 1px solid #00ff6444; }
+.lod-city     { background: rgba(255,200,0,0.15); color: #ffcc00; border: 1px solid #ffcc0044; }
+.lod-street   { background: rgba(255,80,0,0.15);  color: #ff5000; border: 1px solid #ff500044; }
+
+/* ── GIBS SELECTOR ───────────────────────────────────────────────────────── */
+.gibs-row    { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.gibs-label  { font-size: 9px; color: var(--text-muted); letter-spacing: 0.1em; white-space: nowrap; }
+.gibs-select {
+  flex: 1; background: rgba(0,255,65,0.05); border: 1px solid var(--panel-border);
+  color: var(--text-primary); font-family: 'Share Tech Mono', monospace;
+  font-size: 9px; padding: 2px 4px; border-radius: 2px; cursor: pointer;
+}
+.gibs-select option { background: #050f05; }
