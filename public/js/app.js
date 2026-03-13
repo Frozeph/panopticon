@@ -41,6 +41,7 @@ const S = {
     mesh: false, intel: true,
   },
   activeSatGroups: new Set(['visual']),
+  showFootprints:  false,
   intelArticles:  [],
   intelFilter:    '',
   intelQuery:     '',
@@ -115,23 +116,46 @@ S.viewer.scene.globe.show = true;
 applyBasemap('dark');
 
 // ─── BASEMAP ──────────────────────────────────────────────────────────────────
-function applyBasemap(mode) {
+// CesiumJS 1.114: IonImageryProvider is now async — must use fromAssetId()
+async function applyBasemap(mode) {
   S.viewer.imageryLayers.removeAll();
+  // Reset to flat ellipsoid terrain first
+  S.viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+
   const layers = S.viewer.imageryLayers;
-  if (mode === 'dark') {
-    layers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
-      url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-      subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
-      credit: '© CARTO © OpenStreetMap',
-    }));
-  } else if (mode === 'satellite') {
-    layers.addImageryProvider(new Cesium.IonImageryProvider({ assetId: 3 }));
-  } else if (mode === 'terrain') {
-    layers.addImageryProvider(new Cesium.IonImageryProvider({ assetId: 3 }));
-    S.viewer.terrainProvider = Cesium.createWorldTerrain();
-  } else {
-    // void — pure dark bg
-    S.viewer.scene.globe.baseColor = new Cesium.Color(0.04, 0.04, 0.06, 1);
+
+  try {
+    if (mode === 'dark') {
+      layers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
+        url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+        subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
+        credit: '© CARTO © OpenStreetMap',
+      }));
+    } else if (mode === 'satellite') {
+      // Async Ion provider — CesiumJS 1.109+
+      const provider = await Cesium.IonImageryProvider.fromAssetId(3);
+      layers.addImageryProvider(provider);
+    } else if (mode === 'terrain') {
+      // Satellite imagery base
+      const imgProvider = await Cesium.IonImageryProvider.fromAssetId(3);
+      layers.addImageryProvider(imgProvider);
+      // World terrain with async API
+      try {
+        S.viewer.terrainProvider = await Cesium.CesiumTerrainProvider.fromIon(1);
+      } catch {
+        // Fallback: terrain without Ion if token missing
+        S.viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+      }
+    }
+  } catch(e) {
+    console.warn('Basemap load failed, falling back to dark tiles:', e.message);
+    try {
+      layers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
+        url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+        subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
+        credit: '© CARTO © OpenStreetMap',
+      }));
+    } catch {}
   }
 }
 
@@ -268,6 +292,8 @@ function parseTLE(txt) {
   return out;
 }
 
+let satFootprintDs = null;
+
 function renderSatellites() {
   if (!S.layers.satellites || !S.viewer) return;
   if (S.satDs) S.viewer.dataSources.remove(S.satDs, true);
@@ -310,13 +336,123 @@ function renderSatellites() {
           pixelOffset: new Cesium.Cartesian2(8, 0),
           translucencyByDistance: new Cesium.NearFarScalar(1e7, 1, 1e8, 0),
         } : undefined,
-        properties: { type: 'satellite', name: sat.name, alt: pos.alt, lat: pos.lat, lon: pos.lng },
+        properties: { type: 'satellite', name: sat.name, alt: pos.alt, lat: pos.lat, lon: pos.lng, tleIdx: i },
       });
     } catch {}
   }
 
   S.viewer.dataSources.add(ds);
   S.satDs = ds;
+
+  // Render footprints if enabled
+  if (S.showFootprints) renderSatFootprints(now);
+}
+
+// ─── SATELLITE FOOTPRINTS ─────────────────────────────────────────────────────
+// Visualises sensor coverage for the visual (brightest) satellite group
+// Inner amber ring  = nadir sensor swath (~5° half-angle: high-res imaging zone)
+// Outer cyan ring   = wide-area coverage (~25° half-angle: off-nadir observable)
+// Ground track line = predicted orbit path ±20 minutes
+function renderSatFootprints(now) {
+  if (satFootprintDs) S.viewer.dataSources.remove(satFootprintDs, true);
+  if (!S.tleData.length) return;
+
+  const ds   = new Cesium.CustomDataSource('sat_footprints');
+  const date = now || new Date();
+  const R    = 6371;  // Earth radius km
+
+  // Only render footprints for the first 200 sats (visual group + stations)
+  const limit = Math.min(S.tleData.length, 200);
+
+  for (let i = 0; i < limit; i++) {
+    const sat = S.tleData[i];
+    try {
+      const pos = sgp4Position(sat.tle1, sat.tle2, date);
+      if (!pos) continue;
+      const h   = pos.alt;          // km above ellipsoid
+      if (h < 100 || h > 40000) continue; // skip if out of range
+
+      const isGEO     = h > 35000;
+      const isStation = sat.name.match(/ISS|TIANGONG|CSS/i);
+
+      // ── Inner sensor swath (nadir, ~5° half-angle)
+      const sensorRad  = h * Math.tan(5  * Math.PI / 180) * 1000; // metres
+      // ── Outer coverage (~25° off-nadir)
+      const coverageRad= h * Math.tan(25 * Math.PI / 180) * 1000;
+
+      const groundPos = Cesium.Cartesian3.fromDegrees(pos.lng, pos.lat, 0);
+
+      // Outer coverage zone — dim cyan ring
+      if (!isGEO) {
+        ds.entities.add({
+          position: groundPos,
+          ellipse: {
+            semiMinorAxis: coverageRad,
+            semiMajorAxis: coverageRad,
+            material:      Cesium.Color.fromCssColorString('#06b6d4').withAlpha(0.04),
+            outline:       true,
+            outlineColor:  Cesium.Color.fromCssColorString('#06b6d4').withAlpha(0.25),
+            outlineWidth:  1,
+            heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+          },
+        });
+      }
+
+      // Inner sensor footprint — amber
+      const innerAlpha = isStation ? 0.15 : 0.08;
+      ds.entities.add({
+        position: groundPos,
+        ellipse: {
+          semiMinorAxis: isGEO ? 2000000 : sensorRad,  // GEO gets fixed large footprint
+          semiMajorAxis: isGEO ? 2000000 : sensorRad,
+          material:      Cesium.Color.fromCssColorString('#f59e0b').withAlpha(innerAlpha),
+          outline:       true,
+          outlineColor:  Cesium.Color.fromCssColorString('#f59e0b').withAlpha(isStation ? 0.8 : 0.45),
+          outlineWidth:  isStation ? 2 : 1,
+          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+        },
+      });
+
+      // Sub-satellite crosshair point (brighter dot at nadir)
+      ds.entities.add({
+        position: groundPos,
+        point: {
+          pixelSize: isStation ? 5 : 2,
+          color: Cesium.Color.fromCssColorString('#f59e0b').withAlpha(0.7),
+          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+        },
+      });
+
+      // Ground track line (projected orbit ±20 min) — only for LEO
+      if (!isGEO) {
+        const trackPositions = [];
+        const steps = 40;
+        const spanMs = 20 * 60 * 1000;
+        for (let s = 0; s <= steps; s++) {
+          const t = new Date(date.getTime() - spanMs/2 + (spanMs * s / steps));
+          try {
+            const tp = sgp4Position(sat.tle1, sat.tle2, t);
+            if (tp) trackPositions.push(Cesium.Cartesian3.fromDegrees(tp.lng, tp.lat, 0));
+          } catch {}
+        }
+        if (trackPositions.length > 2) {
+          ds.entities.add({
+            polyline: {
+              positions:      trackPositions,
+              width:          isStation ? 1.5 : 0.8,
+              material:       new Cesium.ColorMaterialProperty(
+                Cesium.Color.fromCssColorString(isStation ? '#ff6600' : '#f59e0b').withAlpha(0.3)
+              ),
+              clampToGround:  true,
+            },
+          });
+        }
+      }
+    } catch {}
+  }
+
+  S.viewer.dataSources.add(ds);
+  satFootprintDs = ds;
 }
 
 // SGP4 propagation using satellite.js (accurate)
@@ -350,6 +486,15 @@ document.querySelectorAll('[data-satgrp]').forEach(cb => {
 });
 document.getElementById('reload-sats').addEventListener('click', () => {
   if (S.layers.satellites) loadSatellites();
+});
+document.getElementById('toggle-footprints').addEventListener('change', (e) => {
+  S.showFootprints = e.target.checked;
+  if (!e.target.checked && satFootprintDs) {
+    S.viewer.dataSources.remove(satFootprintDs, true);
+    satFootprintDs = null;
+  } else if (e.target.checked && S.tleData.length) {
+    renderSatFootprints(new Date());
+  }
 });
 
 // ─── FLIGHTS ──────────────────────────────────────────────────────────────────
@@ -943,48 +1088,145 @@ function showInfoPanel(entity) {
   const type  = props.type?.getValue?.() || props.type || 'unknown';
   const name  = entity.name || entity.id;
   const box   = document.getElementById('info-box');
-  const icon  = document.getElementById('info-icon');
-  const nameEl= document.getElementById('info-name');
-  const body  = document.getElementById('info-body');
 
   S.selectedEntity = entity;
 
-  const icons  = { flight:'✈', military:'★', satellite:'◎', ship:'⚓', quake:'⚡', cctv:'📷', fire:'🔥', mesh:'📡', intel_event:'◈' };
-  icon.textContent  = icons[type] || '●';
-  nameEl.textContent = name.substring(0, 24).toUpperCase();
+  const icons = { flight:'✈', military:'★', satellite:'◎', ship:'⚓', quake:'⚡', cctv:'📷', fire:'🔥', mesh:'📡', intel_event:'◈', shodan:'🔍' };
+  document.getElementById('info-icon').textContent  = icons[type] || '●';
+  document.getElementById('info-name').textContent  = name.substring(0, 28).toUpperCase();
 
-  const rows = [];
-  const addRow = (k, v) => { if (v != null && v !== '' && v !== undefined) rows.push(`<div class="info-row"><span class="info-key">${k}</span><span class="info-val">${escHtml(String(v))}</span></div>`); };
+  const body  = document.getElementById('info-body');
+  const rows  = [];
+  const R = (k, v) => { if (v != null && v !== '' && v !== undefined) rows.push(`<div class="info-row"><span class="info-key">${k}</span><span class="info-val">${escHtml(String(v))}</span></div>`); };
 
   if (type === 'flight' || type === 'military') {
-    addRow('ICAO',     props.icao?.getValue?.() || props.icao);
-    addRow('CALLSIGN', props.callsign?.getValue?.() || props.callsign);
-    addRow('ALT',      `${(props.altFt?.getValue?.() || props.altFt || 0).toLocaleString()} ft`);
-    addRow('SPEED',    `${props.spdKt?.getValue?.() || props.spdKt || 0} kt`);
-    addRow('TRACK',    `${Math.round(props.track?.getValue?.() || props.track || 0)}°`);
-    addRow('COUNTRY',  props.country?.getValue?.() || props.country);
-    addRow('STATUS',   props.onGround?.getValue?.() ? 'ON GROUND' : 'AIRBORNE');
+    R('ICAO',    props.icao?.getValue?.() || props.icao);
+    R('CALLSIGN',props.callsign?.getValue?.() || props.callsign);
+    R('ALT',     `${((props.altFt?.getValue?.() || props.altFt || 0)).toLocaleString()} ft`);
+    R('SPEED',   `${props.spdKt?.getValue?.() || props.spdKt || 0} kt`);
+    R('TRACK',   `${Math.round(props.track?.getValue?.() || props.track || 0)}°`);
+    R('COUNTRY', props.country?.getValue?.() || props.country);
+    R('STATUS',  (props.onGround?.getValue?.() || props.onGround) ? 'ON GROUND' : 'AIRBORNE');
   } else if (type === 'ship') {
-    addRow('MMSI',   props.mmsi?.getValue?.() || props.mmsi);
-    addRow('SPEED',  `${props.speed?.getValue?.() || props.speed || 0} kt`);
-    addRow('COURSE', `${props.course?.getValue?.() || props.course || 0}°`);
+    R('MMSI',    props.mmsi?.getValue?.() || props.mmsi);
+    R('SPEED',   `${props.speed?.getValue?.() || props.speed || 0} kt`);
+    R('COURSE',  `${props.course?.getValue?.() || props.course || 0}°`);
+    R('TYPE',    props.type_desc?.getValue?.() || props.type_desc || '');
   } else if (type === 'satellite') {
-    addRow('ALT',    `${Math.round(props.alt?.getValue?.() || props.alt || 0)} km`);
-    addRow('LAT',    `${(props.lat?.getValue?.() || props.lat || 0).toFixed(2)}°`);
-    addRow('LON',    `${(props.lon?.getValue?.() || props.lon || 0).toFixed(2)}°`);
+    R('ALT',     `${Math.round(props.alt?.getValue?.() || props.alt || 0)} km`);
+    R('LAT',     `${(props.lat?.getValue?.() || props.lat || 0).toFixed(2)}°`);
+    R('LON',     `${(props.lon?.getValue?.() || props.lon || 0).toFixed(2)}°`);
   } else if (type === 'quake') {
-    addRow('MAG',   `M${props.mag?.getValue?.() || props.mag}`);
-    addRow('DEPTH', `${props.depth?.getValue?.() || props.depth || 0} km`);
-    addRow('PLACE', props.place?.getValue?.() || props.place);
+    R('MAG',     `M${props.mag?.getValue?.() || props.mag}`);
+    R('DEPTH',   `${props.depth?.getValue?.() || props.depth || 0} km`);
+    R('PLACE',   props.place?.getValue?.() || props.place);
     const time = props.time?.getValue?.() || props.time;
-    if (time) addRow('TIME', new Date(time).toUTCString().substring(0, 25));
-  } else if (type === 'intel_event') {
-    addRow('LOCATION', props.name?.getValue?.() || props.name);
-    addRow('ARTICLES', props.count?.getValue?.() || props.count);
+    if (time) R('TIME', new Date(time).toUTCString().substring(0,25));
   }
 
-  body.innerHTML = rows.join('') || '<div class="dim small" style="padding:4px">No details available</div>';
+  rows.push(`<div id="enrich-data" class="enrich-section"><div class="enrich-loading"><span class="loading-spinner" style="width:12px;height:12px;border-width:1.5px"></span><span class="dim tiny" style="margin-left:6px">QUERYING DATABASES…</span></div></div>`);
+  body.innerHTML = rows.join('');
   box.classList.remove('hidden');
+
+  // Auto-enrich in background
+  autoEnrich(entity, type, props);
+}
+
+async function autoEnrich(entity, type, props) {
+  const enrichDiv = document.getElementById('enrich-data');
+  if (!enrichDiv) return;
+
+  let url = null;
+  let callsignUrl = null;
+  const icao     = props.icao?.getValue?.()     || props.icao;
+  const callsign = props.callsign?.getValue?.() || props.callsign;
+  const mmsi     = props.mmsi?.getValue?.()     || props.mmsi;
+  const satName  = entity.name;
+
+  if ((type === 'flight' || type === 'military') && icao) {
+    url = `/api/enrich/aircraft/${icao}`;
+    if (callsign) callsignUrl = `/api/enrich/callsign/${callsign}`;
+  } else if (type === 'ship' && mmsi) {
+    url = `/api/enrich/ship/${mmsi}`;
+  } else if (type === 'satellite') {
+    // Extract NORAD ID from TLE line 1 (cols 3-7)
+    const tleEntry = S.tleData.find(t => t.name === satName);
+    if (tleEntry) {
+      const noradId = tleEntry.tle1.substring(2,7).trim();
+      if (noradId) url = `/api/enrich/satellite/${noradId}`;
+    }
+  }
+
+  if (!url) { enrichDiv.innerHTML = ''; return; }
+
+  try {
+    const [r1, r2] = await Promise.all([
+      fetch(url).then(r => r.json()),
+      callsignUrl ? fetch(callsignUrl).then(r => r.json()) : Promise.resolve(null),
+    ]);
+
+    const rows = [];
+    const R = (k, v) => { if (v != null && v !== '' && v !== undefined && v !== 'null') rows.push(`<div class="info-row"><span class="info-key">${k}</span><span class="info-val">${escHtml(String(v))}</span></div>`); };
+
+    if (type === 'flight' || type === 'military') {
+      if (r1.registration)  R('REG',           r1.registration);
+      if (r1.type_full)     R('AIRCRAFT',       r1.type_full);
+      else if (r1.type_code) R('TYPE',          r1.type_code);
+      if (r1.manufacturer)  R('MANUFACTURER',   r1.manufacturer);
+      if (r1.operator)      R('OPERATOR',       r1.operator);
+      if (r1.operator_iata) R('IATA',           r1.operator_iata);
+      if (r1.country)       R('REGISTERED',     r1.country);
+      if (r1.built_year)    R('BUILT',          r1.built_year);
+      if (r1.engines)       R('ENGINES',        r1.engines);
+      if (r2?.origin)       R('FROM', `${r2.origin.iata||r2.origin.icao} ${r2.origin.name}, ${r2.origin.country}`);
+      if (r2?.destination)  R('TO',   `${r2.destination.iata||r2.destination.icao} ${r2.destination.name}, ${r2.destination.country}`);
+      if (r2?.operator)     R('AIRLINE',        r2.operator);
+      if (r1.photo_url) {
+        rows.push(`<div class="enrich-photo"><img src="${escHtml(r1.photo_url)}" alt="Aircraft photo" onerror="this.parentNode.remove()"></div>`);
+      }
+    } else if (type === 'ship') {
+      R('COUNTRY', r1.country);
+      R('CLASS',   r1.type);
+      R('IMO',     r1.imo);
+      R('FLAG',    r1.flag);
+      R('BUILT',   r1.built);
+      R('LENGTH',  r1.length ? `${r1.length}m` : null);
+      R('BEAM',    r1.beam   ? `${r1.beam}m`   : null);
+      R('DWT',     r1.dwt);
+      R('GT',      r1.gt);
+      R('DEST',    r1.destination);
+      if (r1.name) R('VESSEL', r1.name);
+      rows.push(`<div class="enrich-links"><a href="https://www.marinetraffic.com/en/ais/details/ships/mmsi:${r1.mmsi}" target="_blank" class="enrich-link">MarineTraffic ↗</a><a href="https://www.vesselfinder.com/vessels/${r1.mmsi}" target="_blank" class="enrich-link">VesselFinder ↗</a></div>`);
+    } else if (type === 'satellite') {
+      R('NAME',        r1.name || satName);
+      R('NORAD',       r1.norad_id);
+      R('INT DESIG',   r1.int_designator);
+      R('COUNTRY',     r1.country);
+      R('TYPE',        r1.object_type);
+      R('RCS SIZE',    r1.rcs_size);
+      R('LAUNCHED',    r1.launch_date);
+      R('REGIME',      r1.orbital_regime);
+      R('ALTITUDE',    r1.mean_altitude_km ? `${r1.mean_altitude_km} km` : null);
+      R('APOGEE',      r1.apoapsis_km ? `${r1.apoapsis_km} km` : null);
+      R('PERIGEE',     r1.periapsis_km ? `${r1.periapsis_km} km` : null);
+      R('PERIOD',      r1.period_min ? `${r1.period_min} min` : null);
+      R('ORBITS/DAY',  r1.orbits_per_day);
+      R('INCLINATION', r1.inclination ? `${r1.inclination}°` : null);
+      R('VELOCITY',    r1.orbital_velocity_kms ? `${r1.orbital_velocity_kms} km/s` : null);
+      R('CLASS',       r1.classification === 'U' ? 'Unclassified' : r1.classification);
+      if (r1.decay_date) R('DECAYED', r1.decay_date);
+      rows.push(`<div class="enrich-links"><a href="https://celestrak.org/SOCRATES/" target="_blank" class="enrich-link">SOCRATES Conjunctions ↗</a><a href="https://heavens-above.com/" target="_blank" class="enrich-link">Heavens-Above ↗</a></div>`);
+    }
+
+    if (rows.length === 0) {
+      enrichDiv.innerHTML = '<div class="dim tiny" style="padding:4px">No additional data found</div>';
+    } else {
+      const srcBadge = r1.sources?.length ? `<div class="enrich-src">SRC: ${r1.sources.join(' · ').toUpperCase()}</div>` : '';
+      enrichDiv.innerHTML = `<div class="enrich-hdr">◈ ENRICHED INTELLIGENCE</div>${rows.join('')}${srcBadge}`;
+    }
+  } catch(e) {
+    enrichDiv.innerHTML = `<div class="dim tiny" style="padding:4px">Enrichment failed: ${e.message}</div>`;
+  }
 }
 
 document.getElementById('info-close').addEventListener('click', () => {

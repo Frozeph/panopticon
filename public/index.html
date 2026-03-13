@@ -69,9 +69,8 @@
     <div class="sb-label">BASEMAP</div>
     <select id="basemap-sel" class="sb-sel">
       <option value="dark">Dark Tile</option>
-      <option value="satellite">Satellite</option>
-      <option value="terrain">Terrain</option>
-      <option value="void">Void</option>
+      <option value="satellite">Satellite (Ion)</option>
+      <option value="terrain">Terrain + Elevation</option>
     </select>
   </div>
 
@@ -83,6 +82,15 @@
     <label class="chk"><input type="checkbox" data-satgrp="weather"> Weather</label>
     <label class="chk"><input type="checkbox" data-satgrp="gps"> GPS/GNSS</label>
     <label class="chk"><input type="checkbox" data-satgrp="geo"> GEO Belt</label>
+    <div class="sb-divider"></div>
+    <label class="chk" title="Show sensor swath, coverage zone and ground track for each satellite">
+      <input type="checkbox" id="toggle-footprints"> Coverage Footprints
+    </label>
+    <div class="dim tiny" style="padding:2px 0 0 18px;line-height:1.4;">
+      <span style="color:#f59e0b">▪</span> sensor swath &nbsp;
+      <span style="color:#06b6d4">▪</span> coverage zone<br>
+      ground track ±20 min
+    </div>
     <button class="sb-btn mt4" id="reload-sats">↺ RELOAD TLE</button>
   </div>
 
@@ -155,7 +163,7 @@
 
   <div id="intel-footer">
     <span id="intel-count" class="mono dim tiny">—</span>
-    <span class="dim tiny"> · GDELT updates every 15min</span>
+    <span class="dim tiny"> · <span id="intel-last-update">—</span></span>
     <button id="intel-refresh" class="tiny-btn">↺ REFRESH</button>
   </div>
 </div>

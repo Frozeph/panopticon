@@ -172,27 +172,95 @@ app.get('/api/ships', async (req, res) => {
     return res.json({ ships: ships.slice(0,5000), _src:'aisstream', _count:ships.length });
   }
 
-  if (shipFallback.data && Date.now()-shipFallback.ts < 30000) {
+  // Serve stale cache up to 5 minutes old rather than hammering external APIs
+  if (shipFallback.data && Date.now()-shipFallback.ts < 5*60*1000) {
     let ships = shipFallback.data;
     if (hasBbox) ships = ships.filter(s=>s.lat>=minLat&&s.lat<=maxLat&&s.lon>=minLon&&s.lon<=maxLon);
     return res.json({ ships:ships.slice(0,2000), _src:'vf_cache', _count:ships.length });
   }
 
+  // Try MarineTraffic public map data first
+  const mtHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+    'Referer': 'https://www.marinetraffic.com/',
+    'Accept': 'application/json, text/javascript, */*',
+    'X-Requested-With': 'XMLHttpRequest',
+  };
+
+  const tryParseMT = (raw) => {
+    try {
+      const d = JSON.parse(raw);
+      const arr = d.data?.rows || d.rows || (Array.isArray(d) ? d : []);
+      return arr.slice(0,3000).map(s => ({
+        mmsi: String(s.MMSI||s[0]||''),
+        name: (s.SHIPNAME||s[1]||'').trim(),
+        lat:  parseFloat(s.LAT||s.lat||s[2]||0),
+        lon:  parseFloat(s.LON||s.lon||s[3]||0),
+        speed: parseFloat(s.SPEED||s[4]||0),
+        course: parseFloat(s.COURSE||s[5]||0),
+        type: parseInt(s.SHIPTYPE||s[7]||0),
+        flag: s.FLAG||'',
+        ts: Date.now(),
+      })).filter(s => s.lat && s.lon && Math.abs(s.lat)<=90 && Math.abs(s.lon)<=180);
+    } catch { return null; }
+  };
+
+  // Source 1: MarineTraffic public endpoint
   try {
-    const url = hasBbox
-      ? `https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=${minLat}&minlon=${minLon}&maxlat=${maxLat}&maxlon=${maxLon}&z=5`
-      : `https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=-70&minlon=-180&maxlat=70&maxlon=180&z=2`;
-    const r = await fetchUrl(url, { headers:{'User-Agent':'Mozilla/5.0','Referer':'https://www.vesselfinder.com/','Accept':'application/json'} });
-    if (r.status === 200) {
+    const zoom = hasBbox ? 5 : 3;
+    const lat1 = hasBbox ? minLat : -70, lat2 = hasBbox ? maxLat : 70;
+    const lon1 = hasBbox ? minLon : -180, lon2 = hasBbox ? maxLon : 180;
+    const url = `https://www.marinetraffic.com/getData/get_data_json_4/z:${zoom}/X:1/Y:1/station:0`;
+    const r = await fetchUrl(url, { headers: mtHeaders, timeout: 12000 });
+    if (r.status === 200 && r.data.length > 100) {
+      const ships = tryParseMT(r.data);
+      if (ships && ships.length > 0) {
+        shipFallback = { data: ships, ts: Date.now() };
+        let out = ships;
+        if (hasBbox) out = ships.filter(s=>s.lat>=lat1&&s.lat<=lat2&&s.lon>=lon1&&s.lon<=lon2);
+        return res.json({ ships: out.slice(0,2000), _src:'marinetraffic', _count:out.length });
+      }
+    }
+  } catch(e) { console.warn('[Ships] MT error:', e.message); }
+
+  // Source 2: VesselFinder public API
+  try {
+    const vfLat1 = hasBbox ? minLat : -70, vfLat2 = hasBbox ? maxLat : 70;
+    const vfLon1 = hasBbox ? minLon : -180, vfLon2 = hasBbox ? maxLon : 180;
+    const zoom = hasBbox ? 5 : 2;
+    const url = `https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=${vfLat1}&minlon=${vfLon1}&maxlat=${vfLat2}&maxlon=${vfLon2}&z=${zoom}`;
+    const r = await fetchUrl(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+        'Referer': 'https://www.vesselfinder.com/',
+        'Accept': 'application/json, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      timeout: 15000,
+    });
+    if (r.status === 200 && r.data.length > 10) {
       const raw = JSON.parse(r.data);
-      const arr = Array.isArray(raw)?raw:(raw.vessels||raw.data||[]);
-      const ships = arr.slice(0,3000).map(s=>({ mmsi:String(s[0]||s.mmsi||''), name:s[1]||s.name||'', lat:s[2]||s.lat, lon:s[3]||s.lon, speed:s[4]||0, course:s[5]||0, type:s[7]||0, ts:Date.now() })).filter(s=>s.lat&&s.lon);
-      shipFallback = { data: ships, ts: Date.now() };
-      return res.json({ ships, _src:'vesselfinder', _count:ships.length });
+      const arr = Array.isArray(raw) ? raw : (raw.vessels || raw.data || []);
+      // VesselFinder array format: [mmsi, name, lat, lon, speed, course, _, type, ...]
+      const ships = arr.slice(0,3000).map(s => ({
+        mmsi:   String(s[0] || s.mmsi || ''),
+        name:   (s[1] || s.name || '').trim(),
+        lat:    parseFloat(s[2] ?? s.lat ?? 0),
+        lon:    parseFloat(s[3] ?? s.lon ?? 0),
+        speed:  parseFloat(s[4] || 0),
+        course: parseFloat(s[5] || 0),
+        type:   parseInt(s[7] || 0),
+        ts: Date.now(),
+      })).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90);
+      if (ships.length > 0) {
+        shipFallback = { data: ships, ts: Date.now() };
+        let out = hasBbox ? ships.filter(s=>s.lat>=vfLat1&&s.lat<=vfLat2&&s.lon>=vfLon1&&s.lon<=vfLon2) : ships;
+        return res.json({ ships: out.slice(0,2000), _src:'vesselfinder', _count:out.length });
+      }
     }
   } catch(e) { console.warn('[Ships] VF error:', e.message); }
 
-  res.json({ ships: [], _src:'none', _count:0, info:'Set AISSTREAM_KEY for full AIS data' });
+  res.json({ ships: [], _src:'none', _count:0, info:'Set AISSTREAM_KEY env var for live AIS (free at aisstream.io)' });
 });
 
 // ─── TLE / SATELLITES ─────────────────────────────────────────────────────────
@@ -234,87 +302,112 @@ app.get('/api/tle/:group', async (req, res) => {
 });
 
 // ─── GDELT INTEL FEED ─────────────────────────────────────────────────────────
-// GDELT monitors 100+ languages, auto-translates everything to English, updates every 15min
-// Free, no API key, near-realtime, global coverage including local/regional media
+// GDELT monitors 100+ languages, auto-translates to English, updates every 15min
+// Free, no API key — rate limit: roughly 1 req/sec, handle 503 gracefully
 const gdeltCache = new Map();
+let   gdeltInFlight = new Map(); // prevent duplicate in-flight requests
+
+async function fetchGdelt(url, cacheKey, maxAge) {
+  // Serve stale if we have it while revalidating in background
+  const cached = gdeltCache.get(cacheKey);
+  const isStale = cached && Date.now() - cached.ts > maxAge;
+  const isFresh = cached && !isStale;
+  if (isFresh) return { data: cached.data, stale: false };
+
+  // Deduplicate concurrent requests for same key
+  if (gdeltInFlight.has(cacheKey)) {
+    const result = await gdeltInFlight.get(cacheKey).catch(() => null);
+    return { data: result || cached?.data, stale: !!cached };
+  }
+
+  const req = (async () => {
+    // Small delay to avoid hammering — GDELT is a shared public resource
+    await new Promise(r => setTimeout(r, 200));
+    const r = await fetchUrl(url, { timeout: 20000 });
+    if (r.status === 503 || r.status === 429) {
+      if (cached) return cached.data; // return stale on rate limit
+      throw new Error(`GDELT rate limited (${r.status}) — try again in 60s`);
+    }
+    if (r.status !== 200) throw new Error(`GDELT ${r.status}`);
+    return JSON.parse(r.data);
+  })();
+
+  gdeltInFlight.set(cacheKey, req);
+  try {
+    const data = await req;
+    gdeltCache.set(cacheKey, { data, ts: Date.now() });
+    gdeltInFlight.delete(cacheKey);
+    return { data, stale: false };
+  } catch(e) {
+    gdeltInFlight.delete(cacheKey);
+    if (cached) return { data: cached.data, stale: true }; // serve stale on error
+    throw e;
+  }
+}
 
 app.get('/api/intel/feed', async (req, res) => {
-  const keyword  = (req.query.q || '').replace(/[^\w\s"()-]/g, '').trim();
+  const keyword  = (req.query.q || '').replace(/[^\w\s"'()|&-]/g, '').trim();
   const timespan = ['1h','6h','12h','24h','7d'].includes(req.query.timespan) ? req.query.timespan : '24h';
   const maxrecs  = Math.min(parseInt(req.query.limit) || 50, 250);
-  const sortMode = req.query.sort === 'tone' ? 'ToneAsc' : 'DateDesc';
 
-  // Default query covers conflict/security themes that have most local corroboration
-  const query = keyword || 'conflict OR attack OR protest OR explosion OR military OR strike OR "breaking news"';
+  // Simpler default query — broad terms less likely to 503
+  const query = keyword || 'war OR attack OR military OR protest OR disaster OR earthquake';
   const cacheKey = `feed_${query}_${timespan}_${maxrecs}`;
-  const cached   = gdeltCache.get(cacheKey);
-  if (cached && Date.now()-cached.ts < 5*60*1000) return res.set('Cache-Control','max-age=300').json(cached.data);
+  const cacheAge = 5 * 60 * 1000; // 5 min
 
   try {
-    const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(query)}&mode=artlist&maxrecords=${maxrecs}&timespan=${timespan}&sort=${sortMode}&format=json`;
-    const r   = await fetchUrl(url, { timeout: 25000 });
-    if (r.status !== 200) throw new Error(`GDELT returned ${r.status}`);
+    const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(query)}&mode=artlist&maxrecords=${maxrecs}&timespan=${timespan}&sort=DateDesc&format=json`;
+    const { data, stale } = await fetchGdelt(url, cacheKey, cacheAge);
 
-    const data     = JSON.parse(r.data);
     const articles = (data.articles || []).map((a, i) => ({
-      id:       i,
-      url:      a.url,
-      title:    a.title || '(no title)',
-      source:   a.domain,
-      language: a.language || 'English',
-      country:  a.sourcecountry || '',
-      image:    a.socialimage || null,
-      date:     a.seendate,
-      // GDELT tone: negative = conflict/negative reporting; positive = good news
-      // We use abs(tone) as "intensity" — heavily negative articles = high conflict signal
-      tone:     a.tone != null ? parseFloat(a.tone) : null,
+      id:            i,
+      url:           a.url,
+      title:         a.title || '(no title)',
+      source:        a.domain,
+      language:      a.language || 'English',
+      country:       a.sourcecountry || '',
+      image:         a.socialimage || null,
+      date:          a.seendate,
+      tone:          a.tone != null ? parseFloat(a.tone) : null,
     }));
 
-    // Group by title similarity to find corroborated stories
-    // Simple approach: count how many sources report similar keywords
+    // Corroboration: group by first 5 words of title
     const titleMap = new Map();
     for (const art of articles) {
-      const key = art.title.toLowerCase().replace(/[^a-z0-9\s]/g,'').split(' ').slice(0,5).join(' ');
-      if (!titleMap.has(key)) titleMap.set(key, []);
-      titleMap.get(key).push(art);
+      const key = art.title.toLowerCase().replace(/[^a-z0-9 ]/g,'').split(' ').slice(0,5).join(' ');
+      if (!titleMap.has(key)) titleMap.set(key, 0);
+      titleMap.set(key, titleMap.get(key) + 1);
     }
-    // Add corroboration count to each article
     for (const art of articles) {
-      const key = art.title.toLowerCase().replace(/[^a-z0-9\s]/g,'').split(' ').slice(0,5).join(' ');
-      art.corroboration = titleMap.get(key)?.length || 1;
+      const key = art.title.toLowerCase().replace(/[^a-z0-9 ]/g,'').split(' ').slice(0,5).join(' ');
+      art.corroboration = titleMap.get(key) || 1;
     }
-    // Sort by corroboration (most sources first), then by date
-    articles.sort((a, b) => (b.corroboration - a.corroboration) || new Date(b.date) - new Date(a.date));
+    articles.sort((a, b) => (b.corroboration - a.corroboration));
 
-    const payload = { articles, count: articles.length, query, timespan, ts: Date.now() };
-    gdeltCache.set(cacheKey, { data: payload, ts: Date.now() });
+    const payload = { articles, count: articles.length, query, timespan, ts: Date.now(), stale };
+    if (!stale) gdeltCache.set(cacheKey, { data, ts: Date.now() });
     res.set('Cache-Control', 'max-age=300').json(payload);
   } catch(e) {
     console.warn('[GDELT] feed error:', e.message);
-    res.status(503).json({ articles: [], error: e.message, query });
+    res.status(503).json({ articles: [], error: e.message, query, hint: 'GDELT may be temporarily rate-limited. Cached data will serve once available.' });
   }
 });
 
 // GDELT geographic events — for map pins
 app.get('/api/intel/events', async (req, res) => {
-  const keyword  = (req.query.q || 'attack military protest').replace(/[^\w\s"()-]/g,'').trim();
-  const timespan = req.query.timespan || '24h';
+  const keyword  = (req.query.q || 'attack protest military').replace(/[^\w\s"'()|&-]/g,'').trim().substring(0, 100);
+  const timespan = ['1h','6h','12h','24h','7d'].includes(req.query.timespan) ? req.query.timespan : '24h';
   const cacheKey = `geo_${keyword}_${timespan}`;
-  const cached   = gdeltCache.get(cacheKey);
-  if (cached && Date.now()-cached.ts < 15*60*1000) return res.json(cached.data);
+  const cacheAge = 15 * 60 * 1000;
 
   try {
     const url = `https://api.gdeltproject.org/api/v2/geo/geo?query=${encodeURIComponent(keyword)}&mode=pointdata&timespan=${timespan}&format=json&maxrecords=500`;
-    const r   = await fetchUrl(url, { timeout: 25000 });
-    if (r.status !== 200) throw new Error(`GDELT GEO ${r.status}`);
-    const data = JSON.parse(r.data);
+    const { data } = await fetchGdelt(url, cacheKey, cacheAge);
     const features = (data.features||[]).map(f=>({
       lat: f.geometry?.coordinates?.[1], lon: f.geometry?.coordinates?.[0],
-      name: f.properties?.name||'',  count: f.properties?.count||1,
-      articles: (f.properties?.articles||[]).slice(0,3).map(a=>({ title:a.title, url:a.url, domain:a.domain })),
+      name: f.properties?.name||'', count: f.properties?.count||1,
     })).filter(f=>f.lat&&f.lon);
     const payload = { features, count: features.length, query: keyword, ts: Date.now() };
-    gdeltCache.set(cacheKey, { data: payload, ts: Date.now() });
     res.set('Cache-Control','max-age=900').json(payload);
   } catch(e) { res.status(503).json({ features: [], error: e.message }); }
 });
@@ -461,6 +554,221 @@ app.get('/api/debug/sources', async (req,res) => {
   try { const r=await fetchUrl('https://api.gdeltproject.org/api/v2/doc/doc?query=conflict&mode=artlist&maxrecords=3&timespan=1h&format=json',{timeout:10000}); const d=r.status===200?JSON.parse(r.data):{}; out.sources.gdelt={ok:r.status===200,count:(d.articles||[]).length}; } catch(e) { out.sources.gdelt={ok:false,error:e.message}; }
   out.sources.ships={aisstream_key:!!(process.env.AISSTREAM_KEY),ws_connected:wsConnection?.readyState===1,cached:shipPositions.size};
   res.json(out);
+});
+
+// ─── ENTITY ENRICHMENT ────────────────────────────────────────────────────────
+// Auto-pull all available public info for any tracked entity
+const enrichCache = new Map();
+function getCached(key, maxAgeMs=300000) {
+  const c = enrichCache.get(key);
+  return (c && Date.now()-c.ts < maxAgeMs) ? c.data : null;
+}
+function setCache(key, data) { enrichCache.set(key, { data, ts:Date.now() }); return data; }
+
+// Aircraft enrichment: ADSBDB (free, no key) + OpenSky metadata
+app.get('/api/enrich/aircraft/:hex', async (req, res) => {
+  const hex = req.params.hex.toLowerCase().replace(/[^a-f0-9]/g,'');
+  if (!hex) return res.status(400).json({error:'bad hex'});
+  const ck = `ac_${hex}`;
+  const cached = getCached(ck, 3600000); // 1hr cache - registration rarely changes
+  if (cached) return res.json(cached);
+
+  const result = { hex, sources:[] };
+
+  // 1 — ADSBDB (free aircraft registration database, no key needed)
+  try {
+    const r = await fetchUrl(`https://api.adsbdb.com/v0/aircraft/${hex}`, { timeout:8000 });
+    if (r.status === 200) {
+      const d = JSON.parse(r.data);
+      const ac = d.response?.aircraft;
+      if (ac) {
+        result.registration     = ac.registration || null;
+        result.type_code        = ac.type || null;
+        result.type_full        = ac.type_longname || null;
+        result.manufacturer     = ac.manufacturer || null;
+        result.operator         = ac.registered_owner || null;
+        result.operator_code    = ac.registered_owner_operator_flag_code || null;
+        result.country          = ac.registered_owner_country_name || null;
+        result.country_iso      = ac.registered_owner_country_iso_name || null;
+        result.photo_url        = ac.url_photo_thumbnail || null;
+        result.photo_full       = ac.url_photo || null;
+        result.sources.push('adsbdb');
+      }
+    }
+  } catch(e) { console.warn('[Enrich AC]', e.message); }
+
+  // 2 — OpenSky metadata (aircraft type & operator confirmation)
+  try {
+    const r = await fetchUrl(`https://opensky-network.org/api/metadata/aircraft/icao/${hex}`, { timeout:8000 });
+    if (r.status === 200) {
+      const d = JSON.parse(r.data);
+      if (d.icao24) {
+        result.registration    = result.registration || d.registration;
+        result.type_code       = result.type_code || d.typecode;
+        result.operator        = result.operator || d.operatorcallsign;
+        result.operator_iata   = d.operatoriata || null;
+        result.operator_icao   = d.operatoricao || null;
+        result.owner           = d.owner || null;
+        result.built_year      = d.built ? new Date(d.built).getFullYear() : null;
+        result.engines         = d.engines || null;
+        result.sources.push('opensky');
+      }
+    }
+  } catch(e) {}
+
+  res.json(setCache(ck, result));
+});
+
+// Callsign enrichment: route data (origin → destination)
+app.get('/api/enrich/callsign/:callsign', async (req, res) => {
+  const cs = req.params.callsign.toUpperCase().replace(/[^A-Z0-9]/g,'');
+  if (!cs) return res.status(400).json({error:'bad callsign'});
+  const ck = `cs_${cs}`;
+  const cached = getCached(ck, 1800000); // 30min
+  if (cached) return res.json(cached);
+  try {
+    const r = await fetchUrl(`https://api.adsbdb.com/v0/callsign/${cs}`, { timeout:8000 });
+    if (r.status !== 200) return res.json({});
+    const d = JSON.parse(r.data);
+    const fl = d.response?.flightroute;
+    if (!fl) return res.json({});
+    const result = {
+      callsign: cs,
+      origin: fl.origin ? { iata:fl.origin.iata_code, icao:fl.origin.icao_code, name:fl.origin.name, country:fl.origin.country?.name, lat:fl.origin.latitude, lon:fl.origin.longitude } : null,
+      destination: fl.destination ? { iata:fl.destination.iata_code, icao:fl.destination.icao_code, name:fl.destination.name, country:fl.destination.country?.name, lat:fl.destination.latitude, lon:fl.destination.longitude } : null,
+      operator: fl.airline?.name || null,
+    };
+    res.json(setCache(ck, result));
+  } catch(e) { res.json({}); }
+});
+
+// Ship enrichment: decode MMSI structure + fetch public vessel data
+const MID_COUNTRY = {
+  '201':'Albania','202':'Andorra','203':'Austria','204':'Portugal (Azores)','205':'Belgium','206':'Belarus','207':'Bulgaria','208':'Vatican','209':'Cyprus','210':'Cyprus','212':'Cyprus','215':'Malta','218':'Germany','219':'Denmark','220':'Denmark','224':'Spain','225':'Spain','226':'France','227':'France','228':'France','229':'Malta','230':'Finland','231':'Faroe Islands','232':'United Kingdom','233':'United Kingdom','234':'United Kingdom','235':'United Kingdom','236':'Gibraltar','237':'Greece','238':'Croatia','239':'Greece','240':'Greece','241':'Greece','242':'Morocco','243':'Hungary','244':'Netherlands','245':'Netherlands','246':'Netherlands','247':'Italy','248':'Malta','249':'Malta','250':'Ireland','251':'Iceland','252':'Liechtenstein','253':'Luxembourg','254':'Monaco','255':'Portugal (Madeira)','256':'Malta','257':'Norway','258':'Norway','259':'Norway','261':'Poland','262':'Montenegro','263':'Portugal','264':'Romania','265':'Sweden','266':'Sweden','267':'Slovakia','268':'San Marino','269':'Switzerland','270':'Czech Republic','271':'Turkey','272':'Ukraine','273':'Russia','274':'North Macedonia','275':'Latvia','276':'Estonia','277':'Lithuania','278':'Slovenia','279':'Serbia','301':'Anguilla','303':'USA (Alaska)','304':'Antigua and Barbuda','305':'Antigua and Barbuda','306':'Curaçao / St Maarten','307':'Aruba','308':'Bahamas','309':'Bahamas','310':'Bermuda','311':'Bahamas','312':'Belize','314':'Barbados','316':'Canada','319':'Cayman Islands','321':'Costa Rica','323':'Cuba','325':'Dominica','327':'Dominican Republic','329':'Guadeloupe','330':'Grenada','331':'Greenland','332':'Guatemala','334':'Honduras','336':'Haiti','338':'United States','339':'United States','341':'Jamaica','343':'Saint Kitts and Nevis','345':'Saint Lucia','347':'Mexico','348':'Martinique','350':'Nicaragua','351':'Panama','352':'Panama','353':'Panama','354':'Panama','355':'Panama','356':'Panama','357':'Panama','358':'Puerto Rico','359':'El Salvador','361':'Saint Pierre and Miquelon','362':'Trinidad and Tobago','364':'Turks and Caicos','366':'United States','367':'United States','368':'United States','369':'United States','370':'Panama','371':'Panama','372':'Panama','373':'Panama','374':'Panama','375':'Saint Vincent','376':'Virgin Islands (BVI)','377':'Virgin Islands (US)','378':'Barbados','379':'Saint Kitts and Nevis','401':'Afghanistan','403':'Saudi Arabia','405':'Bangladesh','408':'Bahrain','410':'Bhutan','412':'China','413':'China','414':'China','416':'Taiwan','419':'Sri Lanka','422':'Iran','423':'Azerbaijan','425':'Iraq','428':'Israel','431':'Japan','432':'Japan','434':'Turkmenistan','436':'Kazakhstan','437':'Uzbekistan','438':'Jordan','440':'South Korea','441':'South Korea','443':'Palestine','445':'North Korea','447':'Kuwait','450':'Lebanon','451':'Kyrgyzstan','453':'Macao','455':'Maldives','457':'Mongolia','459':'Nepal','461':'Oman','463':'Pakistan','466':'Qatar','468':'Syria','470':'United Arab Emirates','472':'Tajikistan','473':'Yemen','477':'Hong Kong','478':'Bosnia and Herzegovina','501':'Antarctica','503':'Australia','506':'Myanmar','508':'Brunei','510':'Micronesia','511':'Palau','512':'New Zealand','514':'Cambodia','515':'Cambodia','516':'Christmas Island','518':'Cook Islands','520':'Fiji','523':'Cocos Islands','525':'Indonesia','529':'Kiribati','531':'Laos','533':'Malaysia','536':'Northern Mariana Islands','538':'Marshall Islands','540':'New Caledonia','542':'Niue','544':'Nauru','546':'French Polynesia','548':'Philippines','550':'East Timor','553':'Papua New Guinea','555':'Pitcairn Islands','557':'Solomon Islands','559':'American Samoa','561':'Samoa','563':'Singapore','564':'Singapore','565':'Singapore','566':'Singapore','567':'Thailand','570':'Tonga','572':'Tuvalu','574':'Vietnam','576':'Vanuatu','577':'Wallis and Futuna','578':'Tuvalu','601':'South Africa','603':'Angola','605':'Algeria','607':'Saint Paul Island','608':'Burundi','609':'Benin','610':'Botswana','611':'Comoros','612':'Cameroon','613':'Cape Verde','615':'Congo','616':'Comoros','617':'Djibouti','618':'Kerguelen','619':'Ivory Coast','620':'Madagascar','621':'Mali','622':'Mozambique','624':'Zambia','625':'Tanzania','626':'Nigeria','627':'Namibia','629':'Senegal','630':'Somalia','631':'Togo','632':'Mauritania','633':'Morocco','634':'Egypt','635':'Tunisia','636':'Liberia','637':'Liberia','638':'Libya','642':'Ethiopia','644':'Gambia','645':'Ghana','647':'Reunion','649':'Kenya','650':'Eritrea','654':'Malawi','655':'Mauritius','656':'Chad','657':'Tanzania','659':'Rwanda','660':'Sierra Leone','661':'Somalia','663':'Sudan','664':'Seychelles','665':'Swaziland','666':'South Sudan','667':'Saint Helena','668':'Uganda','669':'Zimbabwe','670':'Sudan','671':'Guinea','672':'Zimbabwe','674':'Democratic Republic of Congo','675':'Equatorial Guinea','676':'Gabon','677':'Burkina Faso','678':'Central African Republic','679':'Guinea-Bissau','701':'Argentina','710':'Brazil','720':'Bolivia','725':'Chile','730':'Colombia','735':'Ecuador','740':'Falkland Islands','745':'French Guiana','750':'Guyana','755':'Paraguay','760':'Peru','765':'Suriname','770':'Uruguay','775':'Venezuela',
+};
+
+function decodeMmsi(mmsi) {
+  const s = String(mmsi).padStart(9,'0');
+  const mid = s.substring(0,3);
+  let type = 'Ship', special = null;
+  if (s.startsWith('00'))      { type='Coast Station'; }
+  else if (s.startsWith('0'))  { type='Group Call'; }
+  else if (s.startsWith('111')){ type='SAR Aircraft'; }
+  else if (s.startsWith('970')){ type='SAR Device'; }
+  else if (s.startsWith('972')){ type='Man Overboard'; }
+  else if (s.startsWith('974')){ type='EPIRB'; }
+  else if (s.startsWith('99')) { type='AtoN Buoy/Beacon'; }
+  else if (s.startsWith('98')) { type='Craft w/ Parent Ship'; }
+  const mid3 = s.startsWith('111') ? s.substring(3,6) : mid;
+  const country = MID_COUNTRY[mid3] || MID_COUNTRY[mid] || 'Unknown';
+  return { type, country, mid: mid3, mmsi: s };
+}
+
+app.get('/api/enrich/ship/:mmsi', async (req, res) => {
+  const mmsi = req.params.mmsi.replace(/\D/g,'');
+  if (!mmsi || mmsi.length < 7) return res.status(400).json({error:'bad mmsi'});
+  const ck = `ship_${mmsi}`;
+  const cached = getCached(ck, 600000); // 10 min
+  if (cached) return res.json(cached);
+
+  const result = { mmsi, ...decodeMmsi(mmsi), sources:['mmsi_decode'] };
+
+  // Try VesselFinder vessel detail (public HTML endpoint)
+  try {
+    const r = await fetchUrl(`https://www.vesselfinder.com/vessels/details/${mmsi}`, {
+      headers: { 'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0', 'Accept':'text/html,application/xhtml+xml', 'Referer':'https://www.vesselfinder.com/' },
+      timeout: 10000,
+    });
+    if (r.status === 200 && r.data.includes('IMO')) {
+      const html = r.data;
+      const extract = (re) => { const m = html.match(re); return m ? m[1].trim() : null; };
+      result.imo       = extract(/IMO[:\s]+(\d{7})/i);
+      result.flag      = extract(/[Ff]lag[:\s"]+([A-Za-z\s]+)["<]/);
+      result.built     = extract(/[Bb]uilt[:\s"]+(\d{4})/);
+      result.length    = extract(/[Ll]ength[:\s"]+(\d+)/);
+      result.beam      = extract(/[Bb]eam[:\s"]+(\d+)/);
+      result.dwt       = extract(/DWT[:\s"]+([0-9,]+)/);
+      result.gt        = extract(/GT[:\s"]+([0-9,]+)/);
+      result.type_desc = extract(/class="[^"]*type[^"]*"[^>]*>([^<]+)/i);
+      const hasData = result.imo || result.flag || result.built;
+      if (hasData) result.sources.push('vesselfinder');
+    }
+  } catch(e) {}
+
+  // Try MarineTraffic vessel page
+  try {
+    const r = await fetchUrl(`https://www.marinetraffic.com/en/ais/details/ships/mmsi:${mmsi}`, {
+      headers: { 'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0', 'Accept':'text/html', 'Referer':'https://www.marinetraffic.com/' },
+      timeout: 10000,
+    });
+    if (r.status === 200) {
+      const m = r.data.match(/<title>([^<]+)<\/title>/i);
+      if (m && !result.name) result.name = m[1].replace(/- MarineTraffic.*/i,'').trim();
+      const dest = r.data.match(/[Dd]estination[:\s"]+([A-Z\s]+)["<]/);
+      if (dest) result.destination = dest[1].trim();
+      result.sources.push('marinetraffic');
+    }
+  } catch(e) {}
+
+  res.json(setCache(ck, result));
+});
+
+// Satellite enrichment: CelesTrak SATCAT + compute orbital elements from TLE
+app.get('/api/enrich/satellite/:norad', async (req, res) => {
+  const norad = req.params.norad.replace(/\D/g,'');
+  if (!norad) return res.status(400).json({error:'bad norad'});
+  const ck = `sat_${norad}`;
+  const cached = getCached(ck, 3600000); // 1hr
+  if (cached) return res.json(cached);
+
+  const result = { norad_id: norad, sources:[] };
+
+  // CelesTrak SATCAT — public, no key needed
+  try {
+    const r = await fetchUrl(`https://celestrak.org/satcat/query.php?CATNR=${norad}&FORMAT=json`, { timeout:10000 });
+    if (r.status === 200) {
+      const d = JSON.parse(r.data);
+      const s = Array.isArray(d) ? d[0] : d;
+      if (s) {
+        result.name         = s.OBJECT_NAME;
+        result.int_designator = s.OBJECT_ID;
+        result.norad_id     = s.NORAD_CAT_ID || norad;
+        result.object_type  = s.OBJECT_TYPE;
+        result.rcs_size     = s.RCS_SIZE;
+        result.country      = s.COUNTRY_CODE;
+        result.launch_date  = s.LAUNCH_DATE;
+        result.launch_site  = s.SITE;
+        result.decay_date   = s.DECAY_DATE || null;
+        result.period_min   = s.PERIOD ? parseFloat(s.PERIOD).toFixed(2) : null;
+        result.apoapsis_km  = s.APOAPSIS ? parseFloat(s.APOAPSIS).toFixed(0) : null;
+        result.periapsis_km = s.PERIAPSIS ? parseFloat(s.PERIAPSIS).toFixed(0) : null;
+        result.inclination  = s.INCLINATION ? parseFloat(s.INCLINATION).toFixed(2) : null;
+        result.eccentricity = s.ECCENTRICITY ? parseFloat(s.ECCENTRICITY).toFixed(6) : null;
+        result.classification = s.CLASSIFICATION_TYPE;
+        result.sources.push('celestrak_satcat');
+      }
+    }
+  } catch(e) { console.warn('[Enrich Sat]', e.message); }
+
+  // Derive orbital info if we have period
+  if (result.period_min) {
+    const p = parseFloat(result.period_min);
+    const meanAlt = result.apoapsis_km && result.periapsis_km
+      ? ((parseFloat(result.apoapsis_km) + parseFloat(result.periapsis_km)) / 2).toFixed(0)
+      : null;
+    result.mean_altitude_km = meanAlt;
+    result.orbits_per_day   = (1440 / p).toFixed(2);
+    result.orbital_regime   = p < 128 ? 'LEO' : p < 600 ? 'MEO' : p < 1500 ? 'HEO' : 'GEO';
+    // Semi-major axis from period (Kepler's 3rd law): a = (μ * T²/4π²)^(1/3)
+    const mu = 398600.4418; // km³/s²
+    const T_sec = p * 60;
+    const a = Math.pow((mu * T_sec * T_sec) / (4 * Math.PI * Math.PI), 1/3);
+    result.semi_major_axis_km = a.toFixed(0);
+    // Velocity at mean altitude (circular orbit approximation): v = sqrt(μ/a)
+    result.orbital_velocity_kms = Math.sqrt(mu / a).toFixed(3);
+  }
+
+  res.json(setCache(ck, result));
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
