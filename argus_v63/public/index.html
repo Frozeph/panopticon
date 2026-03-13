@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ARGUS // GLOBAL INTELLIGENCE SYSTEM</title>
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
+  <link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="scanlines"></div>
+  <div id="vignette"></div>
+  <div id="cesiumContainer"></div>
+
+  <!-- TOP BAR -->
+  <div id="topbar">
+    <div class="tb-left">
+      <div class="logo-mark">▲</div>
+      <div class="tb-brand">
+        <span class="sys-label">ARGUS</span>
+        <span class="sys-sublabel">GLOBAL INTELLIGENCE SYSTEM v5.0</span>
+      </div>
+      <div class="tb-status">
+        <span class="status-dot active"></span>
+        <span class="status-text">UPLINK ACTIVE</span>
+      </div>
+    </div>
+    <div class="tb-center">
+      <div class="time-block">
+        <span class="time-label">LOCAL</span>
+        <span id="clock" class="time-val">--:--:--</span>
+      </div>
+      <div class="time-sep">|</div>
+      <div class="time-block">
+        <span class="time-label">UTC</span>
+        <span id="utc-clock" class="time-val">--:--:--</span>
+      </div>
+      <div class="time-sep">|</div>
+      <div class="threat-block">
+        <span class="threat-label">THREAT</span>
+        <span class="threat-val">GUARDED</span>
+      </div>
+    </div>
+    <div class="tb-right">
+      <div class="coord-block">
+        <div class="coord-row"><span class="c-lbl">LAT</span><span id="lat-display" class="c-val">---.---°</span></div>
+        <div class="coord-row"><span class="c-lbl">LON</span><span id="lon-display" class="c-val">---.---°</span></div>
+      </div>
+      <div class="coord-block">
+        <div class="coord-row"><span class="c-lbl">ALT</span><span id="alt-display" class="c-val">---km</span></div>
+        <div class="coord-row">
+          <span id="lod-indicator" class="lod-badge lod-global">LOD: GLOBAL</span>
+          <span id="token-status" style="font-size:8px;color:var(--text-muted);letter-spacing:0.1em;margin-left:8px">INIT...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LEFT PANEL -->
+  <div id="left-panel">
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="layers">LAYERS</button>
+      <button class="tab-btn" data-tab="intel">INTEL</button>
+      <button class="tab-btn" data-tab="playback">PLAYBACK</button>
+    </div>
+
+    <!-- TAB: LAYERS -->
+    <div class="tab-pane" id="tab-layers">
+
+      <div class="layer-section">
+        <div class="layer-section-title">ORBITAL</div>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-satellites" checked>
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">🛰</span>
+          <span class="layer-name">Satellites</span>
+          <span class="layer-count" id="sat-count">0</span>
+        </label>
+      </div>
+
+      <div class="layer-section">
+        <div class="layer-section-title">AVIATION</div>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-flights">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">✈</span>
+          <span class="layer-name">Commercial Flights</span>
+          <span class="layer-count" id="flight-count">0</span>
+        </label>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-military">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">★</span>
+          <span class="layer-name">Military Flights</span>
+          <span class="layer-count" id="mil-count">0</span>
+        </label>
+        <div id="filter-stats" class="filter-stats-mini"></div>
+        <button class="sub-btn" onclick="document.getElementById('filter-panel').classList.toggle('hidden')">⚙ Flight Filters</button>
+      </div>
+
+      <div class="layer-section">
+        <div class="layer-section-title">MARITIME</div>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-ships">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">⛵</span>
+          <span class="layer-name">AIS Vessels</span>
+          <span class="layer-count" id="ship-count">0</span>
+        </label>
+      </div>
+
+      <div class="layer-section">
+        <div class="layer-section-title">GROUND</div>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-traffic">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">🛣</span>
+          <span class="layer-name">Road Network</span>
+          <span class="layer-count" id="traffic-count">0</span>
+        </label>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-cctv">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">📷</span>
+          <span class="layer-name">CCTV Cameras</span>
+          <span class="layer-count" id="cctv-count">0</span>
+        </label>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-meshtastic">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">📡</span>
+          <span class="layer-name">Meshtastic Nodes</span>
+          <span class="layer-count" id="mesh-count">0</span>
+        </label>
+      </div>
+
+      <div class="layer-section">
+        <div class="layer-section-title">GEOPHYSICAL</div>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-quakes">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">📈</span>
+          <span class="layer-name">Seismic Events</span>
+          <span class="layer-count" id="quake-count">0</span>
+        </label>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-sensors">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">🔬</span>
+          <span class="layer-name">Seismic Stations</span>
+          <span class="layer-count" id="sensor-count">0</span>
+        </label>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-wildfires">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">🔥</span>
+          <span class="layer-name">Active Fires</span>
+          <span class="layer-count" id="fire-count">0</span>
+        </label>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-gpsjam">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">⚡</span>
+          <span class="layer-name">GPS Jamming</span>
+          <span class="layer-count" id="jam-count">0</span>
+        </label>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-weather">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">🌡</span>
+          <span class="layer-name">Weather Grid</span>
+          <span class="layer-count" id="weather-count">0</span>
+        </label>
+      </div>
+
+      <div class="layer-section">
+        <div class="layer-section-title">SATELLITE IMAGERY</div>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-sat-imagery">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">🌍</span>
+          <span class="layer-name">Overlay</span>
+        </label>
+        <select id="sat-imagery-select" class="layer-select">
+          <option value="none">— Select product —</option>
+          <option value="modis_true">MODIS True Colour</option>
+          <option value="viirs_true">VIIRS True Colour</option>
+          <option value="nightlights">VIIRS Night Lights</option>
+          <option value="sst">Sea Surface Temp</option>
+          <option value="land_temp">Land Surface Temp</option>
+          <option value="rain_radar">Rain Rate (GPM)</option>
+        </select>
+      </div>
+
+      <div class="layer-section">
+        <div class="layer-section-title">OSINT</div>
+        <label class="layer-row">
+          <input type="checkbox" id="toggle-shodan">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-icon">🔍</span>
+          <span class="layer-name">Shodan Devices</span>
+          <span class="layer-count" id="shodan-count">0</span>
+        </label>
+      </div>
+
+      <div class="section-divider"></div>
+      <div class="layer-section-title" style="margin-bottom:8px">DISPLAY MODE</div>
+      <div class="det-group">
+        <button class="det-btn active" data-mode="sparse">SPARSE</button>
+        <button class="det-btn" data-mode="full">FULL LABELS</button>
+      </div>
+
+      <div class="section-divider"></div>
+      <div class="layer-section-title" style="margin-bottom:8px">TARGET LOCK</div>
+      <div id="tracking-info"><div class="no-track">No target locked</div></div>
+      <button id="clear-track-btn" style="display:none" class="danger-btn">Release Target</button>
+    </div>
+
+    <!-- TAB: INTEL -->
+    <div class="tab-pane hidden" id="tab-intel">
+      <div class="section-header">SHODAN OSINT</div>
+
+      <div id="shodan-key-prompt" style="display:none; margin-bottom:10px">
+        <div class="warn-box">⚠ API Key Required</div>
+        <input type="password" id="shodan-key-input" class="text-input" placeholder="Enter Shodan API key...">
+        <button id="shodan-save-key-btn" class="action-btn full-w mt-4">Save Key</button>
+      </div>
+
+      <select id="shodan-preset-select" class="layer-select" style="margin-bottom:6px">
+        <option value="">— Preset query —</option>
+      </select>
+      <input type="text" id="shodan-query-input" class="text-input" placeholder='e.g. port:8080 country:GB'>
+      <button id="shodan-search-btn" class="action-btn full-w mt-4">▶ Execute Scan</button>
+      <div id="shodan-result-count" class="result-note"></div>
+
+      <div class="section-divider"></div>
+      <div class="section-header">
+        CREDIT USAGE
+        <button id="shodan-credit-refresh" class="icon-btn">↺</button>
+      </div>
+      <div id="shodan-credit-display" class="credit-display">
+        <span class="muted-text">Loading...</span>
+      </div>
+      <div class="info-note">Results cached 1h · 1 credit/search</div>
+
+      <div class="section-divider"></div>
+      <div class="section-header">MESHTASTIC</div>
+      <div id="mesh-panel" class="mesh-panel">
+        <div class="mesh-stat-row">
+          <span class="muted-text">Nodes online:</span>
+          <span id="mesh-online-count" class="val-green">—</span>
+        </div>
+        <div id="mesh-messages" class="mesh-messages">
+          <div class="muted-text" style="padding:8px 0">Toggle Meshtastic layer to load messages</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB: PLAYBACK -->
+    <div class="tab-pane hidden" id="tab-playback">
+      <div class="section-header">TIME MACHINE</div>
+      <div class="stat-row"><span class="muted-text">Status</span><span id="playback-status" class="val-green">NOT INITIALISED</span></div>
+      <div class="stat-row"><span class="muted-text">Current</span><span id="playback-time" class="val-green">—</span></div>
+      <button id="pb-init-btn" class="action-btn full-w mt-4">⟳ Load Timeline</button>
+
+      <div class="section-divider"></div>
+      <div class="section-header">TIMELINE</div>
+      <canvas id="timeline-canvas" width="196" height="50" style="width:100%;cursor:crosshair;display:block;border:1px solid var(--border)"></canvas>
+      <input type="range" id="pb-scrubber" min="0" max="100" value="100" step="0.1" class="pb-scrubber">
+
+      <div class="pb-controls">
+        <button id="pb-play-btn" class="action-btn">▶ Play</button>
+        <select id="pb-speed" class="layer-select" style="flex:1">
+          <option value="1">1× speed</option>
+          <option value="4">4× speed</option>
+          <option value="12">12× speed</option>
+          <option value="60">60× speed</option>
+          <option value="360">360× speed</option>
+        </select>
+      </div>
+
+      <div class="section-divider"></div>
+      <div class="section-header">
+        STORAGE
+        <button id="storage-refresh-btn" class="icon-btn">↺</button>
+      </div>
+      <div id="storage-stats" class="storage-stats">Loading...</div>
+      <div class="info-note">7-day retention · Delta compressed</div>
+    </div>
+  </div>
+
+  <!-- RIGHT PANEL -->
+  <div id="right-panel">
+    <div class="section-header">DISPLAY</div>
+    <div class="vision-modes">
+      <button class="vision-btn active" data-mode="normal">STANDARD</button>
+      <button class="vision-btn" data-mode="crt">CRT</button>
+      <button class="vision-btn" data-mode="nvg">NVG</button>
+      <button class="vision-btn" data-mode="flir">FLIR</button>
+    </div>
+
+    <div class="section-divider"></div>
+    <div class="section-header">CAMERA</div>
+    <div class="preset-grid">
+      <button class="preset-btn" data-preset="global">GLOBAL</button>
+      <button class="preset-btn" data-preset="london">LONDON</button>
+      <button class="preset-btn" data-preset="nyc">NEW YORK</button>
+      <button class="preset-btn" data-preset="dc">WASHINGTON</button>
+      <button class="preset-btn" data-preset="moscow">MOSCOW</button>
+      <button class="preset-btn" data-preset="beijing">BEIJING</button>
+      <button class="preset-btn" data-preset="dubai">DUBAI</button>
+      <button class="preset-btn" data-preset="sydney">SYDNEY</button>
+    </div>
+  </div>
+
+  <!-- FLIGHT FILTER PANEL -->
+  <div id="filter-panel" class="float-panel hidden">
+    <div class="fp-header">
+      <span>✈ FLIGHT FILTERS</span>
+      <button onclick="document.getElementById('filter-panel').classList.add('hidden')" class="icon-btn">✕</button>
+    </div>
+    <div class="fp-grid">
+      <div class="fp-group"><label>Min Alt (m)</label><input type="number" id="f-min-alt" class="text-input" value="0"></div>
+      <div class="fp-group"><label>Max Alt (m)</label><input type="number" id="f-max-alt" class="text-input" value="45000"></div>
+      <div class="fp-group"><label>Min Speed</label><input type="number" id="f-min-spd" class="text-input" value="0"></div>
+      <div class="fp-group"><label>Max Speed</label><input type="number" id="f-max-spd" class="text-input" value="1200"></div>
+      <div class="fp-group" style="grid-column:span 2"><label>Country Code</label><input type="text" id="f-country" class="text-input" placeholder="GB, US, DE..."></div>
+      <div class="fp-group" style="grid-column:span 2"><label>Callsign Contains</label><input type="text" id="f-callsign" class="text-input" placeholder="BAW, UNITED..."></div>
+      <div class="fp-group" style="grid-column:span 2">
+        <label class="layer-row" style="padding:0">
+          <input type="checkbox" id="f-show-unknown" checked>
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span style="margin-left:6px;font-size:11px">Show unknown callsigns</span>
+        </label>
+      </div>
+    </div>
+    <div class="fp-actions">
+      <button id="filter-apply-btn" class="action-btn">Apply</button>
+      <button id="filter-reset-btn" class="action-btn dim-btn">Reset</button>
+    </div>
+  </div>
+
+  <!-- BOTTOM BAR -->
+  <div id="bottombar">
+    <div class="log-strip" id="event-log">
+      <span class="log-label">EVT</span>
+      <span class="log-sep">//</span>
+      <span class="log-item">SYSTEM INITIALISED</span>
+    </div>
+    <div class="bb-sources">
+      NASA GIBS · CELESTRAK · OPENSKY · USGS · OSM · FIRMS · OPEN-METEO · AISSTREAM · GPSJAM · MESHTASTIC
+    </div>
+  </div>
+
+  <!-- TOKEN MODAL -->
+  <div id="token-modal" class="modal-overlay">
+    <div class="modal-box">
+      <div class="modal-eyebrow">INITIALISATION REQUIRED</div>
+      <div class="modal-title">ARGUS<br>GLOBAL INTELLIGENCE</div>
+      <div class="modal-body">Enter a Cesium Ion token to enable photorealistic 3D globe tiles. Free tokens at <strong>ion.cesium.com</strong></div>
+      <input type="text" id="cesium-token-input" class="text-input" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6Ikp...">
+      <div class="modal-actions">
+        <button id="token-submit-btn" class="action-btn">Initialise System</button>
+        <button id="token-skip-btn" class="dim-btn">Use Default (Limited)</button>
+      </div>
+      <div style="margin-top:10px;text-align:center">
+        <button onclick="localStorage.removeItem('cesium_token');location.reload()" style="background:none;border:none;color:var(--text-muted);font-size:9px;cursor:pointer;font-family:var(--font-mono);letter-spacing:0.1em">⟳ Clear saved token &amp; re-enter</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- DETAIL PANEL -->
+  <div id="detail-panel" class="hidden">
+    <div class="dp-header">
+      <span id="dp-type-badge" class="dp-badge">UNK</span>
+      <span id="dp-title" class="dp-title">TARGET</span>
+      <button id="dp-close" class="icon-btn">✕</button>
+    </div>
+    <div id="dp-content"></div>
+    <button id="dp-track-btn" class="dp-track-btn">🎯 Lock Target</button>
+  </div>
+
+  <!-- MESHTASTIC MESSAGE MODAL -->
+  <div id="mesh-modal" class="modal-overlay hidden">
+    <div class="modal-box" style="max-width:520px">
+      <div class="dp-header" style="margin-bottom:12px">
+        <span class="dp-badge">📡</span>
+        <span id="mesh-modal-name" class="dp-title">NODE</span>
+        <button onclick="document.getElementById('mesh-modal').classList.add('hidden')" class="icon-btn">✕</button>
+      </div>
+      <div id="mesh-modal-info" style="font-size:11px;color:var(--text-dim);margin-bottom:12px;line-height:1.8"></div>
+      <div class="section-header" style="margin-bottom:8px">RECENT MESSAGES</div>
+      <div id="mesh-modal-messages" style="max-height:300px;overflow-y:auto;font-size:11px"></div>
+    </div>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

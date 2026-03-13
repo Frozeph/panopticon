@@ -35,11 +35,50 @@ const PRESETS = {
 // ── ICONS ─────────────────────────────────────────────────────────────────────
 const svg = (w,h,body) => `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${body}</svg>`)}`;
 
-function planeIcon(color,mil) {
-  const shape = mil
-    ? `<polygon points="12,1 14,8 22,9 16,15 18,23 12,18 6,23 8,15 2,9 10,8" fill="${color}"/>`
-    : `<path d="M12,1 L16,9 L23,11 L16,14 L12,23 L8,14 L1,11 L8,9Z" fill="${color}"/>`;
-  return svg(24,24,`${shape}<circle cx="12" cy="11" r="2" fill="white" opacity="0.7"/>`);
+function planeIcon(color, cat, size) {
+  const s = size || 22;
+  let shape;
+  if (cat === 'heli') {
+    shape = `<ellipse cx="${s/2}" cy="${s*0.55}" rx="${s*0.2}" ry="${s*0.12}" fill="${color}"/>
+      <line x1="${s*0.05}" y1="${s*0.42}" x2="${s*0.95}" y2="${s*0.42}" stroke="${color}" stroke-width="${s*0.1}" stroke-linecap="round"/>
+      <line x1="${s/2}" y1="${s*0.42}" x2="${s/2}" y2="${s*0.88}" stroke="${color}" stroke-width="${s*0.09}"/>`;
+  } else if (cat === 'mil') {
+    shape = `<path d="M${s/2},${s*0.06} L${s*0.62},${s*0.38} L${s*0.92},${s*0.44} L${s*0.72},${s*0.62} L${s*0.78},${s*0.9} L${s/2},${s*0.76} L${s*0.22},${s*0.9} L${s*0.28},${s*0.62} L${s*0.08},${s*0.44} L${s*0.38},${s*0.38}Z" fill="${color}"/>`;
+  } else if (cat === 'prop') {
+    shape = `<path d="M${s/2},${s*0.06} L${s*0.57},${s*0.45} L${s*0.88},${s*0.52} L${s*0.88},${s*0.6} L${s*0.57},${s*0.56} L${s*0.55},${s*0.78} L${s*0.65},${s*0.82} L${s*0.65},${s*0.88} L${s/2},${s*0.84} L${s*0.35},${s*0.88} L${s*0.35},${s*0.82} L${s*0.45},${s*0.78} L${s*0.43},${s*0.56} L${s*0.12},${s*0.6} L${s*0.12},${s*0.52} L${s*0.43},${s*0.45}Z" fill="${color}"/>`;
+  } else {
+    // jet / default — widebody airliner silhouette
+    shape = `<path d="M${s/2},${s*0.04} L${s*0.58},${s*0.4} L${s*0.92},${s*0.5} L${s*0.92},${s*0.58} L${s*0.58},${s*0.52} L${s*0.56},${s*0.74} L${s*0.68},${s*0.78} L${s*0.68},${s*0.85} L${s/2},${s*0.8} L${s*0.32},${s*0.85} L${s*0.32},${s*0.78} L${s*0.44},${s*0.74} L${s*0.42},${s*0.52} L${s*0.08},${s*0.58} L${s*0.08},${s*0.5} L${s*0.42},${s*0.4}Z" fill="${color}"/>`;
+  }
+  return svg(s, s, shape);
+}
+
+// ADSBexchange-style altitude colour gradient
+function altitudeColor(altM, onGround) {
+  if (onGround || altM < 15)    return '#888888';
+  const altFt = altM * 3.28084;
+  if (altFt <  1000) return '#ff7f00';
+  if (altFt <  5000) return '#ff9900';
+  if (altFt < 10000) return '#ffcc00';
+  if (altFt < 18000) return '#aaee22';
+  if (altFt < 25000) return '#00ee88';
+  if (altFt < 33000) return '#00ccff';
+  if (altFt < 40000) return '#2299ff';
+  if (altFt < 45000) return '#9955ff';
+  return '#ff44aa';
+}
+
+// Determine aircraft silhouette category
+function getAircraftCategory(cs, mil, typeCode) {
+  if (mil) return 'mil';
+  if (typeCode) {
+    const t = typeCode.toUpperCase();
+    if (/^(R|EC|AS|BO|BK|H[0-9]|S[0-9]|UH|AH|CH|SH|HH|MH|A[0-9]{3}H)/.test(t)) return 'heli';
+    if (/^(AT[0-9]|DH|DO|E[0-9]{3}|SF|PC|TB|PA|CE|P[0-9])/.test(t)) return 'prop';
+    if (/^(F[0-9]|SU|MIG|EF|GR|TO|A10|B1|B2|B52|C17|C130|KC)/.test(t)) return 'mil';
+  }
+  if (/^(LIFE|HEMS|ROTO|G-|N[0-9]{1,4}[A-Z]|LN-)/.test(cs)) return 'heli';
+  return 'jet';
 }
 function shipIcon(color)  { return svg(20,20,`<polygon points="10,2 18,17 10,13 2,17" fill="${color}" stroke="white" stroke-width="1.2"/>`); }
 function cctvIcon()       { return svg(16,16,`<circle cx="8" cy="8" r="7" fill="#ff6600" opacity="0.9"/><circle cx="8" cy="8" r="3" fill="white" opacity="0.5"/><circle cx="8" cy="8" r="1.5" fill="#ff6600"/>`); }
@@ -150,7 +189,7 @@ async function initCesium(token) {
   },Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
   S.viewer.camera.changed.addEventListener(updateCoords);
   updateCoords();
-  addLog('ARGUS v5 ONLINE');
+  addLog('ARGUS v6.3 ONLINE');
   loadSatellites();
 }
 
@@ -198,7 +237,7 @@ function renderSatellites() {
   const ds=new Cesium.CustomDataSource('satellites');
   const full=S.detMode==='full';
   const now=new Date();
-  const limit=Math.min(S.tleData.length,500);
+  const limit=Math.min(S.tleData.length,2000);
   for(let i=0;i<limit;i++){
     const sat=S.tleData[i];
     try{
@@ -255,7 +294,20 @@ async function loadFlights(mil=false) {
   const key=mil?'military':'flights';
   addLog(`FETCHING ${mil?'MILITARY':'COMMERCIAL'} FLIGHTS...`);
   try{
-    const r=await fetch(mil?'/api/flights/military':'/api/flights/opensky');
+    // Pass camera position to server so adsb.lol can do a lat/lon/dist query
+    let flightUrl = mil ? '/api/flights/military' : '/api/flights/opensky';
+    if (!mil && S.viewer) {
+      try {
+        const cam = S.viewer.camera.positionCartographic;
+        const lat = Cesium.Math.toDegrees(cam.latitude).toFixed(2);
+        const lon = Cesium.Math.toDegrees(cam.longitude).toFixed(2);
+        const altKm = cam.height / 1000;
+        // dist in NM: scale with altitude, capped at 250nm
+        const dist = Math.min(250, Math.max(50, Math.round(altKm * 0.05)));
+        flightUrl = `/api/flights/opensky?lat=${lat}&lon=${lon}&dist=${dist}`;
+      } catch {}
+    }
+    const r=await fetch(flightUrl);
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     const data=await r.json();
     const states=data.states||[];
@@ -318,7 +370,7 @@ function renderFlights(states, mil=false) {
     const spdKt     = Math.round(+(s[9] || 0) * 1.944);
     const altFt     = Math.round(altM * 3.28084);
     const color     = altitudeColor(altM, onGround);
-    const cat       = getAircraftCategory(cs, mil);
+    const cat       = getAircraftCategory(cs, mil, s[17]);
     const iconSize  = cat === 'heli' ? 20 : mil ? 22 : 20;
     const cesColor  = Cesium.Color.fromCssColorString(color);
     const airline   = S.airlineMap[cs];
@@ -530,27 +582,12 @@ function renderGpsJam(geojson){
 }
 
 // ── SHIPS ─────────────────────────────────────────────────────────────────────
-async function loadShips() {
-  try {
-    const r = await fetch('/api/ships');
-    const data = await r.json();
-    if (!r.ok) {
-      // 503 = stream not ready yet — show helpful message, not an error toast
-      const msg = data.error || `HTTP ${r.status}`;
-      console.warn('[ARGUS] Ships:', msg);
-      addLog(`AIS: ${data.connected === false ? 'CONNECTING...' : msg.substring(0,25)}`);
-      if (data.connected === false && !data.error?.includes('No AISSTREAM_KEY')) {
-        // Silently retry — stream is just warming up
-        renderShips([]);
-      } else {
-        showToast(msg.substring(0, 80), 'warn');
-        renderShips([]);
-      }
-      return;
-    }
-    addLog('FETCHING AIS DATA...');
-    renderShips(Array.isArray(data) ? data : (data.ships || []));
-  } catch(e) {
+async function loadShips(){
+  addLog('FETCHING AIS DATA...');
+  try{
+    const r=await fetch('/api/ships'); if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    renderShips(await r.json());
+  } catch(e){
     console.warn('[ARGUS] Ships fetch failed:', e.message);
     addLog(`AIS: ${e.message.substring(0,25)}`);
     showToast(`AIS vessels: ${e.message.substring(0,40)}`, 'warn');

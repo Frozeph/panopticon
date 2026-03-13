@@ -10,7 +10,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "better-sqlite3": "^9.4.3",
-    "msgpackr": "^1.10.1"
+    "msgpackr": "^1.10.1",
+    "ws": "^8.18.0"
   },
   "engines": {
     "node": ">=18"

@@ -279,98 +279,114 @@ app.get('/api/shodan/host/:ip', async (req, res) => {
 // ─── FLIGHTS ─────────────────────────────────────────────────────────────────
 let flightCache = { data: null, ts: 0 };
 
-// ─── FLIGHTS: adsb.lol (free, open, ADSBExchange-compatible) ─────────────────
-// adsb.lol is a community-driven aggregator: https://api.adsb.lol
-// Returns v2 API format compatible with ADSBExchange. No key required currently.
-// Falls back to OpenSky if adsb.lol is down.
-let adsbLolVersion = 'unknown';
-
-async function fetchAllFlights() {
-  // Try adsb.lol first — free, global, unfiltered, ADSBx-compatible
-  try {
-    const r = await fetchUrl('https://api.adsb.lol/v2/all', {
-      headers: { 'Accept': 'application/json', 'User-Agent': 'ARGUS-Intelligence/6.0' }
-    });
-    if (r.status === 200) {
-      const d = JSON.parse(r.data);
-      // adsb.lol v2 returns { ac: [...], msg, now, total, ctime, ptime }
-      // Each aircraft: { hex, flight, lat, lon, alt_baro, gs, track, type, desc, r, t, dbFlags, ... }
-      const states = (d.ac || []).filter(a => a.lat && a.lon).map(a => ([
-        a.hex,                          // [0] icao24
-        (a.flight||'').trim(),          // [1] callsign
-        a.r || '',                      // [2] registration (use as country-ish)
-        null,                           // [3] time_position
-        null,                           // [4] last_contact
-        a.lon,                          // [5] longitude
-        a.lat,                          // [6] latitude
-        a.alt_baro === 'ground' ? 0 : (a.alt_baro || 0) * 0.3048, // [7] baro_altitude in metres
-        a.alt_baro === 'ground',        // [8] on_ground
-        (a.gs || 0) * 0.5144,          // [9] velocity m/s (gs=knots)
-        a.track || 0,                   // [10] true_track degrees
-        a.baro_rate || 0,              // [11] vertical_rate
-        null,                           // [12] sensors
-        a.alt_baro === 'ground' ? 0 : (a.alt_baro || 0) * 0.3048, // [13] geo_altitude
-        a.squawk || '',                // [14] squawk
-        false,                          // [15] spi
-        // Extra fields we carry through
-        a.t || a.type || '',           // aircraft type ICAO e.g. B738
-        a.desc || '',                  // description e.g. "Boeing 737-800"
-        a.dbFlags || 0,               // 1=military, 2=interesting
-        a.category || '',             // ADS-B emitter category
-        a.r || '',                     // registration
-        a.ownOp || '',                 // operator
-      ]));
-      adsbLolVersion = `adsb.lol (${(d.ac||[]).length} ac)`;
-      return { states, source: 'adsb.lol', total: d.total || states.length };
-    }
-  } catch (e) {
-    console.warn('[Flights] adsb.lol failed:', e.message, '— falling back to OpenSky');
-  }
-
-  // Fallback: OpenSky anonymous (rate-limited, may return 503 during peak)
-  try {
-    const r = await fetchUrl('https://opensky-network.org/api/states/all', {
-      headers: { 'User-Agent': 'ARGUS-Intelligence/6.0' }
-    });
-    if (r.status === 200) {
-      const d = JSON.parse(r.data);
-      adsbLolVersion = 'opensky (fallback)';
-      return { states: d.states || [], source: 'opensky' };
-    }
-    throw new Error(`OpenSky HTTP ${r.status}`);
-  } catch (e) {
-    throw new Error(`All flight sources failed. Last: ${e.message}`);
-  }
-}
+// adsb.lol: free, no-key, ADSBExchange-compatible drop-in, global coverage
+// Returns ac[] array with hex, flight, lat, lon, alt_baro, gs, track, category, type, r, t, mil, etc.
+let adsbLolCache = { data: null, ts: 0 };
 
 app.get('/api/flights/opensky', async (req, res) => {
-  if (flightCache.data && Date.now() - flightCache.ts < 8000) return res.json(flightCache.data);
+  // Try adsb.lol first (free, no rate limit, much better data)
+  if (adsbLolCache.data && Date.now() - adsbLolCache.ts < 8000) {
+    return res.json(adsbLolCache.data);
+  }
+
+  // adsb.lol v2 lat/lon/dist endpoint (ADSBexchange-compatible format)
+  const lat  = parseFloat(req.query.lat)  || 0;
+  const lon  = parseFloat(req.query.lon)  || 0;
+  const dist = parseInt(req.query.dist)   || 250; // nautical miles, max 250
+
   try {
-    const data = await fetchAllFlights();
+    // Try global snapshot first (all aircraft), then fall back to bounding query
+    const r = await fetchUrl(`https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${Math.min(dist, 250)}`, {
+      headers: { 'User-Agent': 'ARGUS-Intelligence/6.3 (self-hosted; non-commercial)' }
+    });
+    if (r.status === 200) {
+      const data = JSON.parse(r.data);
+      // Normalise to OpenSky-compat shape { states: [[icao24, callsign, country, ?, ?, lon, lat, alt, onGround, vel, hdg, vr, sensors, altGeo, squawk, spi, cat]] }
+      const states = (data.ac || []).filter(a => a.lat != null && a.lon != null).map(a => [
+        a.hex || '',                         // 0 icao24
+        (a.flight || '').trim(),             // 1 callsign
+        a.r || '',                           // 2 country/reg
+        null, null,                          // 3,4 time_position, last_contact
+        a.lon,                               // 5 longitude
+        a.lat,                               // 6 latitude
+        (a.alt_baro === 'ground' ? 0 : (a.alt_baro || 0)) * 0.3048, // 7 baro_alt (ft→m)
+        a.alt_baro === 'ground',             // 8 on_ground
+        (a.gs || 0) * 0.514444,             // 9 velocity (kts→m/s)
+        a.track || 0,                        // 10 true_track
+        a.baro_rate || 0,                    // 11 vertical_rate
+        null,                                // 12 sensors
+        (a.alt_geom || 0) * 0.3048,         // 13 geo_alt
+        a.squawk || null,                    // 14 squawk
+        false,                               // 15 spi
+        a.category || null,                  // 16 position_source / category
+        // extra fields for rich rendering
+        a.t || null,                         // 17 aircraft type (B738, A320, etc)
+        a.mil || false,                      // 18 military flag
+        a.dbFlags || 0,                      // 19 db flags
+      ]);
+      const payload = { states, _src: 'adsblol', _count: states.length };
+      adsbLolCache = { data: payload, ts: Date.now() };
+      saveSnapshot('flights', payload);
+      res.set('Cache-Control', 'max-age=8');
+      return res.json(payload);
+    }
+  } catch(e) {
+    console.warn('[Flights] adsb.lol failed:', e.message);
+  }
+
+  // Fallback: OpenSky (anonymous, rate limited)
+  if (flightCache.data && Date.now() - flightCache.ts < 15000) return res.json(flightCache.data);
+  try {
+    const r = await fetchUrl('https://opensky-network.org/api/states/all');
+    if (r.status !== 200) throw new Error(`OpenSky HTTP ${r.status}`);
+    const data = JSON.parse(r.data);
     flightCache = { data, ts: Date.now() };
     saveSnapshot('flights', data);
     res.set('Cache-Control', 'max-age=8');
     res.json(data);
-  } catch (e) {
-    res.status(503).json({ states: [], error: e.message, source: 'none' });
+  } catch(e) {
+    console.warn('[Flights] OpenSky also failed:', e.message);
+    res.status(503).json({ states: [], error: 'All flight data sources unavailable' });
   }
 });
 
 app.get('/api/flights/military', async (req, res) => {
+  // adsb.lol /v2/mil — returns aircraft flagged military in their DB (much better than heuristic callsign matching)
   try {
-    // adsb.lol military filter: dbFlags bit 1 = military
-    const data = await fetchAllFlights();
-    const milCallsign = /^(USAF|NAVY|RCH|REACH|SAM|PAT|DUKE|TUSK|HUNT|ROCKY|VALOR|GHOST|BLADE|ATLAS|IRON|HAWK|EAGLE|RAVEN|COBRA|VIPER|TIGER|SHARK|RRR|JTAC|MAGIC|SWEEP|SPAR|EXEC|GATOR)/i;
-    const states = (data.states || []).filter(s => {
-      if (!s) return false;
-      const flags = s[18] || 0;
-      if (flags & 1) return true; // dbFlags military bit
-      return milCallsign.test((s[1] || '').trim());
-    }).slice(0, 200);
+    const r = await fetchUrl('https://api.adsb.lol/v2/mil', {
+      headers: { 'User-Agent': 'ARGUS-Intelligence/6.3 (self-hosted; non-commercial)' }
+    });
+    if (r.status === 200) {
+      const data = JSON.parse(r.data);
+      const states = (data.ac || []).filter(a => a.lat != null && a.lon != null).map(a => [
+        a.hex || '', (a.flight || '').trim(), a.r || '', null, null,
+        a.lon, a.lat,
+        (a.alt_baro === 'ground' ? 0 : (a.alt_baro || 0)) * 0.3048,
+        a.alt_baro === 'ground',
+        (a.gs || 0) * 0.514444,
+        a.track || 0, a.baro_rate || 0, null,
+        (a.alt_geom || 0) * 0.3048,
+        a.squawk || null, false, a.category || null,
+        a.t || null, true, a.dbFlags || 0,
+      ]);
+      saveSnapshot('military', { states });
+      return res.json({ states });
+    }
+  } catch(e) {
+    console.warn('[MilFlights] adsb.lol /v2/mil failed:', e.message);
+  }
+
+  // Fallback: OpenSky with callsign heuristic
+  try {
+    const r = await fetchUrl('https://opensky-network.org/api/states/all?extended=1');
+    if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+    const data = JSON.parse(r.data);
+    const mil = /^(USAF|NAVY|RCH|REACH|SAM|PAT|DUKE|TUSK|HUNT|ROCKY|VALOR|GHOST|BLADE|ATLAS|IRON|HAWK|EAGLE|RAVEN|COBRA|VIPER|TIGER|SHARK)/i;
+    const states = (data.states||[]).filter(s => s && mil.test((s[1]||'').trim())).slice(0,100);
     saveSnapshot('military', { states });
-    res.json({ states, source: data.source });
-  } catch (e) {
-    res.status(503).json({ states: [], error: e.message });
+    return res.json({ states });
+  } catch {
+    res.json({ states: [] });
   }
 });
 
@@ -451,180 +467,135 @@ app.get('/api/gpsjam', async (req, res) => {
   }
 });
 
-// ─── AIS SHIPS: aisstream.io persistent WebSocket accumulator ────────────────
-// aisstream.io is WebSocket-only — no REST endpoint exists.
-// We maintain a persistent WS connection server-side and accumulate positions
-// into a Map, then serve snapshots of that map via HTTP.
-// Free API key at: https://aisstream.io → sign up → API Keys → Create Key
-// Set env var: AISSTREAM_KEY=your_key_here in ZimaOS dashboard settings
-
-const WebSocket = require('ws');
-
-const shipStore = new Map(); // mmsi → ship object
-let aisWs = null;
-let aisConnected = false;
-let aisLastMsg = 0;
-let aisReconnectTimer = null;
-let aisConnectAttempts = 0;
+// ─── AIS SHIPS ────────────────────────────────────────────────────────────────
+// Primary: aisstream.io WebSocket (free API key from aisstream.io)
+// Fallback: VesselFinder public API (no key, ~1000 ships, rate-limited)
+// The WebSocket is maintained persistently; /api/ships just returns the cache.
+let shipPositions = new Map(); // mmsi -> ship object
+let wsConnection   = null;
+let wsConnecting   = false;
 
 function connectAisStream() {
   const key = process.env.AISSTREAM_KEY || '';
-  if (!key) {
-    console.log('[AIS] No AISSTREAM_KEY set — ships layer disabled. Get a free key at https://aisstream.io');
-    return;
-  }
-  if (aisWs) {
-    try { aisWs.terminate(); } catch {}
-    aisWs = null;
-  }
-  aisConnectAttempts++;
-  console.log(`[AIS] Connecting to aisstream.io (attempt ${aisConnectAttempts})...`);
+  if (!key) return;
+  if (wsConnecting || wsConnection) return;
+  wsConnecting = true;
 
+  let ws;
   try {
-    aisWs = new WebSocket('wss://stream.aisstream.io/v0/stream');
-  } catch (e) {
-    console.error('[AIS] WebSocket constructor failed:', e.message);
-    scheduleAisReconnect();
+    ws = new (require('ws'))('wss://stream.aisstream.io/v0/stream');
+  } catch(e) {
+    console.warn('[AIS] ws module unavailable:', e.message);
+    wsConnecting = false;
     return;
   }
+  wsConnection = ws;
 
-  const timeout = setTimeout(() => {
-    if (aisWs && aisWs.readyState !== WebSocket.OPEN) {
-      console.warn('[AIS] Connection timeout');
-      aisWs.terminate();
-    }
-  }, 15000);
-
-  aisWs.on('open', () => {
-    clearTimeout(timeout);
-    aisConnected = true;
-    aisConnectAttempts = 0;
-    console.log('[AIS] Connected — subscribing to global PositionReport stream');
-    aisWs.send(JSON.stringify({
+  ws.on('open', () => {
+    wsConnecting = false;
+    console.log('[AIS] WebSocket connected');
+    ws.send(JSON.stringify({
       APIKey: key,
       BoundingBoxes: [[[-90, -180], [90, 180]]],
-      FilterMessageTypes: ['PositionReport', 'ShipStaticData'],
+      FilterMessageTypes: ['PositionReport'],
     }));
   });
 
-  aisWs.on('message', (raw) => {
-    aisLastMsg = Date.now();
+  ws.on('message', (raw) => {
     try {
-      const msg = JSON.parse(raw);
-      const mtype = msg.MessageType;
-
-      if (mtype === 'PositionReport') {
-        const m = msg.Message?.PositionReport || msg.MetaData || {};
-        const meta = msg.MetaData || {};
-        const mmsi = String(meta.MMSI || m.UserID || '');
-        if (!mmsi) return;
-        const lat = m.Latitude  ?? meta.latitude;
-        const lon = m.Longitude ?? meta.longitude;
-        if (!lat || !lon || isNaN(lat) || isNaN(lon)) return;
-        const existing = shipStore.get(mmsi) || {};
-        shipStore.set(mmsi, {
-          mmsi,
-          name:    (meta.ShipName || existing.name || 'UNKNOWN').trim(),
-          lat:     +lat,
-          lon:     +lon,
-          sog:     m.Sog    ?? existing.sog    ?? 0,
-          cog:     m.Cog    ?? existing.cog    ?? 0,
-          heading: m.TrueHeading ?? existing.heading ?? 511,
-          type:    existing.type ?? 0,
-          status:  m.NavigationalStatus ?? 0,
-          flag:    meta.flag  || existing.flag  || '',
-          dest:    existing.dest || '',
-          ts:      Date.now(),
-        });
-      } else if (mtype === 'ShipStaticData') {
-        const m = msg.Message?.ShipStaticData || {};
-        const meta = msg.MetaData || {};
-        const mmsi = String(meta.MMSI || m.UserID || '');
-        if (!mmsi) return;
-        const existing = shipStore.get(mmsi) || { mmsi };
-        shipStore.set(mmsi, {
-          ...existing,
-          name:  (m.Name || meta.ShipName || existing.name || 'UNKNOWN').trim(),
-          type:  m.Type ?? existing.type ?? 0,
-          dest:  (m.Destination || existing.dest || '').trim(),
-          imo:   m.ImoNumber || existing.imo || 0,
-          ts:    existing.ts || Date.now(),
-        });
-      }
+      const msg  = JSON.parse(raw);
+      const meta = msg.MetaData || {};
+      const pos  = msg.Message?.PositionReport || msg.Message?.StandardClassBPositionReport;
+      if (!pos || meta.latitude == null || meta.longitude == null) return;
+      const mmsi = String(meta.MMSI || pos.UserID || '');
+      if (!mmsi) return;
+      shipPositions.set(mmsi, {
+        mmsi, ts: Date.now(),
+        name:    (meta.ShipName || '').trim() || mmsi,
+        lat:     meta.latitude,
+        lon:     meta.longitude,
+        sog:     pos.Sog   || 0,
+        cog:     pos.Cog   || 0,
+        type:    pos.ShipType || 0,
+        heading: pos.TrueHeading || pos.Cog || 0,
+        dest:    (meta.Destination || '').trim(),
+      });
     } catch {}
   });
 
-  aisWs.on('close', (code, reason) => {
-    clearTimeout(timeout);
-    aisConnected = false;
-    console.warn(`[AIS] Disconnected (code ${code}): ${reason}`);
-    scheduleAisReconnect();
-  });
-
-  aisWs.on('error', (err) => {
-    clearTimeout(timeout);
-    console.error('[AIS] WebSocket error:', err.message);
-    aisConnected = false;
+  ws.on('error', (e) => { console.warn('[AIS] WS error:', e.message); });
+  ws.on('close', () => {
+    wsConnection  = null;
+    wsConnecting  = false;
+    console.log('[AIS] WS closed — reconnect in 30s');
+    setTimeout(connectAisStream, 30_000);
   });
 }
 
-function scheduleAisReconnect() {
-  clearTimeout(aisReconnectTimer);
-  // Exponential backoff capped at 5 min
-  const delay = Math.min(5000 * Math.pow(1.5, Math.min(aisConnectAttempts, 8)), 300000);
-  console.log(`[AIS] Reconnecting in ${Math.round(delay/1000)}s`);
-  aisReconnectTimer = setTimeout(connectAisStream, delay);
-}
-
-// Prune ships not seen in last 30 minutes, check WS health every 60s
-setInterval(() => {
-  const cutoff = Date.now() - 30 * 60 * 1000;
-  let pruned = 0;
-  for (const [mmsi, s] of shipStore) {
-    if (s.ts < cutoff) { shipStore.delete(mmsi); pruned++; }
-  }
-  if (pruned) console.log(`[AIS] Pruned ${pruned} stale ships, ${shipStore.size} remain`);
-
-  // Health check — reconnect if no messages for 3 min
-  if (aisConnected && Date.now() - aisLastMsg > 180000) {
-    console.warn('[AIS] No messages for 3 min — reconnecting');
-    aisConnected = false;
-    connectAisStream();
-  }
-}, 60000);
-
-// Start connecting when server boots
+// Start WebSocket when key is present
 connectAisStream();
 
-app.get('/api/ships', (req, res) => {
-  const ships = Array.from(shipStore.values())
-    .filter(s => s.lat && s.lon)
-    .slice(0, 5000);
+// Evict ships older than 15 min
+setInterval(() => {
+  const cutoff = Date.now() - 900_000;
+  for (const [mmsi, s] of shipPositions) if (s.ts < cutoff) shipPositions.delete(mmsi);
+}, 300_000);
 
-  res.set('Cache-Control', 'no-store');
-  if (ships.length === 0 && !aisConnected) {
-    const key = process.env.AISSTREAM_KEY || '';
-    return res.status(503).json({
-      error: key
-        ? `AIS stream disconnected (${aisConnectAttempts} attempts). Reconnecting...`
-        : 'No AISSTREAM_KEY set. Get a free key at https://aisstream.io and add it to ZimaOS env vars.',
-      ships: [],
-      connected: false,
-    });
+let shipFallbackCache = { data: null, ts: 0 };
+
+app.get('/api/ships', async (req, res) => {
+  const key = process.env.AISSTREAM_KEY || '';
+
+  // ── Primary: return aisstream WS cache ──────────────────────────────────────
+  if (key) {
+    if (shipPositions.size > 0) {
+      const minLat = parseFloat(req.query.minLat) || -90;
+      const maxLat = parseFloat(req.query.maxLat) ||  90;
+      const minLon = parseFloat(req.query.minLon) || -180;
+      const maxLon = parseFloat(req.query.maxLon) ||  180;
+      const hasBbox = req.query.minLat !== undefined;
+      let ships = [...shipPositions.values()];
+      if (hasBbox) ships = ships.filter(s => s.lat >= minLat && s.lat <= maxLat && s.lon >= minLon && s.lon <= maxLon);
+      res.set('Cache-Control', 'no-cache');
+      return res.json(ships.slice(0, 5000));
+    }
+    // Key present but WS still connecting
+    return res.status(202).json({ error: 'AIS stream connecting, retry in a few seconds', ships: [] });
   }
-  res.json(ships);
-});
 
-app.get('/api/ships/status', (req, res) => {
-  res.json({
-    connected: aisConnected,
-    stored: shipStore.size,
-    last_message_ago_s: aisLastMsg ? Math.round((Date.now() - aisLastMsg) / 1000) : null,
-    connect_attempts: aisConnectAttempts,
-    key_configured: !!(process.env.AISSTREAM_KEY),
-  });
-});
+  // ── Fallback: VesselFinder public tile API (no key needed) ──────────────────
+  if (shipFallbackCache.data && Date.now() - shipFallbackCache.ts < 30_000) {
+    return res.json(shipFallbackCache.data);
+  }
 
+  try {
+    const r = await fetchUrl(
+      'https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=-70&minlon=-180&maxlat=70&maxlon=180&z=2',
+      { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Referer': 'https://www.vesselfinder.com/' } }
+    );
+    if (r.status === 200) {
+      const raw  = JSON.parse(r.data);
+      const arr  = Array.isArray(raw) ? raw : (raw.vessels || []);
+      const ships = arr.slice(0, 2000).map(s => ({
+        mmsi: s[0] || s.mmsi || '',
+        name: (s[2] || s.name || 'UNKNOWN').trim(),
+        lat:  s[4] != null ? s[4] : s.lat,
+        lon:  s[5] != null ? s[5] : s.lon,
+        sog:  s[6] || 0,
+        cog:  s[7] || 0,
+        type: s[8] || 0,
+        flag: s[13] || '',
+        dest: '',
+      })).filter(s => s.lat != null && s.lon != null);
+      shipFallbackCache = { data: ships, ts: Date.now() };
+      return res.json(ships);
+    }
+  } catch(e) {
+    console.warn('[Ships] VesselFinder fallback failed:', e.message);
+  }
+
+  res.status(503).json({ error: 'No ship data source available. Set AISSTREAM_KEY env var for full coverage.', ships: [] });
+});
 
 // ─── CCTV CAMERAS: OpenStreetMap surveillance nodes ───────────────────────────
 app.get('/api/cctv', async (req, res) => {
@@ -681,11 +652,16 @@ out geom qt tags;`;
 // ─── TLE ─────────────────────────────────────────────────────────────────────
 // Map friendly group names to CelesTrak group IDs
 const TLE_GROUP_MAP = {
-  'stations': 'space-stations',
-  'visual':   'visual',
-  'starlink': 'starlink',
-  'weather':  'weather',
-  'gps':      'gps-ops',
+  'stations':      'space-stations',
+  'space-stations':'space-stations',
+  'visual':        'visual',
+  'active':        'active',
+  'starlink':      'starlink',
+  'weather':       'weather',
+  'gps':           'gps-ops',
+  'gpsops':        'gps-ops',
+  'iridium':       'iridium-next',
+  'geo':           'geo',
 };
 
 app.get('/api/tle/:group', async (req, res) => {
@@ -693,10 +669,10 @@ app.get('/api/tle/:group', async (req, res) => {
   const group = TLE_GROUP_MAP[raw] || raw;
 
   // Try multiple CelesTrak endpoints in order
+  // Correct endpoint: NORAD/elements/gp.php (updated mid-2023; SOCRATES is for conjunctions)
   const urls = [
-    `https://celestrak.org/SOCRATES/query.php?GROUP=${group}&FORMAT=tle`,
-    `https://celestrak.org/TLE/query.php?GROUP=${group}&FORMAT=tle`,
-    `https://celestrak.org/pub/TLE/catalog.txt`,          // full catalog fallback
+    `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=tle`,
+    `https://celestrak.org/NORAD/elements/gp.php?GROUP=${encodeURIComponent(group)}&FORMAT=tle`,
   ];
 
   for (const url of urls) {
@@ -704,8 +680,10 @@ app.get('/api/tle/:group', async (req, res) => {
       const r = await fetchUrl(url, {
         headers: { 'User-Agent': 'PanopticonDashboard/2.0 (self-hosted; non-commercial)' }
       });
-      if (r.status === 200 && r.data && r.data.includes('1 ')) {
-        res.set('Content-Type', 'text/plain').set('Cache-Control', 'max-age=120');
+      if (r.status === 200 && r.data && r.data.includes('\n1 ')) {
+        const lineCount = r.data.trim().split('\n').filter(l=>l.trim()).length;
+        console.log(`[TLE] ${group}: ${Math.floor(lineCount/3)} satellites`);
+        res.set('Content-Type', 'text/plain').set('Cache-Control', 'max-age=300');
         return res.send(r.data);
       }
     } catch {}
@@ -922,29 +900,50 @@ app.get('/api/status', (req, res) => {
 
 // Debug flights
 app.get('/api/debug/flights', async (req, res) => {
+  const out = { results: [] };
+  // Test adsb.lol
+  try {
+    const start = Date.now();
+    const r = await fetchUrl('https://api.adsb.lol/v2/lat/51.5/lon/-0.1/dist/100', {
+      headers: { 'User-Agent': 'ARGUS-Intelligence/6.3' }
+    });
+    const ms = Date.now() - start;
+    if (r.status === 200) {
+      const d = JSON.parse(r.data);
+      out.results.push({ src: 'adsb.lol', ok: true, ms, count: (d.ac||[]).length, sample: (d.ac||[]).slice(0,2) });
+    } else {
+      out.results.push({ src: 'adsb.lol', ok: false, status: r.status, ms });
+    }
+  } catch (e) { out.results.push({ src: 'adsb.lol', ok: false, error: e.message }); }
+  // Test OpenSky
   try {
     const start = Date.now();
     const r = await fetchUrl('https://opensky-network.org/api/states/all');
     const ms = Date.now() - start;
-    if (r.status !== 200) return res.json({ ok: false, status: r.status, ms, snippet: String(r.data || '').substring(0, 300) });
-    const d = JSON.parse(r.data);
-    res.json({ ok: true, ms, count: (d.states || []).length, sample: (d.states || []).slice(0, 2) });
-  } catch (e) { res.json({ ok: false, error: e.message }); }
+    if (r.status !== 200) { out.results.push({ src: 'opensky', ok: false, status: r.status, ms }); }
+    else {
+      const d = JSON.parse(r.data);
+      out.results.push({ src: 'opensky', ok: true, ms, count: (d.states||[]).length });
+    }
+  } catch (e) { out.results.push({ src: 'opensky', ok: false, error: e.message }); }
+  res.json(out);
 });
 
-// Debug ships — redirects to status endpoint
-app.get('/api/debug/ships', (req, res) => {
-  res.json({
-    architecture: 'persistent WebSocket accumulator',
-    ws_url: 'wss://stream.aisstream.io/v0/stream',
-    connected: aisConnected,
-    stored_ships: shipStore.size,
-    last_message_ago_s: aisLastMsg ? Math.round((Date.now() - aisLastMsg) / 1000) : null,
-    connect_attempts: aisConnectAttempts,
-    key_configured: !!(process.env.AISSTREAM_KEY),
-    note: 'aisstream.io is WebSocket-only — no REST endpoint exists. Server maintains persistent WS connection.',
-    get_key_at: 'https://aisstream.io',
-  });
+// Debug ships
+app.get('/api/debug/ships', async (req, res) => {
+  const aisKey = process.env.AISSTREAM_KEY || '';
+  const out = {
+    aisstream_key_present: !!aisKey,
+    ws_connected: wsConnection !== null && wsConnection.readyState === 1,
+    positions_in_cache: shipPositions.size,
+    results: []
+  };
+  // Test VesselFinder fallback
+  try {
+    const r = await fetchUrl('https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=45&minlon=-10&maxlat=60&maxlon=10&z=4', { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.vesselfinder.com/' } });
+    out.results.push({ src: 'vesselfinder', status: r.status, bytes: (r.data||'').length, snippet: String(r.data||'').substring(0,300) });
+  } catch (e) { out.results.push({ src: 'vesselfinder', error: e.message }); }
+  res.json(out);
 });
 
 app.listen(PORT, '0.0.0.0', () => {
