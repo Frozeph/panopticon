@@ -624,6 +624,115 @@ app.get('/api/jamming/dates', (req, res) => {
   res.json({ dates });
 });
 
+// ─── MESHTASTIC (liamcottle.net public API) ───────────────────────────────────
+let meshtasticCache = { nodes: null, messages: null, ts: 0 };
+
+app.get('/api/meshtastic/nodes', async (req, res) => {
+  const maxAge = 120_000; // 2 min cache
+  if (meshtasticCache.nodes && Date.now() - meshtasticCache.ts < maxAge) {
+    return res.json(meshtasticCache.nodes);
+  }
+  try {
+    // Liam Cottle's Meshtastic map API — public, no key
+    const r = await fetchUrl('https://meshtastic.liamcottle.net/api/nodes', {
+      headers: { 'Accept': 'application/json', 'User-Agent': 'ARGUS-Intelligence/5.0' }
+    });
+    if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+    const data = JSON.parse(r.data);
+    const nodes = (data.nodes || data || []).filter(n => n.latitude && n.longitude).map(n => ({
+      id:        n.id || n.node_id || String(n.nodeNum),
+      name:      n.short_name || n.long_name || n.id || 'Unknown',
+      long_name: n.long_name || '',
+      lat:       n.latitude,
+      lon:       n.longitude,
+      altitude:  n.altitude || 0,
+      snr:       n.snr || 0,
+      battery:   n.battery_level || n.batteryLevel || null,
+      last_heard:n.last_heard || n.lastHeard || null,
+      hw_model:  n.hw_model || n.hwModel || '',
+      firmware:  n.firmware_version || '',
+    }));
+    meshtasticCache.nodes = { nodes, total: nodes.length, ts: Date.now() };
+    meshtasticCache.ts    = Date.now();
+    res.set('Cache-Control', 'max-age=120');
+    res.json(meshtasticCache.nodes);
+  } catch (e) {
+    // Fallback: return empty but valid response
+    res.json({ nodes: [], total: 0, ts: Date.now(), error: e.message });
+  }
+});
+
+app.get('/api/meshtastic/messages', async (req, res) => {
+  const nodeId = req.query.node || '';
+  try {
+    const url = nodeId
+      ? `https://meshtastic.liamcottle.net/api/messages?node_id=${encodeURIComponent(nodeId)}`
+      : 'https://meshtastic.liamcottle.net/api/messages?limit=50';
+    const r = await fetchUrl(url, {
+      headers: { 'Accept': 'application/json', 'User-Agent': 'ARGUS-Intelligence/5.0' }
+    });
+    if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+    const data = JSON.parse(r.data);
+    const messages = (data.messages || data || []).map(m => ({
+      id:        m.id,
+      from:      m.from_node || m.from || 'Unknown',
+      from_name: m.from_short_name || m.from_name || '',
+      to:        m.to_node || m.to || 'broadcast',
+      text:      m.text || m.message || '',
+      ts:        m.created_at || m.timestamp || m.ts,
+      channel:   m.channel || 0,
+    }));
+    res.set('Cache-Control', 'max-age=30');
+    res.json({ messages });
+  } catch (e) {
+    res.json({ messages: [], error: e.message });
+  }
+});
+
+// ─── SEISMIC STATIONS (USGS FDSN) ────────────────────────────────────────────
+let stationCache = { data: null, ts: 0 };
+
+app.get('/api/seismic/stations', async (req, res) => {
+  const maxAge = 3_600_000; // 1hr cache — stations don't change often
+  if (stationCache.data && Date.now() - stationCache.ts < maxAge) {
+    return res.json(stationCache.data);
+  }
+  try {
+    // USGS FDSN station web service — returns real seismic network stations
+    const url = 'https://earthquake.usgs.gov/fdsnws/station/1/query?format=geojson&network=IU,II,IC,G,MX&level=station&includeavailability=false';
+    const r = await fetchUrl(url, { headers: { 'User-Agent': 'ARGUS-Intelligence/5.0' } });
+    if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+    const raw  = JSON.parse(r.data);
+    const features = (raw.features || []).map(f => ({
+      id:       f.id || f.properties?.code,
+      name:     f.properties?.name || f.properties?.station || 'Station',
+      network:  f.properties?.network || '',
+      code:     f.properties?.code || '',
+      lat:      f.geometry?.coordinates?.[1],
+      lon:      f.geometry?.coordinates?.[0],
+      elev:     f.geometry?.coordinates?.[2] || 0,
+      start:    f.properties?.starttime || '',
+    })).filter(f => f.lat && f.lon);
+    stationCache.data = { stations: features, total: features.length };
+    stationCache.ts   = Date.now();
+    res.set('Cache-Control', 'max-age=3600');
+    res.json(stationCache.data);
+  } catch (e) {
+    // Fallback: well-known IRIS/USGS global stations
+    const fallback = [
+      { id:'IU.ANMO', name:'Albuquerque NM', network:'IU', code:'ANMO', lat:34.946, lon:-106.457, elev:1740 },
+      { id:'IU.COLA', name:'College AK',     network:'IU', code:'COLA', lat:64.874, lon:-147.861, elev:84 },
+      { id:'IU.MAJO', name:'Matsushiro Japan',network:'IU', code:'MAJO', lat:36.541, lon:138.207, elev:418 },
+      { id:'IU.TATO', name:'Taipei Taiwan',  network:'IU', code:'TATO', lat:24.975, lon:121.497, elev:74 },
+      { id:'II.BFO',  name:'Black Forest Germany',network:'II', code:'BFO', lat:48.330, lon:8.330, elev:589 },
+      { id:'II.MSVF', name:'Monasavu Fiji',  network:'II', code:'MSVF', lat:-17.747, lon:178.053, elev:620 },
+      { id:'G.ECH',   name:'Echery France',  network:'G',  code:'ECH',  lat:48.216, lon:7.159, elev:580 },
+      { id:'IC.BJT',  name:'Beijing China',  network:'IC', code:'BJT',  lat:40.018, lon:116.168, elev:120 },
+    ];
+    res.json({ stations: fallback, total: fallback.length, fallback: true });
+  }
+});
+
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   let dbInfo = { ok: false };
