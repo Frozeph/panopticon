@@ -13,7 +13,7 @@ name: argus
 
 services:
   argus:
-    image: ghcr.io/frozeph/panopticon
+    image: ghcr.io/frozeph/panopticon:latest
     container_name: argus
     restart: unless-stopped
 
