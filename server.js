@@ -22,6 +22,8 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ─── HTTP FETCH HELPER ────────────────────────────────────────────────────────
 // Use a real browser UA — many public APIs block bot-identified clients
+// NOTE: do NOT send Accept-Encoding — Node http.get doesn't auto-decompress,
+// so compressed responses would be garbled binary
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0';
 
 function fetchUrl(url, opts = {}) {
@@ -32,8 +34,6 @@ function fetchUrl(url, opts = {}) {
         'User-Agent':      BROWSER_UA,
         'Accept':          'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection':      'keep-alive',
         ...opts.headers,
       },
       timeout: opts.timeout || 15000,
