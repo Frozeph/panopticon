@@ -1,12 +1,99 @@
-version: '3.8'
+# ══════════════════════════════════════════════════════════════════════════════
+# ARGUS v7 // ZimaOS Dashboard Install
+#
+# PASTE THIS INTO: ZimaOS Dashboard → [+] → Install customized app
+#                  → Import → Docker Compose tab → Submit
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: argus
+
 services:
   argus:
     image: ghcr.io/frozeph/panopticon:latest
-    ports:
-      - "3000:3000"
-    volumes:
-      - /DATA/AppData/argus:/data
-    environment:
-      - SHODAN_API_KEY=${SHODAN_API_KEY:-}
-      - AISSTREAM_KEY=${AISSTREAM_KEY:-}
+    container_name: argus
     restart: unless-stopped
+
+    ports:
+      - target: 3000
+        published: "3000"
+        protocol: tcp
+
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATA_DIR=/app/data
+      - SHODAN_API_KEY=
+      - AISSTREAM_KEY=
+
+    volumes:
+      - type: bind
+        source: /DATA/AppData/argus/data
+        target: /app/data
+
+    cpu_shares: 90
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    security_opt:
+      - no-new-privileges=true
+    privileged: false
+    cap_drop:
+      - ALL
+    cap_add: []
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    network_mode: bridge
+    devices: []
+
+    labels:
+      icon: https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f30d.svg
+
+x-casaos:
+  author: self
+  category: Network
+  hostname: ""
+  icon: https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f30d.svg
+  index: /
+  is_uncontrolled: false
+  port_map: "3000"
+  scheme: http
+  store_app_id: argus
+  title:
+    custom: ARGUS
+    en_us: ARGUS — Geospatial Intelligence
+  description:
+    en_us: >
+      Real-time 3D geospatial intelligence dashboard. Live satellite tracking
+      (SGP4/TLE), commercial & military flights, AIS ship tracking, GDELT global
+      intel feed (100+ languages), AI natural language queries, seismic activity,
+      GPS jamming overlay, Shodan OSINT, and Meshtastic nodes. Powered by CesiumJS.
+  tips:
+    before_install:
+      en_us: |
+        No API keys required to get started — satellites, flights, ships,
+        earthquakes, and the GDELT intel feed all work out of the box.
+
+        Optional keys for extra features:
+        • AISStream (free at aisstream.io) — full global AIS ship positions
+        • Shodan (paid) — OSINT device search overlay
+
+        Add them to the environment variables above before submitting,
+        or leave blank and add later via container settings.
+
+        Data stored at: /DATA/AppData/argus/data
