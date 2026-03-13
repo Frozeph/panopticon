@@ -26,7 +26,7 @@
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: 'Rajdhani', sans-serif; font-size: 14px; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: 'Exo 2', sans-serif; font-size: 14px; }
 .mono { font-family: 'JetBrains Mono', monospace; }
 .dim  { color: var(--text-d); }
 .tiny { font-size: 11px; }
@@ -60,7 +60,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg);
 
 .logo { display: flex; align-items: center; gap: 6px; }
 .logo-text {
-  font-family: 'Rajdhani', sans-serif; font-weight: 700; font-size: 18px;
+  font-family: 'Exo 2', sans-serif; font-weight: 700; font-size: 18px;
   letter-spacing: 4px; color: var(--amber);
 }
 .logo-ver { font-size: 10px; color: var(--amber-d); font-family: 'JetBrains Mono', monospace; margin-top: 2px; }

@@ -166,102 +166,122 @@ app.get('/api/ships', async (req, res) => {
   const minLon = parseFloat(req.query.minLon)||-180, maxLon = parseFloat(req.query.maxLon)||180;
   const hasBbox = req.query.minLat != null;
 
+  // Priority 1: live AISStream WebSocket cache
   if (shipPositions.size > 0) {
     let ships = [...shipPositions.values()];
     if (hasBbox) ships = ships.filter(s => s.lat>=minLat && s.lat<=maxLat && s.lon>=minLon && s.lon<=maxLon);
     return res.json({ ships: ships.slice(0,5000), _src:'aisstream', _count:ships.length });
   }
 
-  // Serve stale cache up to 5 minutes old rather than hammering external APIs
+  // Priority 2: fresh fallback cache (5 min)
   if (shipFallback.data && Date.now()-shipFallback.ts < 5*60*1000) {
     let ships = shipFallback.data;
     if (hasBbox) ships = ships.filter(s=>s.lat>=minLat&&s.lat<=maxLat&&s.lon>=minLon&&s.lon<=maxLon);
-    return res.json({ ships:ships.slice(0,2000), _src:'vf_cache', _count:ships.length });
+    return res.json({ ships:ships.slice(0,2000), _src:'cached', _count:ships.length });
   }
 
-  // Try MarineTraffic public map data first
-  const mtHeaders = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
-    'Referer': 'https://www.marinetraffic.com/',
-    'Accept': 'application/json, text/javascript, */*',
-    'X-Requested-With': 'XMLHttpRequest',
+  const bHdrs = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
+    'Accept': 'application/json, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
   };
 
-  const tryParseMT = (raw) => {
-    try {
-      const d = JSON.parse(raw);
-      const arr = d.data?.rows || d.rows || (Array.isArray(d) ? d : []);
-      return arr.slice(0,3000).map(s => ({
-        mmsi: String(s.MMSI||s[0]||''),
-        name: (s.SHIPNAME||s[1]||'').trim(),
-        lat:  parseFloat(s.LAT||s.lat||s[2]||0),
-        lon:  parseFloat(s.LON||s.lon||s[3]||0),
-        speed: parseFloat(s.SPEED||s[4]||0),
-        course: parseFloat(s.COURSE||s[5]||0),
-        type: parseInt(s.SHIPTYPE||s[7]||0),
-        flag: s.FLAG||'',
-        ts: Date.now(),
-      })).filter(s => s.lat && s.lon && Math.abs(s.lat)<=90 && Math.abs(s.lon)<=180);
-    } catch { return null; }
-  };
-
-  // Source 1: MarineTraffic public endpoint
+  // Source A: Kystverket (Norwegian Coastal Admin) - genuinely free public AIS
   try {
-    const zoom = hasBbox ? 5 : 3;
-    const lat1 = hasBbox ? minLat : -70, lat2 = hasBbox ? maxLat : 70;
-    const lon1 = hasBbox ? minLon : -180, lon2 = hasBbox ? maxLon : 180;
-    const url = `https://www.marinetraffic.com/getData/get_data_json_4/z:${zoom}/X:1/Y:1/station:0`;
-    const r = await fetchUrl(url, { headers: mtHeaders, timeout: 12000 });
+    const r = await fetchUrl('https://kystdatahuset.no/ws/api/ais/positions/all', {
+      headers: { ...bHdrs, 'Referer':'https://kystdatahuset.no/' }, timeout: 12000,
+    });
     if (r.status === 200 && r.data.length > 100) {
-      const ships = tryParseMT(r.data);
-      if (ships && ships.length > 0) {
+      const parsed = JSON.parse(r.data);
+      const arr = Array.isArray(parsed) ? parsed : (parsed.features || parsed.data || []);
+      const ships = arr.slice(0,3000).map(s => {
+        const p = s.properties || s;
+        const g = s.geometry?.coordinates;
+        return {
+          mmsi:   String(p.mmsi || p.MMSI || ''),
+          name:   (p.name || p.shipName || '').trim(),
+          lat:    g ? parseFloat(g[1]) : parseFloat(p.lat || p.latitude || 0),
+          lon:    g ? parseFloat(g[0]) : parseFloat(p.lon || p.longitude || 0),
+          speed:  parseFloat(p.sog || p.speed || 0),
+          course: parseFloat(p.cog || p.course || 0),
+          type:   parseInt(p.shipType || 0),
+          ts: Date.now(),
+        };
+      }).filter(s => s.lat && s.lon && Math.abs(s.lat)<=90 && s.mmsi);
+      if (ships.length > 0) {
         shipFallback = { data: ships, ts: Date.now() };
-        let out = ships;
-        if (hasBbox) out = ships.filter(s=>s.lat>=lat1&&s.lat<=lat2&&s.lon>=lon1&&s.lon<=lon2);
-        return res.json({ ships: out.slice(0,2000), _src:'marinetraffic', _count:out.length });
+        let out = hasBbox ? ships.filter(s=>s.lat>=minLat&&s.lat<=maxLat&&s.lon>=minLon&&s.lon<=maxLon) : ships;
+        return res.json({ ships: out.slice(0,2000), _src:'kystverket', _count:out.length });
       }
     }
-  } catch(e) { console.warn('[Ships] MT error:', e.message); }
+  } catch(e) { console.warn('[Ships] Kystverket:', e.message); }
 
-  // Source 2: VesselFinder public API
+  // Source B: BarentsWatch open AIS (Norwegian government, free)
+  try {
+    const r = await fetchUrl('https://www.barentswatch.no/bwapi/v2/ais/openpositions?modelType=Simple&projection=Normal', {
+      headers: { ...bHdrs, 'Referer':'https://www.barentswatch.no/' }, timeout: 12000,
+    });
+    if (r.status === 200) {
+      const arr = JSON.parse(r.data);
+      const ships = (Array.isArray(arr) ? arr : []).slice(0,3000).map(s => ({
+        mmsi:    String(s.mmsi || ''),
+        name:    (s.name || s.shipName || '').trim(),
+        lat:     parseFloat(s.latitude || s.lat || 0),
+        lon:     parseFloat(s.longitude || s.lon || 0),
+        speed:   parseFloat(s.speedOverGround || s.sog || 0),
+        course:  parseFloat(s.courseOverGround || s.cog || 0),
+        heading: parseFloat(s.trueHeading || 511),
+        type:    parseInt(s.shipType || 0),
+        ts: Date.now(),
+      })).filter(s => s.lat && s.lon && s.mmsi);
+      if (ships.length > 0) {
+        shipFallback = { data: ships, ts: Date.now() };
+        let out = hasBbox ? ships.filter(s=>s.lat>=minLat&&s.lat<=maxLat&&s.lon>=minLon&&s.lon<=maxLon) : ships;
+        return res.json({ ships: out.slice(0,2000), _src:'barentswatch', _count:out.length });
+      }
+    }
+  } catch(e) { console.warn('[Ships] BarentsWatch:', e.message); }
+
+  // Source C: VesselFinder
   try {
     const vfLat1 = hasBbox ? minLat : -70, vfLat2 = hasBbox ? maxLat : 70;
     const vfLon1 = hasBbox ? minLon : -180, vfLon2 = hasBbox ? maxLon : 180;
-    const zoom = hasBbox ? 5 : 2;
-    const url = `https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=${vfLat1}&minlon=${vfLon1}&maxlat=${vfLat2}&maxlon=${vfLon2}&z=${zoom}`;
+    const url = `https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=${vfLat1}&minlon=${vfLon1}&maxlat=${vfLat2}&maxlon=${vfLon2}&z=3`;
     const r = await fetchUrl(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
-        'Referer': 'https://www.vesselfinder.com/',
-        'Accept': 'application/json, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
+      headers: { ...bHdrs, 'Referer':'https://www.vesselfinder.com/map', 'Origin':'https://www.vesselfinder.com' },
       timeout: 15000,
     });
     if (r.status === 200 && r.data.length > 10) {
       const raw = JSON.parse(r.data);
       const arr = Array.isArray(raw) ? raw : (raw.vessels || raw.data || []);
-      // VesselFinder array format: [mmsi, name, lat, lon, speed, course, _, type, ...]
       const ships = arr.slice(0,3000).map(s => ({
         mmsi:   String(s[0] || s.mmsi || ''),
         name:   (s[1] || s.name || '').trim(),
         lat:    parseFloat(s[2] ?? s.lat ?? 0),
         lon:    parseFloat(s[3] ?? s.lon ?? 0),
-        speed:  parseFloat(s[4] || 0),
+        speed:  parseFloat(s[4] || 0) / 10,
         course: parseFloat(s[5] || 0),
         type:   parseInt(s[7] || 0),
         ts: Date.now(),
-      })).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90);
+      })).filter(s => s.lat && s.lon && Math.abs(s.lat)<=90);
       if (ships.length > 0) {
         shipFallback = { data: ships, ts: Date.now() };
         let out = hasBbox ? ships.filter(s=>s.lat>=vfLat1&&s.lat<=vfLat2&&s.lon>=vfLon1&&s.lon<=vfLon2) : ships;
         return res.json({ ships: out.slice(0,2000), _src:'vesselfinder', _count:out.length });
       }
     }
-  } catch(e) { console.warn('[Ships] VF error:', e.message); }
+  } catch(e) { console.warn('[Ships] VF:', e.message); }
 
-  res.json({ ships: [], _src:'none', _count:0, info:'Set AISSTREAM_KEY env var for live AIS (free at aisstream.io)' });
+  // Stale cache always beats empty
+  if (shipFallback.data) {
+    let ships = shipFallback.data;
+    if (hasBbox) ships = ships.filter(s=>s.lat>=minLat&&s.lat<=maxLat&&s.lon>=minLon&&s.lon<=maxLon);
+    return res.json({ ships:ships.slice(0,2000), _src:'stale_cache', _count:ships.length });
+  }
+
+  res.json({ ships:[], _src:'none', _count:0, hint:'Set AISSTREAM_KEY (free: aisstream.io) for live global AIS' });
 });
+
 
 // ─── TLE / SATELLITES ─────────────────────────────────────────────────────────
 // ONLY 'visual' group by default (~150 sats) — fast, reliable

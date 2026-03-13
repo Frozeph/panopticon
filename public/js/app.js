@@ -212,6 +212,20 @@ S.viewer.scene.postRender.addEventListener(() => {
 });
 
 // ─── LAYER TOGGLE BUTTONS ─────────────────────────────────────────────────────
+// Explicit map: layer name → state property name for the DataSource
+const LAYER_DS_KEY = {
+  satellites: 'satDs',
+  flights:    'flightDs',
+  military:   'militaryDs',
+  ships:      'shipDs',
+  quakes:     'quakeDs',
+  cctv:       'cctvDs',
+  wildfires:  'fireDs',
+  jamming:    'jammingDs',
+  mesh:       'meshDs',
+  intel:      'intelDs',
+};
+
 document.querySelectorAll('.lbtn').forEach(btn => {
   const layer = btn.dataset.layer;
   btn.addEventListener('click', () => {
@@ -226,12 +240,16 @@ document.querySelectorAll('.lbtn').forEach(btn => {
     }
 
     if (!on) {
-      // Remove data source
-      const dsKey = layer + 'Ds';
-      if (S[dsKey]) { S.viewer.dataSources.remove(S[dsKey], true); S[dsKey] = null; }
-      if (layer === 'satellites') clearInterval(S.intervals.sat);
+      const dsKey = LAYER_DS_KEY[layer];
+      if (dsKey && S[dsKey]) {
+        S.viewer.dataSources.remove(S[dsKey], true);
+        S[dsKey] = null;
+      }
+      if (layer === 'satellites') {
+        clearInterval(S.intervals.sat);
+        if (satFootprintDs) { S.viewer.dataSources.remove(satFootprintDs, true); satFootprintDs = null; }
+      }
     } else {
-      // Reload
       switch(layer) {
         case 'satellites': loadSatellites(); break;
         case 'flights':    fetchFlights();   break;
@@ -1071,16 +1089,34 @@ handler.setInputAction(click => {
   showInfoPanel(entity);
 }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 
-// Double-click to track
+// Double-click to track/untrack
 handler.setInputAction(click => {
   const picked = S.viewer.scene.pick(click.position);
   if (Cesium.defined(picked) && picked.id) {
-    S.viewer.trackedEntity = picked.id;
-    toast(`Tracking: ${picked.id.name}`, 'info', 3000);
+    if (S.viewer.trackedEntity === picked.id) {
+      S.viewer.trackedEntity = undefined;
+      document.getElementById('info-track').textContent = '📍 TRACK';
+      toast('Tracking stopped', 'info', 2000);
+    } else {
+      S.viewer.trackedEntity = picked.id;
+      document.getElementById('info-track').textContent = '⏹ UNTRACK';
+      toast(`Tracking: ${picked.id.name}`, 'info', 2000);
+    }
   } else {
     S.viewer.trackedEntity = undefined;
+    document.getElementById('info-track').textContent = '📍 TRACK';
   }
 }, Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
+
+// ESC to untrack
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    S.viewer.trackedEntity = undefined;
+    document.getElementById('info-track').textContent = '📍 TRACK';
+    document.getElementById('info-box').classList.add('hidden');
+    document.getElementById('ai-response').classList.add('hidden');
+  }
+});
 
 function showInfoPanel(entity) {
   const props = entity.properties;
@@ -1234,8 +1270,16 @@ document.getElementById('info-close').addEventListener('click', () => {
 });
 document.getElementById('info-track').addEventListener('click', () => {
   if (S.selectedEntity) {
-    S.viewer.trackedEntity = S.selectedEntity;
-    toast(`Tracking: ${S.selectedEntity.name}`, 'info', 2000);
+    if (S.viewer.trackedEntity === S.selectedEntity) {
+      // Already tracking — untrack
+      S.viewer.trackedEntity = undefined;
+      document.getElementById('info-track').textContent = '📍 TRACK';
+      toast('Tracking stopped', 'info', 2000);
+    } else {
+      S.viewer.trackedEntity = S.selectedEntity;
+      document.getElementById('info-track').textContent = '⏹ UNTRACK';
+      toast(`Tracking: ${S.selectedEntity.name}`, 'info', 2000);
+    }
   }
 });
 document.getElementById('info-shodan').addEventListener('click', () => {
