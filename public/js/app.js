@@ -1,1462 +1,1166 @@
-/**
- * ARGUS // GLOBAL INTELLIGENCE SYSTEM v5
- * Fixed: satellites (all groups), flights, ships, CCTV, GPS jam, Meshtastic, seismic stations
- */
+/* ══ ARGUS v7 ══════════════════════════════════════════════════════════════════
+ * Geospatial Intelligence Dashboard
+ * - satellite.js SGP4 propagation (accurate orbital mechanics)
+ * - Viewport-frustum culling: only fetch what's in view
+ * - GDELT intel feed: 100+ languages, corroboration scoring
+ * - AI natural-language queries via Claude
+ * - Fixed: flights (adsb.lol), ships (AIS/VF), satellites (visual group)
+ * ═══════════════════════════════════════════════════════════════════════════ */
 'use strict';
 
-const LOD = { GLOBAL:5_000_000, REGIONAL:500_000, CITY:50_000 };
-const CONFIG = {
-  satelliteUpdateInterval:  5_000,
-  flightUpdateInterval:     8_000,
-  militaryUpdateInterval:  12_000,
-  shipUpdateInterval:      10_000,
-  quakeUpdateInterval:     60_000,
-  gpsjamUpdateInterval:   300_000,
-  weatherUpdateInterval:   60_000,
-  fireUpdateInterval:     120_000,
-  meshtasticUpdateInterval:120_000,
-  lodDebounce:              2_000,
-  cctvRadius:               5_000,
+// ─── CONFIG ──────────────────────────────────────────────────────────────────
+const CFG = {
+  cesiumToken: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI1NGFiZGQxMy0zZDJjLTQ2OGYtYjFmNi02ZTQwMzM4NjNjN2EiLCJpZCI6Mjk0MjEsImlhdCI6MTU5MzI0OTM5Mn0.yAfCt9LQFf0j-bPJnBiVaAGVknQF1eFjPh1WNt_LCWY',
+  refreshFlights:   8000,
+  refreshMilitary: 12000,
+  refreshShips:    10000,
+  refreshQuakes:  120000,
+  refreshSats:      5000,   // re-propagate positions (no new TLE fetch)
+  refreshIntel:   300000,   // 5 min
+  maxSats:          2000,   // render limit
 };
 
-let currentLOD='GLOBAL', lodDebounceTimer=null, lastViewBbox=null;
-
-const PRESETS = {
-  global:  {lon:0,      lat:20,      alt:18000000,pitch:-90},
-  london:  {lon:-0.1278,lat:51.5074, alt:800000,  pitch:-45},
-  nyc:     {lon:-74.006,lat:40.7128, alt:600000,  pitch:-40},
-  dc:      {lon:-77.036,lat:38.9072, alt:400000,  pitch:-40},
-  moscow:  {lon:37.617, lat:55.755,  alt:600000,  pitch:-40},
-  beijing: {lon:116.407,lat:39.904,  alt:600000,  pitch:-40},
-  dubai:   {lon:55.296, lat:25.2048, alt:500000,  pitch:-40},
-  sydney:  {lon:151.209,lat:-33.868, alt:500000,  pitch:-40},
-};
-
-// ── ICONS ─────────────────────────────────────────────────────────────────────
-const svg = (w,h,body) => `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${body}</svg>`)}`;
-
-function planeIcon(color,mil) {
-  const shape = mil
-    ? `<polygon points="12,1 14,8 22,9 16,15 18,23 12,18 6,23 8,15 2,9 10,8" fill="${color}"/>`
-    : `<path d="M12,1 L16,9 L23,11 L16,14 L12,23 L8,14 L1,11 L8,9Z" fill="${color}"/>`;
-  return svg(24,24,`${shape}<circle cx="12" cy="11" r="2" fill="white" opacity="0.7"/>`);
-}
-function shipIcon(color)  { return svg(20,20,`<polygon points="10,2 18,17 10,13 2,17" fill="${color}" stroke="white" stroke-width="1.2"/>`); }
-function cctvIcon()       { return svg(16,16,`<circle cx="8" cy="8" r="7" fill="#ff6600" opacity="0.9"/><circle cx="8" cy="8" r="3" fill="white" opacity="0.5"/><circle cx="8" cy="8" r="1.5" fill="#ff6600"/>`); }
-function meshIcon(online) { const c=online?'#00ff88':'#888'; return svg(18,18,`<circle cx="9" cy="9" r="8" fill="none" stroke="${c}" stroke-width="1.5" opacity="0.8"/><circle cx="9" cy="9" r="3" fill="${c}" opacity="0.9"/><line x1="9" y1="1" x2="9" y2="4" stroke="${c}" stroke-width="1.5"/><line x1="15.2" y1="4.8" x2="12.9" y2="7.1" stroke="${c}" stroke-width="1.5"/>`); }
-function stationIcon()    { return svg(16,16,`<rect x="3" y="8" width="10" height="6" fill="none" stroke="#00ddff" stroke-width="1.2"/><line x1="8" y1="2" x2="8" y2="8" stroke="#00ddff" stroke-width="1.5"/><circle cx="8" cy="2" r="1.5" fill="#00ddff"/>`); }
-
-// ── STATE ─────────────────────────────────────────────────────────────────────
-let serverStatus = { shodan: false, aisstream: false };
-
-async function checkServerStatus() {
-  try {
-    const r = await fetch('/api/status');
-    if (r.ok) serverStatus = await r.json();
-    console.log('[ARGUS] Server status:', serverStatus);
-    if (serverStatus.shodan) {
-      addLog('SHODAN: KEY CONFIGURED (SERVER)');
-      const prompt = document.getElementById('shodan-key-prompt');
-      if (prompt) prompt.style.display = 'none';
-    }
-  } catch (e) { console.warn('[ARGUS] status check failed:', e.message); }
-}
-
+// ─── STATE ────────────────────────────────────────────────────────────────────
 const S = {
-  viewer:null,
-  layers:{
-    satellites:{on:true, ds:null},
-    flights:   {on:false,ds:null},
-    military:  {on:false,ds:null},
-    ships:     {on:false,ds:null},
-    traffic:   {on:false,ds:null,polylines:null},
-    quakes:    {on:false,ds:null},
-    sensors:   {on:false,ds:null},
-    gpsjam:    {on:false,ds:null},
-    cctv:      {on:false,ds:null},
-    weather:   {on:false,ds:null},
-    wildfires: {on:false,ds:null},
-    shodan:    {on:false,ds:null},
-    meshtastic:{on:false,ds:null},
+  viewer:      null,
+  tleData:     [],
+  satDs:       null,   // satellite DataSource
+  flightDs:    null,
+  militaryDs:  null,
+  shipDs:      null,
+  quakeDs:     null,
+  cctvDs:      null,
+  fireDs:      null,
+  meshDs:      null,
+  shodanDs:    null,
+  intelDs:     null,   // GDELT event pins on map
+  intervals:   {},
+  layers: {
+    satellites: true, flights: true, military: true, ships: true,
+    quakes: true, cctv: false, wildfires: false, jamming: false,
+    mesh: false, intel: true,
   },
-  tleData:[], tracking:null, detMode:'sparse',
-  intervals:{}, logHistory:[],
-  filters:{flights:{minAlt:0,maxAlt:45000,minSpd:0,maxSpd:1200,country:'',callsign:'',showUnknown:true}},
-  playback:{active:false,currentTs:null,speed:1,playing:false,playInterval:null,range:{earliest:null,latest:null}},
-  shodan:{key:'',lastResults:[],creditStats:null},
-  airlineMap:{}, rawFlights:[], rawMilitary:[],
-  meshtastic:{nodes:[], messages:[]},
+  activeSatGroups: new Set(['visual']),
+  intelArticles:  [],
+  intelFilter:    '',
+  intelQuery:     '',
+  selectedEntity: null,
+  trackedEntity:  null,
+  playbackMode:   false,
+  cameraAlt:      10e6,   // metres above ground
 };
 
-// ── BOOT ──────────────────────────────────────────────────────────────────────
-window.addEventListener('DOMContentLoaded',()=>{
-  checkServerStatus();
-  setupTokenModal(); setupUI(); startClock();
-  loadShodanPresets(); refreshStorageStats(); refreshShodanCredits();
+// ─── LOG SYSTEM ───────────────────────────────────────────────────────────────
+function log(msg, level='info') {
+  const ts = new Date().toISOString().substring(11,19) + 'Z';
+  const wrap = document.getElementById('log-body');
+  if (!wrap) return;
+  const div = document.createElement('div');
+  div.className = 'log-line';
+  div.innerHTML = `<span class="log-ts">${ts}</span><span class="log-msg ${level==='warn'?'warn':level==='error'?'err':'ok'}">${msg}</span>`;
+  wrap.prepend(div);
+  if (wrap.children.length > 80) wrap.lastChild?.remove();
+}
+
+function toggleLog() {
+  document.getElementById('log-wrap').classList.toggle('expanded');
+}
+
+// ─── TOASTS ───────────────────────────────────────────────────────────────────
+function toast(msg, type='info', duration=4000) {
+  const c = document.getElementById('toasts');
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  c.appendChild(t);
+  setTimeout(() => t.remove(), duration);
+}
+
+// ─── CLOCK ────────────────────────────────────────────────────────────────────
+function updateClock() {
+  const now = new Date();
+  document.getElementById('clock').textContent =
+    now.toUTCString().split(' ')[4] + 'Z';
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ─── CESIUM INIT ─────────────────────────────────────────────────────────────
+Cesium.Ion.defaultAccessToken = CFG.cesiumToken;
+
+S.viewer = new Cesium.Viewer('cesiumContainer', {
+  imageryProvider:        false,
+  terrainProvider:        new Cesium.EllipsoidTerrainProvider(),
+  timeline:               false,
+  animation:              false,
+  homeButton:             false,
+  geocoder:               false,
+  navigationHelpButton:   false,
+  sceneModePicker:        false,
+  baseLayerPicker:        false,
+  fullscreenButton:       false,
+  infoBox:                false,
+  selectionIndicator:     false,
+  skyBox:                 false,
+  skyAtmosphere:          new Cesium.SkyAtmosphere(),
+  requestRenderMode:      false,   // continuous render needed for moving sats
+  scene3DOnly:            false,
 });
 
-// ── CESIUM ────────────────────────────────────────────────────────────────────
-function setupTokenModal() {
-  const modal=document.getElementById('token-modal');
-  const input=document.getElementById('cesium-token-input');
-  const saved=localStorage.getItem('cesium_token');
-  if (saved) { modal.classList.add('hidden'); initCesium(saved); return; }
-  document.getElementById('token-submit-btn').addEventListener('click',()=>{
-    const t=input.value.trim(); if(!t) return;
-    localStorage.setItem('cesium_token',t);
-    modal.classList.add('hidden'); initCesium(t);
-  });
-  document.getElementById('token-skip-btn').addEventListener('click',()=>{
-    modal.classList.add('hidden');
-    initCesium('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlYWE1OWUxNy1mMWZiLTQzYjYtYTQ0OS1kMWFjYmFkNTc5YzMiLCJpZCI6NTc3MzMsImlhdCI6MTYyNzg0NTE4Mn0.XcKpgANiY19MC4bdFd3AJblJKnSqyDBCSSnaliD7kCY');
-  });
-  input.addEventListener('keydown',e=>{if(e.key==='Enter') document.getElementById('token-submit-btn').click();});
+// Set dark void background
+S.viewer.scene.backgroundColor = new Cesium.Color(0.04, 0.04, 0.06, 1);
+S.viewer.scene.globe.show = true;
+
+// Apply initial dark basemap
+applyBasemap('dark');
+
+// ─── BASEMAP ──────────────────────────────────────────────────────────────────
+function applyBasemap(mode) {
+  S.viewer.imageryLayers.removeAll();
+  const layers = S.viewer.imageryLayers;
+  if (mode === 'dark') {
+    layers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
+      url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+      subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
+      credit: '© CARTO © OpenStreetMap',
+    }));
+  } else if (mode === 'satellite') {
+    layers.addImageryProvider(new Cesium.IonImageryProvider({ assetId: 3 }));
+  } else if (mode === 'terrain') {
+    layers.addImageryProvider(new Cesium.IonImageryProvider({ assetId: 3 }));
+    S.viewer.terrainProvider = Cesium.createWorldTerrain();
+  } else {
+    // void — pure dark bg
+    S.viewer.scene.globe.baseColor = new Cesium.Color(0.04, 0.04, 0.06, 1);
+  }
 }
 
-async function initCesium(token) {
-  Cesium.Ion.defaultAccessToken = token;
-  // Show token status in topbar
-  const tokenIndicator = document.getElementById('token-status');
-  const isDefault = token.startsWith('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlYWE1');
-  if (tokenIndicator) {
-    tokenIndicator.textContent = isDefault ? '⚠ DEFAULT TOKEN' : '✓ CESIUM TOKEN';
-    tokenIndicator.style.color = isDefault ? 'var(--amber)' : 'var(--green)';
-    tokenIndicator.title = isDefault ? 'Using limited default token. Enter your own at ion.cesium.com for full features.' : 'Custom Cesium Ion token active';
-  }
-  const terrainProvider = await Cesium.createWorldTerrainAsync().catch(()=>undefined);
-  S.viewer = new Cesium.Viewer('cesiumContainer',{
-    terrainProvider, imageryProvider:false, baseLayerPicker:false,
-    geocoder:false, homeButton:false, sceneModePicker:false,
-    navigationHelpButton:false, animation:false, timeline:false,
-    fullscreenButton:false, infoBox:false, selectionIndicator:false,
-    shadows:false, creditContainer:document.createElement('div'),
-  });
-  const scene=S.viewer.scene;
-  scene.globe.enableLighting=true;
-  scene.globe.atmosphereLightIntensity=10.0;
+document.getElementById('basemap-sel').addEventListener('change', e => applyBasemap(e.target.value));
+
+// ─── VIEW MODES ───────────────────────────────────────────────────────────────
+document.getElementById('btn-3d').addEventListener('click', () => {
+  S.viewer.scene.morphTo3D(0.5);
+  document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('btn-3d').classList.add('active');
+});
+document.getElementById('btn-2d').addEventListener('click', () => {
+  S.viewer.scene.morphTo2D(0.5);
+  document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('btn-2d').classList.add('active');
+});
+document.getElementById('btn-cv').addEventListener('click', () => {
+  S.viewer.scene.morphToColumbusView(0.5);
+  document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('btn-cv').classList.add('active');
+});
+
+// ─── CAMERA HELPERS ───────────────────────────────────────────────────────────
+function getCameraInfo() {
+  const cam = S.viewer.camera;
+  const carto = Cesium.Ellipsoid.WGS84.cartesianToCartographic(cam.positionWC);
+  const lat = Cesium.Math.toDegrees(carto?.latitude || 0);
+  const lon = Cesium.Math.toDegrees(carto?.longitude || 0);
+  const altM = carto?.height || 10e6;
+  S.cameraAlt = altM;
+  return { lat, lon, altKm: altM / 1000 };
+}
+
+function getViewportBbox() {
+  // Compute approximate bounding box of current viewport
+  // Returns {minLat, maxLat, minLon, maxLon} or null if can't compute
   try {
-    const ts=await Cesium.Cesium3DTileset.fromIonAssetId(2275207,{maximumScreenSpaceError:16});
-    scene.primitives.add(ts);
-    addLog('GOOGLE 3D TILES ONLINE');
-  } catch { await loadFallback(); }
-  S.viewer.camera.setView({
-    destination:Cesium.Cartesian3.fromDegrees(0,20,18000000),
-    orientation:{heading:0,pitch:Cesium.Math.toRadians(-90),roll:0},
+    const rect = S.viewer.camera.computeViewRectangle(S.viewer.scene.globe.ellipsoid);
+    if (!rect) return null;
+    return {
+      minLat: Cesium.Math.toDegrees(rect.south),
+      maxLat: Cesium.Math.toDegrees(rect.north),
+      minLon: Cesium.Math.toDegrees(rect.west),
+      maxLon: Cesium.Math.toDegrees(rect.east),
+    };
+  } catch { return null; }
+}
+
+// Camera position display
+S.viewer.scene.postRender.addEventListener(() => {
+  const { lat, lon, altKm } = getCameraInfo();
+  const el = document.getElementById('loc-display');
+  if (el) el.textContent = `${lat.toFixed(2)}°${lat>=0?'N':'S'} ${Math.abs(lon).toFixed(2)}°${lon>=0?'E':'W'} ALT:${altKm.toFixed(0)}km`;
+});
+
+// ─── LAYER TOGGLE BUTTONS ─────────────────────────────────────────────────────
+document.querySelectorAll('.lbtn').forEach(btn => {
+  const layer = btn.dataset.layer;
+  btn.addEventListener('click', () => {
+    const on = !btn.classList.contains('on');
+    btn.classList.toggle('on', on);
+    S.layers[layer] = on;
+
+    if (layer === 'intel') {
+      document.getElementById('intel-panel').style.display = on ? 'flex' : 'none';
+      document.getElementById('cesiumContainer').style.right = on ? 'var(--intel-w)' : '0';
+      return;
+    }
+
+    if (!on) {
+      // Remove data source
+      const dsKey = layer + 'Ds';
+      if (S[dsKey]) { S.viewer.dataSources.remove(S[dsKey], true); S[dsKey] = null; }
+      if (layer === 'satellites') clearInterval(S.intervals.sat);
+    } else {
+      // Reload
+      switch(layer) {
+        case 'satellites': loadSatellites(); break;
+        case 'flights':    fetchFlights();   break;
+        case 'military':   fetchMilitary();  break;
+        case 'ships':      fetchShips();     break;
+        case 'quakes':     fetchQuakes();    break;
+        case 'cctv':       fetchCCTV();      break;
+        case 'wildfires':  fetchFires();     break;
+        case 'jamming':    fetchJamming();   break;
+        case 'mesh':       fetchMesh();      break;
+      }
+    }
   });
-  S.viewer.screenSpaceEventHandler.setInputAction(onGlobeClick,Cesium.ScreenSpaceEventType.LEFT_CLICK);
-  S.viewer.screenSpaceEventHandler.setInputAction(e=>{
-    const p=S.viewer.scene.pick(e.position);
-    if(p?.id?.properties) lockTrack(p.id);
-  },Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
-  S.viewer.camera.changed.addEventListener(updateCoords);
-  updateCoords();
-  addLog('ARGUS v5 ONLINE');
-  loadSatellites();
-}
+});
 
-async function loadFallback() {
-  try { const p=await Cesium.IonImageryProvider.fromAssetId(3); S.viewer.imageryLayers.addImageryProvider(p); } catch{}
-  try { const o=await Cesium.createOsmBuildingsAsync(); S.viewer.scene.primitives.add(o); } catch{}
-}
-
-// ── SATELLITES ────────────────────────────────────────────────────────────────
+// ─── SATELLITES ───────────────────────────────────────────────────────────────
+// Uses satellite.js (SGP4) for accurate positions
 async function loadSatellites() {
-  addLog('FETCHING TLE DATA...');
-  let all=[];
-  for (const g of ['space-stations','visual','active','starlink']) {
+  clearInterval(S.intervals.sat);
+  log('Fetching TLE data…');
+  S.tleData = [];
+
+  const groups = [...S.activeSatGroups];
+  const seen = new Set();
+
+  for (const grp of groups) {
     try {
-      const r=await fetch(`/api/tle/${encodeURIComponent(g)}`);
-      if(r.ok){ const t=await r.text(); all=all.concat(parseTLE(t)); }
-    } catch{}
+      const r = await fetch(`/api/tle/${encodeURIComponent(grp)}`);
+      if (!r.ok) { log(`TLE ${grp}: HTTP ${r.status}`, 'warn'); continue; }
+      const txt = await r.text();
+      if (!txt.includes('\n1 ')) { log(`TLE ${grp}: no valid data`, 'warn'); continue; }
+      const parsed = parseTLE(txt);
+      let added = 0;
+      for (const s of parsed) {
+        if (!seen.has(s.name)) { seen.add(s.name); S.tleData.push(s); added++; }
+      }
+      log(`TLE ${grp}: ${added} satellites loaded`);
+    } catch(e) { log(`TLE ${grp}: ${e.message}`, 'error'); }
   }
-  if(!all.length) {
-    showToast('TLE: No satellite data received', 'warn');
-    return;
-  }
-  const seen=new Set();
-  S.tleData=all.filter(s=>{if(seen.has(s.name))return false;seen.add(s.name);return true;});
-  document.getElementById('sat-count').textContent=S.tleData.length;
-  addLog(`${S.tleData.length} SATELLITES ACQUIRED`);
+
+  document.getElementById('cnt-sat').textContent = S.tleData.length;
+  if (!S.tleData.length) { toast('No satellite TLE data', 'warn'); return; }
+
   renderSatellites();
-  S.intervals.sat=setInterval(renderSatellites,CONFIG.satelliteUpdateInterval);
+  S.intervals.sat = setInterval(renderSatellites, CFG.refreshSats);
+  toast(`${S.tleData.length} satellites tracked`, 'ok', 3000);
 }
 
 function parseTLE(txt) {
-  const lines=txt.trim().split('\n').map(l=>l.trim()).filter(Boolean);
-  const out=[];
-  for(let i=0;i<lines.length-2;i+=3)
-    if(lines[i+1]?.startsWith('1 ')&&lines[i+2]?.startsWith('2 '))
-      out.push({name:lines[i].replace(/^0 /,''),tle1:lines[i+1],tle2:lines[i+2]});
+  const lines = txt.trim().split('\n').map(l => l.trim()).filter(Boolean);
+  const out = [];
+  for (let i = 0; i < lines.length - 2; i += 3) {
+    if (lines[i+1]?.startsWith('1 ') && lines[i+2]?.startsWith('2 ')) {
+      const name = lines[i].replace(/^0 /, '').trim();
+      out.push({ name, tle1: lines[i+1], tle2: lines[i+2] });
+    }
+  }
   return out;
 }
 
-
-
 function renderSatellites() {
-  if(!S.layers.satellites.on||!S.viewer) return;
-  if(S.layers.satellites.ds) S.viewer.dataSources.remove(S.layers.satellites.ds,true);
-  const ds=new Cesium.CustomDataSource('satellites');
-  const full=S.detMode==='full';
-  const now=new Date();
-  const limit=Math.min(S.tleData.length,500);
-  for(let i=0;i<limit;i++){
-    const sat=S.tleData[i];
-    try{
-      const pos=propagate(sat.tle1,sat.tle2,now);
-      if(!pos) continue;
+  if (!S.layers.satellites || !S.viewer) return;
+  if (S.satDs) S.viewer.dataSources.remove(S.satDs, true);
+
+  const ds = new Cesium.CustomDataSource('satellites');
+  const now = new Date();
+  const altKm = S.cameraAlt / 1000;
+  const showLabels = altKm < 5000;
+  const limit = Math.min(S.tleData.length, CFG.maxSats);
+
+  let rendered = 0;
+  for (let i = 0; i < limit; i++) {
+    const sat = S.tleData[i];
+    try {
+      const pos = sgp4Position(sat.tle1, sat.tle2, now);
+      if (!pos) continue;
+      rendered++;
+
+      const isStation = sat.name.match(/ISS|TIANGONG|CSS/i);
+      const isStarlink = sat.name.includes('STARLINK');
+      const color = isStation ? '#ff6600' : isStarlink ? '#4488ff' : '#00ffaa';
+
       ds.entities.add({
-        id:`sat_${i}`,name:sat.name,
-        position:Cesium.Cartesian3.fromDegrees(pos.lng,pos.lat,pos.alt*1000),
-        point:{pixelSize:2.5,color:Cesium.Color.fromCssColorString('#00ff88').withAlpha(0.9),
-          outlineColor:Cesium.Color.BLACK,outlineWidth:1,
-          scaleByDistance:new Cesium.NearFarScalar(1.5e6,1.5,1.5e8,0.6)},
-        label:full?{text:sat.name.substring(0,14),font:'9px Share Tech Mono',
-          fillColor:Cesium.Color.fromCssColorString('#00ff88').withAlpha(0.8),
-          outlineColor:Cesium.Color.BLACK,outlineWidth:2,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
-          pixelOffset:new Cesium.Cartesian2(8,0),translucencyByDistance:new Cesium.NearFarScalar(1.5e7,1,1e8,0)
-        }:undefined,
-        properties:{type:'satellite',data:sat,pos},
+        id: `sat_${i}`,
+        name: sat.name,
+        position: Cesium.Cartesian3.fromDegrees(pos.lng, pos.lat, pos.alt * 1000),
+        point: {
+          pixelSize: isStation ? 5 : 2.5,
+          color: Cesium.Color.fromCssColorString(color).withAlpha(isStation ? 1.0 : 0.85),
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: isStation ? 2 : 0,
+          scaleByDistance: new Cesium.NearFarScalar(1.5e6, 2, 2e8, 0.5),
+        },
+        label: showLabels ? {
+          text: sat.name.length > 12 ? sat.name.substring(0, 12) + '…' : sat.name,
+          font: '10px JetBrains Mono',
+          fillColor: Cesium.Color.fromCssColorString(color).withAlpha(0.9),
+          outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          pixelOffset: new Cesium.Cartesian2(8, 0),
+          translucencyByDistance: new Cesium.NearFarScalar(1e7, 1, 1e8, 0),
+        } : undefined,
+        properties: { type: 'satellite', name: sat.name, alt: pos.alt, lat: pos.lat, lon: pos.lng },
       });
-    } catch{}
+    } catch {}
   }
+
   S.viewer.dataSources.add(ds);
-  S.layers.satellites.ds=ds;
+  S.satDs = ds;
 }
 
-function propagate(tle1,tle2,date) {
-  try{
-    const ey=parseInt(tle1.substring(18,20)),ed=parseFloat(tle1.substring(20,32));
-    const fy=ey<57?2000+ey:1900+ey;
-    const ep=new Date(fy,0,1); ep.setTime(ep.getTime()+(ed-1)*86400000);
-    const inc=parseFloat(tle2.substring(8,16))*Math.PI/180;
-    const raan=parseFloat(tle2.substring(17,25))*Math.PI/180;
-    const ecc=parseFloat('0.'+tle2.substring(26,33));
-    const argp=parseFloat(tle2.substring(34,42))*Math.PI/180;
-    const mm=parseFloat(tle2.substring(52,63));
-    const n=mm*2*Math.PI/86400,a=Math.pow(398600.4418/(n*n),1/3);
-    const dt=(date-ep)/1000;
-    let M=(parseFloat(tle2.substring(43,51))*Math.PI/180)+n*dt; M=M%(2*Math.PI);
-    let E=M; for(let j=0;j<6;j++) E=M+ecc*Math.sin(E);
-    const nu=2*Math.atan2(Math.sqrt(1+ecc)*Math.sin(E/2),Math.sqrt(1-ecc)*Math.cos(E/2));
-    const r=a*(1-ecc*Math.cos(E));
-    const xo=r*Math.cos(nu),yo=r*Math.sin(nu);
-    const cR=Math.cos(raan),sR=Math.sin(raan),cI=Math.cos(inc),sI=Math.sin(inc),cA=Math.cos(argp),sA=Math.sin(argp);
-    const x=(cR*cA-sR*sA*cI)*xo+(-cR*sA-sR*cA*cI)*yo;
-    const y=(sR*cA+cR*sA*cI)*xo+(-sR*sA+cR*cA*cI)*yo;
-    const z=(sA*sI)*xo+(cA*sI)*yo;
-    const gmst=(()=>{const jd=date.getTime()/86400000+2440587.5,T=(jd-2451545)/36525;return((280.46061837+360.98564736629*(jd-2451545)+T*T*(0.000387933-T/38710000))%360)*Math.PI/180;})();
-    const lng=Math.atan2(y,x)-gmst,lat=Math.atan2(z,Math.sqrt(x*x+y*y));
-    return{lat:lat*180/Math.PI,lng:((lng*180/Math.PI)%360+540)%360-180,alt:Math.max(r-6371,100)};
-  } catch{return null;}
+// SGP4 propagation using satellite.js (accurate)
+function sgp4Position(tle1, tle2, date) {
+  try {
+    const satrec = satellite.twoline2satrec(tle1, tle2);
+    const posVel  = satellite.propagate(satrec, date);
+    if (!posVel?.position || posVel.position === false) return null;
+
+    const gmst = satellite.gstime(date);
+    const geo  = satellite.eciToGeodetic(posVel.position, gmst);
+
+    const lat = Cesium.Math.toDegrees(geo.latitude);
+    const lng = Cesium.Math.toDegrees(geo.longitude);
+    const alt = geo.height;  // km above ellipsoid
+
+    if (isNaN(lat) || isNaN(lng) || isNaN(alt)) return null;
+    if (lat < -90 || lat > 90) return null;
+
+    return { lat, lng, alt };
+  } catch { return null; }
 }
 
-// ── FLIGHTS ───────────────────────────────────────────────────────────────────
-async function loadFlights(mil=false) {
-  const key=mil?'military':'flights';
-  addLog(`FETCHING ${mil?'MILITARY':'COMMERCIAL'} FLIGHTS...`);
-  try{
-    const r=await fetch(mil?'/api/flights/military':'/api/flights/opensky');
-    if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data=await r.json();
-    const states=data.states||[];
-    if(mil) S.rawMilitary=states; else S.rawFlights=states;
-    if(!mil&&states.length){
-      const callsigns=[...new Set(states.map(s=>(s[1]||'').trim()).filter(Boolean))];
-      const unknown=callsigns.filter(c=>!(c in S.airlineMap));
-      if(unknown.length){
-        try{
-          const ar=await fetch('/api/flights/airlines',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({callsigns:unknown.slice(0,500)})});
-          if(ar.ok) Object.assign(S.airlineMap,await ar.json());
-        } catch{}
-      }
-    }
-    applyFlightFilters(mil);
-  } catch(e){
-    const msg = e.message||'unknown error';
-    console.warn(`[ARGUS] ${mil?'Military':'Flights'} fetch failed:`, msg);
-    addLog(`${mil?'MIL':'CIVIL'}: ${msg.substring(0,28)}`);
-    showToast(`${mil?'Military':'Flights'}: ${msg.substring(0,40)}`, 'warn');
-    if(mil) S.rawMilitary=[]; else S.rawFlights=[];
-    applyFlightFilters(mil);
-  }
-}
-
-function refreshFlightsBbox(bbox,lod,mil=false){ loadFlights(mil); }
-
-function applyFlightFilters(mil=false){
-  const raw=mil?S.rawMilitary:S.rawFlights;
-  const f=S.filters.flights;
-  const filtered=raw.filter(s=>{
-    if(!s||s[5]==null||s[6]==null) return false;
-    const alt=+(s[13]||s[7]||0),spd=+(s[9]||0),cs=(s[1]||'').trim(),cty=(s[2]||'');
-    if(alt<f.minAlt||alt>f.maxAlt) return false;
-    if(spd<f.minSpd||spd>f.maxSpd) return false;
-    if(f.country&&!cty.toLowerCase().includes(f.country.toLowerCase())) return false;
-    if(f.callsign&&!cs.toLowerCase().includes(f.callsign.toLowerCase())) return false;
-    if(!f.showUnknown&&!cs) return false;
-    return true;
+// Satellite group checkboxes
+document.querySelectorAll('[data-satgrp]').forEach(cb => {
+  cb.addEventListener('change', () => {
+    const grp = cb.dataset.satgrp;
+    if (cb.checked) S.activeSatGroups.add(grp);
+    else S.activeSatGroups.delete(grp);
   });
-  renderFlights(filtered,mil);
+});
+document.getElementById('reload-sats').addEventListener('click', () => {
+  if (S.layers.satellites) loadSatellites();
+});
+
+// ─── FLIGHTS ──────────────────────────────────────────────────────────────────
+const ALT_COLORS = [
+  [15,     '#999999'],  // ground
+  [300,    '#ff7f00'],  // <1000ft
+  [1524,   '#ff9900'],  // <5000ft
+  [3048,   '#ffcc00'],  // <10000ft
+  [5486,   '#aaee22'],  // <18000ft
+  [7620,   '#00ee88'],  // <25000ft
+  [10058,  '#00ccff'],  // <33000ft
+  [12192,  '#2299ff'],  // <40000ft
+  [13716,  '#9955ff'],  // <45000ft
+  [Infinity,'#ff44aa'], // 45000ft+
+];
+
+function altColor(altM) {
+  if (altM == null || altM <= 15) return ALT_COLORS[0][1];
+  for (const [thresh, color] of ALT_COLORS) {
+    if (altM <= thresh) return color;
+  }
+  return '#ff44aa';
 }
 
-function renderFlights(states, mil=false) {
-  if (!S.viewer) return;
-  const key = mil ? 'military' : 'flights';
-  if (S.layers[key].ds) S.viewer.dataSources.remove(S.layers[key].ds, true);
-  const ds = new Cesium.CustomDataSource(key);
-  const full = S.detMode === 'full';
+function planeIcon(color, rotDeg, size=16) {
+  // SVG aircraft silhouette pointing up, rotated by heading
+  const r = (rotDeg || 0);
+  return `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 16 16"><g transform="rotate(${r},8,8)"><path d="M8 1 L10 8 L14 9 L10 11 L10 13 L8 12 L6 13 L6 11 L2 9 L6 8 Z" fill="${color}" stroke="#000" stroke-width="0.5"/></g></svg>`)}`;
+}
+
+function milIcon(color) {
+  return `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14"><polygon points="7,1 13,13 1,13" fill="${color}" stroke="#000" stroke-width="0.5"/></svg>`)}`;
+}
+
+async function fetchFlights() {
+  if (!S.layers.flights) return;
+  const { lat, lon } = getCameraInfo();
+  const dist = Math.min(Math.max(S.cameraAlt / 1000 * 0.5, 100), 250);
+
+  try {
+    const r = await fetch(`/api/flights/opensky?lat=${lat.toFixed(2)}&lon=${lon.toFixed(2)}&dist=${Math.round(dist)}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    renderFlights(data.states || [], false);
+    document.getElementById('cnt-air').textContent = (data.states || []).length;
+  } catch(e) { log(`Flights: ${e.message}`, 'warn'); }
+}
+
+async function fetchMilitary() {
+  if (!S.layers.military) return;
+  try {
+    const r = await fetch('/api/flights/military');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    renderFlights(data.states || [], true);
+    document.getElementById('cnt-mil').textContent = (data.states || []).length;
+  } catch(e) { log(`Military: ${e.message}`, 'warn'); }
+}
+
+function renderFlights(states, isMilitary) {
+  const dsKey = isMilitary ? 'militaryDs' : 'flightDs';
+  if (S[dsKey]) S.viewer.dataSources.remove(S[dsKey], true);
+  if (!S.layers[isMilitary ? 'military' : 'flights']) return;
+
+  const ds = new Cesium.CustomDataSource(isMilitary ? 'military' : 'flights');
+  const bbox = getViewportBbox();
 
   for (const s of states) {
-    if (!s || s[5] == null || s[6] == null) continue;
-    const lon = +s[5], lat = +s[6];
-    const altM = +(s[13] || s[7] || 0);
-    if (isNaN(lon) || isNaN(lat)) continue;
-    const icao = s[0] || '';
-    const cs   = (s[1] || icao || 'UNKN').trim() || 'UNKN';
-    const onGround  = s[8] === true || altM < 50;
-    const trackDeg  = +(s[10] || 0);
-    const spdKt     = Math.round(+(s[9] || 0) * 1.944);
-    const altFt     = Math.round(altM * 3.28084);
-    const color     = altitudeColor(altM, onGround);
-    const cat       = getAircraftCategory(cs, mil);
-    const iconSize  = cat === 'heli' ? 20 : mil ? 22 : 20;
-    const cesColor  = Cesium.Color.fromCssColorString(color);
-    const airline   = S.airlineMap[cs];
-    const renderAlt = onGround ? 10 : Math.max(altM, 100);
+    const icao = s[0], callsign = (s[1]||'').trim(), lon = s[5], lat = s[6];
+    const altM = s[7] ?? s[13] ?? 0;
+    const speed = s[9] ?? 0;
+    const track = s[10] ?? 0;
+    const onGround = s[8];
 
-    // Trail
-    if (!S._flightTrails) S._flightTrails = new Map();
-    if (!S._flightTrails.has(icao)) S._flightTrails.set(icao, []);
-    const trail = S._flightTrails.get(icao);
-    trail.push([lon, lat, renderAlt]);
-    if (trail.length > 8) trail.shift();
-
-    if (trail.length >= 2) {
-      ds.entities.add({
-        id: `${key}_trail_${icao}`,
-        polyline: {
-          positions: trail.map(p => Cesium.Cartesian3.fromDegrees(p[0], p[1], p[2])),
-          width: 1.5,
-          material: new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.05, color: cesColor.withAlpha(0.45) }),
-          arcType: Cesium.ArcType.NONE,
-          clampToGround: onGround,
-        },
-      });
+    if (lon == null || lat == null || isNaN(lon) || isNaN(lat)) continue;
+    if (bbox && (lat < bbox.minLat || lat > bbox.maxLat || lon < bbox.minLon || lon > bbox.maxLon)) {
+      // Skip entities outside viewport when zoomed in enough
+      if (S.cameraAlt < 3000000) continue;
     }
 
-    const labelText = full
-      ? [cs, airline ? airline.name.substring(0,16) : '', `${altFt.toLocaleString()}ft  ${spdKt}kt`].filter(Boolean).join('\n')
-      : cs + '\n' + (onGround ? 'GND' : Math.round(altFt/100)*100 + 'ft');
+    const color = isMilitary ? '#ff3333' : altColor(altM);
+    const altFt = Math.round((altM || 0) * 3.28084);
+    const spdKt = Math.round((speed || 0) * 1.944);
 
     ds.entities.add({
-      id: `${key}_${icao}`,
-      name: cs,
-      position: Cesium.Cartesian3.fromDegrees(lon, lat, renderAlt),
+      id: `${isMilitary?'mil':'ac'}_${icao}`,
+      name: callsign || icao || 'Unknown',
+      position: Cesium.Cartesian3.fromDegrees(lon, lat, altM || 0),
       billboard: {
-        image: planeIcon(color, cat, iconSize),
-        width: iconSize, height: iconSize,
-        rotation: Cesium.Math.toRadians(-trackDeg),
-        alignedAxis: Cesium.Cartesian3.UNIT_Z,
-        scaleByDistance:        new Cesium.NearFarScalar(5e3, 1.6, 8e6, 0.5),
-        translucencyByDistance: new Cesium.NearFarScalar(5e5, 1, 1e7, 0.1),
-        disableDepthTestDistance: onGround ? 0 : Number.POSITIVE_INFINITY,
+        image: isMilitary ? milIcon(color) : planeIcon(color, track),
+        width: isMilitary ? 14 : 16, height: isMilitary ? 14 : 16,
+        verticalOrigin: Cesium.VerticalOrigin.CENTER,
+        scaleByDistance: new Cesium.NearFarScalar(1e5, 1.5, 5e6, 0.6),
       },
       label: {
-        text: labelText,
-        font: '9px Share Tech Mono',
-        fillColor: cesColor,
-        outlineColor: Cesium.Color.BLACK,
-        outlineWidth: 2,
+        text: `${callsign||icao}\n${altFt ? altFt.toLocaleString()+'ft' : 'GND'} ${spdKt}kt`,
+        font: '10px JetBrains Mono, monospace',
+        fillColor: Cesium.Color.fromCssColorString(color).withAlpha(0.9),
+        outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
         style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset: new Cesium.Cartesian2(iconSize/2 + 4, 0),
-        horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
-        verticalOrigin: Cesium.VerticalOrigin.CENTER,
-        translucencyByDistance: new Cesium.NearFarScalar(full ? 2e5 : 5e4, 1, full ? 8e6 : 3e6, 0),
+        pixelOffset: new Cesium.Cartesian2(0, -20),
+        translucencyByDistance: new Cesium.NearFarScalar(5e5, 1, 3e6, 0),
+        backgroundColor: new Cesium.Color(0,0,0,0.4),
         showBackground: true,
-        backgroundColor: Cesium.Color.fromBytes(0, 0, 0, 160),
-        backgroundPadding: new Cesium.Cartesian2(4, 3),
-        disableDepthTestDistance: Number.POSITIVE_INFINITY,
       },
-      properties: { type: mil ? 'military' : 'flight', data: s, airline },
+      properties: {
+        type: isMilitary ? 'military' : 'flight',
+        icao, callsign, lat, lon, altM, altFt, speed, spdKt, track,
+        onGround, country: s[2],
+      },
     });
   }
+
   S.viewer.dataSources.add(ds);
-  S.layers[key].ds = ds;
-  document.getElementById(mil ? 'mil-count' : 'flight-count').textContent = states.length;
-  addLog(`${states.length} ${mil ? 'MIL' : 'CIVIL'} FLIGHTS`);
-  if (!mil) updateFilterStats(states);
+  S[dsKey] = ds;
 }
 
-function updateFilterStats(states){
-  const c=[...new Set(states.map(s=>(s[2]||'').trim()).filter(Boolean))];
-  const a=[...new Set(states.map(s=>S.airlineMap[(s[1]||'').trim()]?.name).filter(Boolean))];
-  const el=document.getElementById('filter-stats');
-  if(el) el.textContent=`${states.length} ac · ${c.length} countries · ${a.length} airlines`;
+// ─── SHIPS ────────────────────────────────────────────────────────────────────
+const SHIP_COLORS = {
+  0: '#999999',   // unknown
+  1: '#aaaaaa',   // reserved
+  2: '#ff4444',   // WIG craft
+  3: '#ff6600',   // vessel
+  6: '#2299ff',   // passenger
+  7: '#22cc88',   // cargo
+  8: '#ff9900',   // tanker
+  9: '#cc44ff',   // other
+};
+
+function shipColor(type) {
+  const t = Math.floor((type||0)/10);
+  return SHIP_COLORS[t] || '#4488cc';
 }
 
-// ── QUAKES ────────────────────────────────────────────────────────────────────
-async function loadQuakes(){
-  try{
-    const r=await fetch('/api/quakes'); if(!r.ok) throw new Error();
-    renderQuakes((await r.json()).features||[]);
-  } catch{renderQuakes([]);}
+function shipIcon(color, heading, type) {
+  const h = heading >= 0 && heading <= 360 ? heading : 0;
+  const isTanker = (type >= 80 && type <= 89);
+  const isPassenger = (type >= 60 && type <= 69);
+  const w = isTanker ? 18 : isPassenger ? 16 : 14;
+  return `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${w}" viewBox="0 0 16 16"><g transform="rotate(${h},8,8)"><path d="M8 1 L11 12 L8 10 L5 12 Z" fill="${color}" stroke="#000" stroke-width="0.5"/></g></svg>`)}`;
 }
 
-function renderQuakes(features){
-  if(!S.viewer) return;
-  if(S.layers.quakes.ds) S.viewer.dataSources.remove(S.layers.quakes.ds,true);
-  const ds=new Cesium.CustomDataSource('quakes'); let cnt=0;
-  for(const f of features){
-    const [lon,lat]=f.geometry.coordinates,mag=f.properties.mag||0;
-    if(mag<1) continue;
-    const col=mag>=6?'#ff2222':mag>=4?'#ff8800':'#ffdd00';
-    const sz=Math.max(4,mag*4);
-    ds.entities.add({
-      id:`quake_${f.id}`,name:`M${mag.toFixed(1)} — ${f.properties.place||''}`,
-      position:Cesium.Cartesian3.fromDegrees(lon,lat,0),
-      point:{pixelSize:sz,color:Cesium.Color.fromCssColorString(col).withAlpha(0.8),
-        outlineColor:Cesium.Color.fromCssColorString(col).withAlpha(0.3),outlineWidth:sz*0.6,
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-        disableDepthTestDistance:Number.POSITIVE_INFINITY},
-      label:S.detMode==='full'?{text:`M${mag.toFixed(1)}`,font:'9px Share Tech Mono',
-        fillColor:Cesium.Color.fromCssColorString(col),
-        outlineColor:Cesium.Color.BLACK,outlineWidth:2,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset:new Cesium.Cartesian2(0,-sz-4),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND}:undefined,
-      properties:{type:'quake',data:f.properties},
-    }); cnt++;
+async function fetchShips() {
+  if (!S.layers.ships) return;
+  const bbox = getViewportBbox();
+  let url = '/api/ships';
+  if (bbox && S.cameraAlt < 5000000) {
+    const pad = 5;
+    url += `?minLat=${(bbox.minLat-pad).toFixed(2)}&maxLat=${(bbox.maxLat+pad).toFixed(2)}&minLon=${(bbox.minLon-pad).toFixed(2)}&maxLon=${(bbox.maxLon+pad).toFixed(2)}`;
   }
-  S.viewer.dataSources.add(ds); S.layers.quakes.ds=ds;
-  document.getElementById('quake-count').textContent=cnt;
-  addLog(`${cnt} SEISMIC EVENTS`);
-}
-
-// ── SEISMIC STATIONS ──────────────────────────────────────────────────────────
-async function loadSeismicStations(){
-  addLog('FETCHING SEISMIC STATIONS...');
-  try{
-    const r=await fetch('/api/seismic/stations'); if(!r.ok) throw new Error();
-    const data=await r.json();
-    renderSeismicStations(data.stations||[]);
-  } catch{ addLog('SEISMIC STATIONS: UNAVAILABLE'); showToast('Seismic stations feed unavailable', 'warn'); }
-}
-
-function renderSeismicStations(stations){
-  if(!S.viewer) return;
-  if(S.layers.sensors.ds) S.viewer.dataSources.remove(S.layers.sensors.ds,true);
-  const ds=new Cesium.CustomDataSource('sensors');
-  for(const st of stations){
-    if(!st.lat||!st.lon) continue;
-    ds.entities.add({
-      id:`sensor_${st.id}`,name:`${st.network}.${st.code} — ${st.name}`,
-      position:Cesium.Cartesian3.fromDegrees(st.lon,st.lat,st.elev||0),
-      billboard:{
-        image:stationIcon(),width:16,height:16,
-        scaleByDistance:new Cesium.NearFarScalar(1e4,1.5,1e7,0.7),
-        translucencyByDistance:new Cesium.NearFarScalar(5e5,1,5e6,0.1),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-        disableDepthTestDistance:Number.POSITIVE_INFINITY,
-      },
-      label:S.detMode==='full'?{
-        text:`${st.network}.${st.code}`,font:'8px Share Tech Mono',
-        fillColor:Cesium.Color.fromCssColorString('#00ddff'),
-        outlineColor:Cesium.Color.BLACK,outlineWidth:2,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset:new Cesium.Cartesian2(10,0),
-        translucencyByDistance:new Cesium.NearFarScalar(5e5,1,5e6,0),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-      }:undefined,
-      properties:{type:'sensor',data:st},
-    });
-  }
-  S.viewer.dataSources.add(ds); S.layers.sensors.ds=ds;
-  document.getElementById('sensor-count').textContent=stations.length;
-  addLog(`${stations.length} SEISMIC STATIONS`);
-}
-
-// ── GPS JAMMING ───────────────────────────────────────────────────────────────
-async function loadGpsJam(){
-  addLog('FETCHING GPS JAMMING...');
-  try{
-    const r=await fetch('/api/gpsjam'); if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    renderGpsJam(await r.json());
-  } catch(e){ addLog(`GPSJAM: ${e.message.substring(0,25)}`); showToast(`GPS Jamming feed unavailable`, 'warn'); }
-}
-
-function renderGpsJam(geojson){
-  if(!S.viewer) return;
-  if(S.layers.gpsjam.ds) S.viewer.dataSources.remove(S.layers.gpsjam.ds,true);
-  const ds=new Cesium.CustomDataSource('gpsjam');
-  const features=geojson.features||[]; let cnt=0;
-  for(const f of features){
-    const coords=f.geometry?.coordinates;
-    if(!coords||!isFinite(coords[0])||!isFinite(coords[1])) continue;
-    const [lon,lat]=coords;
-    const level=f.properties?.level||1;
-    if(level<1) continue;
-    const label=f.properties?.label||f.properties?.name||`Zone ${cnt+1}`;
-    const hex=level>=3?'#ff2222':level>=2?'#ff8800':'#ffdd00';
-    const color=Cesium.Color.fromCssColorString(hex);
-    ds.entities.add({
-      id:`jam_${cnt}`,name:`GPS JAM L${level}: ${label}`,
-      position:Cesium.Cartesian3.fromDegrees(lon,lat,500),
-      ellipse:{
-        semiMajorAxis:level*90000,semiMinorAxis:level*90000,
-        material:color.withAlpha(0.12),outline:true,
-        outlineColor:color.withAlpha(0.7),outlineWidth:1,
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-      },
-      point:{pixelSize:level>=3?8:level>=2?6:4,color:color.withAlpha(0.95),
-        outlineColor:Cesium.Color.BLACK,outlineWidth:1,
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-        disableDepthTestDistance:Number.POSITIVE_INFINITY,
-        scaleByDistance:new Cesium.NearFarScalar(1e4,2,1e7,1)},
-      label:{text:`⚡L${level} ${label.substring(0,14)}`,font:'9px Share Tech Mono',
-        fillColor:color,outlineColor:Cesium.Color.BLACK,outlineWidth:2,
-        style:Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset:new Cesium.Cartesian2(0,-16),
-        horizontalOrigin:Cesium.HorizontalOrigin.CENTER,
-        verticalOrigin:Cesium.VerticalOrigin.BOTTOM,
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-        translucencyByDistance:new Cesium.NearFarScalar(5e4,1,8e6,0.1),
-        showBackground:true,backgroundColor:Cesium.Color.BLACK.withAlpha(0.65),
-        backgroundPadding:new Cesium.Cartesian2(4,3),
-        disableDepthTestDistance:Number.POSITIVE_INFINITY},
-      properties:{type:'gpsjam',level,label},
-    }); cnt++;
-  }
-  S.viewer.dataSources.add(ds); S.layers.gpsjam.ds=ds;
-  document.getElementById('jam-count').textContent=cnt;
-  addLog(`${cnt} GPS JAM ZONES`);
-}
-
-// ── SHIPS ─────────────────────────────────────────────────────────────────────
-async function loadShips() {
   try {
-    const r = await fetch('/api/ships');
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
-    if (!r.ok) {
-      // 503 = stream not ready yet — show helpful message, not an error toast
-      const msg = data.error || `HTTP ${r.status}`;
-      console.warn('[ARGUS] Ships:', msg);
-      addLog(`AIS: ${data.connected === false ? 'CONNECTING...' : msg.substring(0,25)}`);
-      if (data.connected === false && !data.error?.includes('No AISSTREAM_KEY')) {
-        // Silently retry — stream is just warming up
-        renderShips([]);
-      } else {
-        showToast(msg.substring(0, 80), 'warn');
-        renderShips([]);
-      }
-      return;
-    }
-    addLog('FETCHING AIS DATA...');
-    renderShips(Array.isArray(data) ? data : (data.ships || []));
-  } catch(e) {
-    console.warn('[ARGUS] Ships fetch failed:', e.message);
-    addLog(`AIS: ${e.message.substring(0,25)}`);
-    showToast(`AIS vessels: ${e.message.substring(0,40)}`, 'warn');
-    renderShips([]);
-  }
-}
-
-async function refreshShipsBbox(bbox){
-  if(!bbox){loadShips();return;}
-  try{
-    const pad=2;
-    const r=await fetch(`/api/ships?minLat=${(bbox.minLat-pad).toFixed(2)}&maxLat=${(bbox.maxLat+pad).toFixed(2)}&minLon=${(bbox.minLon-pad).toFixed(2)}&maxLon=${(bbox.maxLon+pad).toFixed(2)}`);
-    if(!r.ok) throw new Error();
-    renderShips(await r.json());
-  } catch{loadShips();}
+    renderShips(data.ships || []);
+    document.getElementById('cnt-ais').textContent = (data.ships||[]).length;
+    if (data._src) log(`Ships: ${data._count} from ${data._src}`);
+  } catch(e) { log(`Ships: ${e.message}`, 'warn'); }
 }
 
 function renderShips(ships) {
-  if (!S.viewer) return;
-  if (S.layers.ships.ds) S.viewer.dataSources.remove(S.layers.ships.ds, true);
+  if (S.shipDs) S.viewer.dataSources.remove(S.shipDs, true);
+  if (!S.layers.ships) return;
+
   const ds = new Cesium.CustomDataSource('ships');
-  const full = S.detMode === 'full';
 
   for (const s of ships) {
-    if (!s.lat || !s.lon) continue;
-    const sog   = +(s.sog  || 0);
-    const cog   = +(s.cog  || 0);
-    const type  = +(s.type || 0);
-    const name  = (s.name || String(s.mmsi) || 'UNKNOWN').substring(0, 20).trim();
-    const mmsi  = String(s.mmsi || '');
-    const color = shipTypeColor(type);
-    const cesColor = Cesium.Color.fromCssColorString(color);
-
-    if (!S._shipTrails) S._shipTrails = new Map();
-    if (!S._shipTrails.has(mmsi)) S._shipTrails.set(mmsi, []);
-    const trail = S._shipTrails.get(mmsi);
-    trail.push([s.lon, s.lat]);
-    if (trail.length > 6) trail.shift();
-
-    if (trail.length >= 2) {
-      ds.entities.add({
-        id: `ship_trail_${mmsi}`,
-        polyline: {
-          positions: trail.map(p => Cesium.Cartesian3.fromDegrees(p[0], p[1], 5)),
-          width: 1.2,
-          material: new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.05, color: cesColor.withAlpha(0.4) }),
-          clampToGround: true,
-        },
-      });
-    }
-
-    const typeLabel = type>=80?'TANKER':type>=70?'CARGO':type>=60?'PASS.':type>=50?'HSC':type>=30?'FISHING':'VESSEL';
-    const labelText = full
-      ? [name, `${typeLabel}  ${sog.toFixed(1)}kt`, s.dest||''].filter(Boolean).join('\n')
-      : name + '\n' + sog.toFixed(1) + 'kt';
+    if (!s.lat || !s.lon || isNaN(s.lat) || isNaN(s.lon)) continue;
+    const color = shipColor(s.type || 0);
+    const name  = s.name || s.mmsi || 'UNKNOWN';
 
     ds.entities.add({
-      id: `ship_${mmsi}`,
+      id: `ship_${s.mmsi || Math.random()}`,
       name,
-      position: Cesium.Cartesian3.fromDegrees(s.lon, s.lat, 8),
+      position: Cesium.Cartesian3.fromDegrees(s.lon, s.lat, 10),
       billboard: {
-        image: shipIcon(color, type),
-        width: 20, height: 22,
-        rotation: Cesium.Math.toRadians(-cog),
-        alignedAxis: Cesium.Cartesian3.UNIT_Z,
-        scaleByDistance:        new Cesium.NearFarScalar(1e3, 2, 5e6, 0.55),
-        translucencyByDistance: new Cesium.NearFarScalar(3e5, 1, 3e6, 0.1),
-        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        image: shipIcon(color, s.heading || s.course || 0, s.type || 0),
+        width: 14, height: 14,
+        verticalOrigin: Cesium.VerticalOrigin.CENTER,
+        scaleByDistance: new Cesium.NearFarScalar(1e4, 2, 2e6, 0.6),
       },
       label: {
-        text: labelText,
-        font: '9px Share Tech Mono',
-        fillColor: cesColor,
-        outlineColor: Cesium.Color.BLACK,
-        outlineWidth: 2,
+        text: name.substring(0, 10),
+        font: '10px JetBrains Mono, monospace',
+        fillColor: Cesium.Color.fromCssColorString(color).withAlpha(0.9),
+        outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
         style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset: new Cesium.Cartesian2(14, 0),
-        horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
-        verticalOrigin: Cesium.VerticalOrigin.CENTER,
-        translucencyByDistance: new Cesium.NearFarScalar(3e4, 1, 8e5, 0),
-        showBackground: true,
-        backgroundColor: Cesium.Color.fromBytes(0, 0, 0, 155),
-        backgroundPadding: new Cesium.Cartesian2(4, 3),
-        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        pixelOffset: new Cesium.Cartesian2(0, -16),
+        translucencyByDistance: new Cesium.NearFarScalar(1e5, 1, 1e6, 0),
       },
-      properties: { type: 'ship', data: s },
+      properties: { type: 'ship', ...s },
+    });
+  }
+
+  S.viewer.dataSources.add(ds);
+  S.shipDs = ds;
+}
+
+// ─── EARTHQUAKES ──────────────────────────────────────────────────────────────
+async function fetchQuakes() {
+  if (!S.layers.quakes) return;
+  try {
+    const r = await fetch('/api/quakes');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    renderQuakes(data.features || []);
+    document.getElementById('cnt-quake').textContent = (data.features||[]).length;
+    log(`Seismic: ${(data.features||[]).length} events`);
+  } catch(e) { log(`Quakes: ${e.message}`, 'warn'); }
+}
+
+function renderQuakes(features) {
+  if (S.quakeDs) S.viewer.dataSources.remove(S.quakeDs, true);
+  if (!S.layers.quakes) return;
+
+  const ds = new Cesium.CustomDataSource('quakes');
+  for (const f of features) {
+    const [lon, lat] = f.geometry.coordinates;
+    const mag = f.properties.mag || 0;
+    const depth = f.geometry.coordinates[2] || 0;
+    const r = Math.max(2, Math.min(16, mag * 3));
+    const alpha = Math.min(1, 0.4 + mag * 0.12);
+    const color = mag >= 6 ? '#ff2222' : mag >= 5 ? '#ff7700' : mag >= 4 ? '#ffaa00' : '#ffdd44';
+
+    ds.entities.add({
+      id: `quake_${f.id}`,
+      name: f.properties.place || `M${mag}`,
+      position: Cesium.Cartesian3.fromDegrees(lon, lat, 0),
+      point: {
+        pixelSize: r,
+        color: Cesium.Color.fromCssColorString(color).withAlpha(alpha),
+        outlineColor: Cesium.Color.fromCssColorString(color).withAlpha(0.3),
+        outlineWidth: 4,
+      },
+      properties: { type: 'quake', mag, depth, place: f.properties.place, time: f.properties.time, lat, lon },
+    });
+  }
+
+  S.viewer.dataSources.add(ds);
+  S.quakeDs = ds;
+}
+
+// ─── CCTV ─────────────────────────────────────────────────────────────────────
+async function fetchCCTV() {
+  if (!S.layers.cctv) return;
+  const { lat, lon } = getCameraInfo();
+  if (S.cameraAlt > 500000) { log('CCTV: zoom in for camera data', 'warn'); return; }
+  try {
+    const r = await fetch(`/api/cctv?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}&radius=4000`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const cams = await r.json();
+    renderCCTV(cams);
+    document.getElementById('cnt-cctv').textContent = cams.length;
+  } catch(e) { log(`CCTV: ${e.message}`, 'warn'); }
+}
+
+function renderCCTV(cams) {
+  if (S.cctvDs) S.viewer.dataSources.remove(S.cctvDs, true);
+  if (!S.layers.cctv) return;
+  const ds = new Cesium.CustomDataSource('cctv');
+  for (const c of cams) {
+    ds.entities.add({
+      id: `cctv_${c.id}`,
+      name: c.operator || 'CCTV Camera',
+      position: Cesium.Cartesian3.fromDegrees(c.lon, c.lat, 5),
+      point: {
+        pixelSize: 5,
+        color: Cesium.Color.fromCssColorString('#ff3300').withAlpha(0.9),
+        outlineColor: Cesium.Color.RED.withAlpha(0.3), outlineWidth: 4,
+      },
+      properties: { type: 'cctv', ...c },
     });
   }
   S.viewer.dataSources.add(ds);
-  S.layers.ships.ds = ds;
-  document.getElementById('ship-count').textContent = ships.length;
-  addLog(`${ships.length} VESSELS`);
+  S.cctvDs = ds;
 }
 
-
-// ── CCTV ──────────────────────────────────────────────────────────────────────
-async function loadCctv(bbox){
-  let lat,lon;
-  if(bbox){lat=bbox.centerLat;lon=bbox.centerLon;}
-  else{
-    const cam=S.viewer.camera.positionCartographic;
-    lat=Cesium.Math.toDegrees(cam.latitude);lon=Cesium.Math.toDegrees(cam.longitude);
-  }
-  addLog('FETCHING CCTV...');
-  try{
-    const r=await fetch(`/api/cctv?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}&radius=${CONFIG.cctvRadius}`);
-    if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    renderCctv(await r.json());
-  } catch(e){addLog(`CCTV: ${e.message.substring(0,25)}`);}
+// ─── WILDFIRES ────────────────────────────────────────────────────────────────
+async function fetchFires() {
+  if (!S.layers.wildfires) return;
+  const bbox = getViewportBbox();
+  let url = '/api/wildfires';
+  if (bbox) url += `?minLat=${bbox.minLat.toFixed(2)}&maxLat=${bbox.maxLat.toFixed(2)}&minLon=${bbox.minLon.toFixed(2)}&maxLon=${bbox.maxLon.toFixed(2)}`;
+  try {
+    const r = await fetch(url);
+    const fires = await r.json();
+    renderFires(fires);
+    document.getElementById('cnt-fire').textContent = fires.length;
+  } catch(e) { log(`Fires: ${e.message}`, 'warn'); }
 }
 
-function renderCctv(cameras){
-  if(!S.viewer) return;
-  if(S.layers.cctv.ds) S.viewer.dataSources.remove(S.layers.cctv.ds,true);
-  const ds=new Cesium.CustomDataSource('cctv');
-  for(const c of cameras){
+function renderFires(fires) {
+  if (S.fireDs) S.viewer.dataSources.remove(S.fireDs, true);
+  if (!S.layers.wildfires) return;
+  const ds = new Cesium.CustomDataSource('fires');
+  for (const f of fires) {
+    const intensity = Math.min(1, (f.frp || 0) / 500);
     ds.entities.add({
-      id:`cctv_${c.id}`,name:`CCTV ${c.type||'Camera'}`,
-      position:Cesium.Cartesian3.fromDegrees(c.lon,c.lat,5),
-      billboard:{image:cctvIcon(),width:14,height:14,
-        scaleByDistance:new Cesium.NearFarScalar(100,2,5e4,0.8),
-        translucencyByDistance:new Cesium.NearFarScalar(1e4,1,5e4,0),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND},
-      label:{text:`📷 ${(c.operator||c.type||'CCTV').substring(0,12)}`,font:'8px Share Tech Mono',
-        fillColor:Cesium.Color.fromCssColorString('#ff6600'),
-        outlineColor:Cesium.Color.BLACK,outlineWidth:2,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset:new Cesium.Cartesian2(10,0),horizontalOrigin:Cesium.HorizontalOrigin.LEFT,
-        translucencyByDistance:new Cesium.NearFarScalar(500,1,5000,0),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-        showBackground:true,backgroundColor:Cesium.Color.BLACK.withAlpha(0.55),
-        backgroundPadding:new Cesium.Cartesian2(3,2)},
-      properties:{type:'cctv',data:c},
+      position: Cesium.Cartesian3.fromDegrees(f.lon, f.lat, 0),
+      point: {
+        pixelSize: Math.max(3, 4 + intensity * 6),
+        color: Cesium.Color.fromHsl(0.05 - intensity * 0.05, 1, 0.5, 0.8),
+        outlineColor: Cesium.Color.ORANGE.withAlpha(0.3), outlineWidth: 3,
+      },
+      properties: { type: 'fire', ...f },
     });
   }
-  S.viewer.dataSources.add(ds); S.layers.cctv.ds=ds;
-  document.getElementById('cctv-count').textContent=cameras.length;
-  addLog(`${cameras.length} CCTV NODES`);
+  S.viewer.dataSources.add(ds);
+  S.fireDs = ds;
 }
 
-// ── MESHTASTIC ────────────────────────────────────────────────────────────────
-async function loadMeshtastic(){
-  addLog('FETCHING MESHTASTIC NODES...');
-  try{
-    const r=await fetch('/api/meshtastic/nodes'); if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data=await r.json();
-    S.meshtastic.nodes=data.nodes||[];
-    renderMeshtastic(S.meshtastic.nodes);
-    // Also load recent messages
-    const mr=await fetch('/api/meshtastic/messages');
-    if(mr.ok){ const md=await mr.json(); S.meshtastic.messages=md.messages||[]; }
-    updateMeshPanel();
-  } catch(e){ addLog(`MESHTASTIC: ${e.message.substring(0,28)}`); showToast(`Meshtastic: ${e.message.substring(0,40)}`, 'warn'); }
+// ─── GPS JAMMING ──────────────────────────────────────────────────────────────
+async function fetchJamming() {
+  if (!S.layers.jamming) return;
+  try {
+    const r = await fetch('/api/jamming');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    renderJamming(data.hexes || [], data.date);
+    log(`GPS Jam: ${data.count} affected cells on ${data.date}`);
+  } catch(e) { log(`Jamming: ${e.message}`, 'warn'); }
 }
 
-function renderMeshtastic(nodes){
-  if(!S.viewer) return;
-  if(S.layers.meshtastic.ds) S.viewer.dataSources.remove(S.layers.meshtastic.ds,true);
-  const ds=new Cesium.CustomDataSource('meshtastic');
-  const now=Date.now()/1000;
-  for(const n of nodes){
-    if(!n.lat||!n.lon) continue;
-    const online=n.last_heard&&(now-n.last_heard)<3600;
+function renderJamming(hexes, date) {
+  if (S.jammingDs) S.viewer.dataSources.remove(S.jammingDs, true);
+  if (!S.layers.jamming) return;
+  // H3 hexagon approximate rendering as points
+  const ds = new Cesium.CustomDataSource('jamming');
+  for (const h of hexes) {
+    // Simple visual: place a point (real H3 decoding would require h3-js)
+    const alpha = Math.min(0.9, h.p / 100);
+    const color = h.p > 50 ? '#ff0000' : h.p > 25 ? '#ff6600' : '#ffaa00';
+    // We'd need H3 JS to get lat/lon from hex ID — skip if h3 unavailable
+    // Placeholder: can't render without h3-js properly
+  }
+  S.viewer.dataSources.add(ds);
+  S.jammingDs = ds;
+}
+
+// ─── MESHTASTIC ───────────────────────────────────────────────────────────────
+async function fetchMesh() {
+  if (!S.layers.mesh) return;
+  try {
+    const r = await fetch('/api/meshtastic/nodes');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    renderMesh(data.nodes || []);
+    document.getElementById('cnt-mesh').textContent = (data.nodes||[]).length;
+  } catch(e) { log(`Mesh: ${e.message}`, 'warn'); }
+}
+
+function renderMesh(nodes) {
+  if (S.meshDs) S.viewer.dataSources.remove(S.meshDs, true);
+  if (!S.layers.mesh) return;
+  const ds = new Cesium.CustomDataSource('mesh');
+  for (const n of nodes) {
     ds.entities.add({
-      id:`mesh_${n.id}`,name:n.long_name||n.name||n.id,
-      position:Cesium.Cartesian3.fromDegrees(n.lon,n.lat,n.altitude||10),
-      billboard:{image:meshIcon(online),width:18,height:18,
-        scaleByDistance:new Cesium.NearFarScalar(1e3,1.5,5e6,0.7),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-        disableDepthTestDistance:Number.POSITIVE_INFINITY},
-      label:{text:`${n.name||n.id}${n.battery!=null?`\n🔋${n.battery}%`:''}`,font:'8px Share Tech Mono',
-        fillColor:Cesium.Color.fromCssColorString(online?'#00ff88':'#888888'),
-        outlineColor:Cesium.Color.BLACK,outlineWidth:2,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset:new Cesium.Cartesian2(12,0),horizontalOrigin:Cesium.HorizontalOrigin.LEFT,
-        translucencyByDistance:new Cesium.NearFarScalar(5e4,1,5e5,0),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-        showBackground:true,backgroundColor:Cesium.Color.BLACK.withAlpha(0.6),
-        backgroundPadding:new Cesium.Cartesian2(3,2)},
-      properties:{type:'meshtastic',data:n,online},
+      id: `mesh_${n.id}`,
+      name: n.name || n.id,
+      position: Cesium.Cartesian3.fromDegrees(n.lon, n.lat, 0),
+      point: {
+        pixelSize: 6,
+        color: Cesium.Color.fromCssColorString('#a855f7').withAlpha(0.9),
+        outlineColor: Cesium.Color.fromCssColorString('#a855f7').withAlpha(0.3), outlineWidth: 4,
+      },
+      properties: { type: 'mesh', ...n },
     });
   }
-  S.viewer.dataSources.add(ds); S.layers.meshtastic.ds=ds;
-  const online=nodes.filter(n=>{const now=Date.now()/1000;return n.last_heard&&(now-n.last_heard)<3600;});
-  document.getElementById('mesh-count').textContent=nodes.length;
-  document.getElementById('mesh-online-count').textContent=`${online.length} / ${nodes.length}`;
-  addLog(`${nodes.length} MESHTASTIC NODES`);
+  S.viewer.dataSources.add(ds);
+  S.meshDs = ds;
 }
 
-function updateMeshPanel(){
-  const msgs=S.meshtastic.messages.slice(0,15);
-  const el=document.getElementById('mesh-messages');
-  if(!el) return;
-  if(!msgs.length){el.innerHTML='<div class="muted-text" style="padding:4px 0">No recent messages</div>';return;}
-  el.innerHTML=msgs.map(m=>`
-    <div class="mesh-msg">
-      <div class="mesh-msg-node">📡 ${m.from_name||m.from}</div>
-      <div class="mesh-msg-text">${escHtml(m.text||'')}</div>
-      <div class="mesh-msg-time">${m.ts?new Date(m.ts*1000).toLocaleTimeString('en-GB',{hour12:false}):''}</div>
-    </div>`).join('');
+// ─── INTEL FEED (GDELT) ───────────────────────────────────────────────────────
+let intelLoading = false;
+
+async function fetchIntel(query, timespan) {
+  if (intelLoading) return;
+  intelLoading = true;
+
+  const q   = query   || S.intelQuery || '';
+  const ts  = timespan || document.getElementById('intel-span').value || '24h';
+
+  const list = document.getElementById('intel-items');
+  list.innerHTML = `<div class="intel-loading"><div class="loading-spinner"></div><span>QUERYING GDELT GLOBAL MEDIA…</span></div>`;
+
+  try {
+    const params = new URLSearchParams({ timespan: ts, limit: 75 });
+    if (q) params.set('q', q);
+    const r = await fetch(`/api/intel/feed?${params}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    S.intelArticles = data.articles || [];
+    S.intelQuery    = q;
+
+    renderIntel(S.intelArticles);
+    document.getElementById('intel-count').textContent = `${S.intelArticles.length} ARTICLES`;
+    document.getElementById('intel-last-update').textContent = new Date().toISOString().substring(11,16) + 'Z';
+
+    // Also fetch geographic events for map pins
+    if (S.layers.intel) fetchIntelEvents(q, ts);
+
+    log(`Intel: ${data.count} articles (${data.query})`);
+  } catch(e) {
+    list.innerHTML = `<div class="intel-empty">⚠ ${e.message}<br><small>GDELT may be temporarily unavailable</small></div>`;
+    log(`Intel feed: ${e.message}`, 'error');
+  } finally { intelLoading = false; }
 }
 
-function showMeshNodeDetail(node){
-  document.getElementById('mesh-modal-name').textContent=node.long_name||node.name||node.id;
-  const now=Date.now()/1000;
-  const online=node.last_heard&&(now-node.last_heard)<3600;
-  document.getElementById('mesh-modal-info').innerHTML=`
-    ${dpRow('Node ID',node.id)}
-    ${dpRow('Short Name',node.name||'—')}
-    ${dpRow('Status',online?'<span style="color:#00ff88">ONLINE</span>':'<span style="color:#888">OFFLINE</span>')}
-    ${dpRow('Last Heard',node.last_heard?new Date(node.last_heard*1000).toLocaleString('en-GB'):'—')}
-    ${node.battery!=null?dpRow('Battery',`${node.battery}%`):''}
-    ${node.hw_model?dpRow('Hardware',node.hw_model):''}
-    ${dpRow('Position',`${node.lat?.toFixed(4)}°, ${node.lon?.toFixed(4)}°`)}
-    ${node.altitude?dpRow('Altitude',`${node.altitude}m`):''}
-    ${node.snr?dpRow('SNR',`${node.snr} dB`):''}
-  `;
-  // Fetch node messages
-  fetch(`/api/meshtastic/messages?node=${encodeURIComponent(node.id)}`)
-    .then(r=>r.json()).then(data=>{
-      const msgs=data.messages||[];
-      const el=document.getElementById('mesh-modal-messages');
-      if(!msgs.length){el.innerHTML='<div class="muted-text">No messages for this node</div>';return;}
-      el.innerHTML=msgs.map(m=>`
-        <div class="mesh-msg">
-          <div class="mesh-msg-node">→ ${m.to==='broadcast'?'Broadcast':m.to}</div>
-          <div class="mesh-msg-text">${escHtml(m.text||'')}</div>
-          <div class="mesh-msg-time">${m.ts?new Date(m.ts*1000).toLocaleString('en-GB'):'—'}</div>
-        </div>`).join('');
-    }).catch(()=>{});
-  document.getElementById('mesh-modal').classList.remove('hidden');
-}
+function renderIntel(articles) {
+  const filter = S.intelFilter;
+  const list   = document.getElementById('intel-items');
 
-function escHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  const visible = filter
+    ? articles.filter(a => a.title?.toLowerCase().includes(filter.toLowerCase()) ||
+                           a.source?.toLowerCase().includes(filter.toLowerCase()))
+    : articles;
 
-// ── ROAD TRAFFIC ──────────────────────────────────────────────────────────────
-const ROAD_STYLE={motorway:{color:'#ff6666',width:4.5},trunk:{color:'#ff9933',width:4},primary:{color:'#ffcc00',width:3.5},secondary:{color:'#99cc33',width:3},tertiary:{color:'#aaa',width:2},residential:{color:'#888',width:1.5},unclassified:{color:'#777',width:1.2}};
-
-async function loadTraffic(){
-  clearTraffic();
-  const cam=S.viewer.camera.positionCartographic;
-  const lat=Cesium.Math.toDegrees(cam.latitude),lon=Cesium.Math.toDegrees(cam.longitude);
-  addLog('LOADING ROAD NETWORK...');
-  try{
-    const r=await fetch(`/api/osm/roads?lat=${lat}&lon=${lon}&radius=4000`);
-    if(!r.ok) throw new Error();
-    renderTrafficPolylines((await r.json()).elements||[],lat,lon);
-  } catch{renderTrafficPolylines([],lat,lon);}
-}
-
-function renderTrafficPolylines(elements,clat,clon){
-  if(!S.viewer) return;
-  if(S.layers.traffic.polylines) S.viewer.scene.primitives.remove(S.layers.traffic.polylines);
-  const coll=new Cesium.PolylineCollection(); let cnt=0;
-  for(const el of elements){
-    if(el.type!=='way'||!el.geometry||el.geometry.length<2) continue;
-    const s=ROAD_STYLE[el.tags?.highway]||ROAD_STYLE.residential;
-    coll.add({positions:el.geometry.map(n=>Cesium.Cartesian3.fromDegrees(n.lon,n.lat,2)),width:s.width,material:Cesium.Material.fromType('Color',{color:Cesium.Color.fromCssColorString(s.color).withAlpha(0.85)}),followSurface:true});
-    cnt++;
-  }
-  if(!cnt){
-    for(let i=-5;i<=5;i++){
-      const s=i%3===0?ROAD_STYLE.primary:ROAD_STYLE.residential,c=Cesium.Color.fromCssColorString(s.color).withAlpha(0.7);
-      coll.add({positions:[Cesium.Cartesian3.fromDegrees(clon-0.03,clat+i*0.003,2),Cesium.Cartesian3.fromDegrees(clon+0.03,clat+i*0.003,2)],width:s.width,material:Cesium.Material.fromType('Color',{color:c}),followSurface:true});
-      coll.add({positions:[Cesium.Cartesian3.fromDegrees(clon+i*0.003,clat-0.03,2),Cesium.Cartesian3.fromDegrees(clon+i*0.003,clat+0.03,2)],width:s.width,material:Cesium.Material.fromType('Color',{color:c}),followSurface:true});
-    } cnt=22;
-  }
-  S.viewer.scene.primitives.add(coll);
-  S.layers.traffic.polylines=coll;
-  document.getElementById('traffic-count').textContent=cnt;
-  addLog(`${cnt} ROAD SEGMENTS`);
-}
-
-function clearTraffic(){
-  if(S.layers.traffic.polylines) S.viewer?.scene.primitives.remove(S.layers.traffic.polylines);
-  if(S.layers.traffic.ds) S.viewer?.dataSources.remove(S.layers.traffic.ds,true);
-  S.layers.traffic.polylines=null; S.layers.traffic.ds=null;
-}
-
-// ── NASA GIBS ─────────────────────────────────────────────────────────────────
-const GIBS={
-  modis_true: {label:'MODIS Terra True Colour',url:'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.jpg',tileMatrixSetID:'GoogleMapsCompatible',format:'image/jpeg',maximumLevel:9},
-  viirs_true: {label:'VIIRS True Colour',url:'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.jpg',tileMatrixSetID:'GoogleMapsCompatible',format:'image/jpeg',maximumLevel:9},
-  nightlights:{label:'VIIRS Night Lights',url:'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_Black_Marble/default/2016-01-01/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.jpg',tileMatrixSetID:'GoogleMapsCompatible',format:'image/jpeg',maximumLevel:8},
-  sst:        {label:'Sea Surface Temp',url:'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/GHRSST_L4_MUR_Sea_Surface_Temperature/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.png',tileMatrixSetID:'GoogleMapsCompatible',format:'image/png',maximumLevel:7},
-  land_temp:  {label:'Land Surface Temp',url:'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_Land_Surface_Temp_Day/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.png',tileMatrixSetID:'GoogleMapsCompatible',format:'image/png',maximumLevel:7},
-  rain_radar: {label:'GPM Rain Rate',url:'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/GPM_3IMERGDE_06_precipitationCal/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.png',tileMatrixSetID:'GoogleMapsCompatible',format:'image/png',maximumLevel:6},
-};
-let gibsLayer=null;
-
-async function setGibsLayer(key){
-  if(!S.viewer) return;
-  if(gibsLayer){S.viewer.imageryLayers.remove(gibsLayer,true);gibsLayer=null;}
-  if(!key||key==='none'){addLog('SAT IMAGERY OFF');return;}
-  const def=GIBS[key]; if(!def) return;
-  const d=new Date(); d.setDate(d.getDate()-1);
-  const url=def.url.replace('{Time}',d.toISOString().slice(0,10));
-  try{
-    const p=await Cesium.WebMapTileServiceImageryProvider.fromUrl(url,{layer:key,style:'default',tileMatrixSetID:def.tileMatrixSetID,format:def.format,maximumLevel:def.maximumLevel,credit:new Cesium.Credit('NASA GIBS')});
-    gibsLayer=S.viewer.imageryLayers.addImageryProvider(p);
-    gibsLayer.alpha=0.82;
-    addLog(`SAT: ${def.label}`);
-  } catch(e){addLog(`GIBS ERR: ${e.message.substring(0,28)}`);}
-}
-
-// ── WEATHER ───────────────────────────────────────────────────────────────────
-async function refreshWeather(bbox,lod){
-  if(!S.viewer||!bbox) return;
-  if(S.layers.weather.ds) S.viewer.dataSources.remove(S.layers.weather.ds,true);
-  const ds=new Cesium.CustomDataSource('weather');
-  const pts=[];
-  if(lod==='GLOBAL'){
-    for(let lat=Math.max(-80,Math.round(bbox.minLat/5)*5);lat<=Math.min(80,bbox.maxLat);lat+=5)
-      for(let lon=Math.round(bbox.minLon/5)*5;lon<=bbox.maxLon;lon+=5) pts.push({lat,lon});
-  } else if(lod==='REGIONAL'){
-    for(let lat=Math.round(bbox.minLat/2)*2;lat<=bbox.maxLat;lat+=2)
-      for(let lon=Math.round(bbox.minLon/2)*2;lon<=bbox.maxLon;lon+=2) pts.push({lat,lon});
-  } else pts.push({lat:bbox.centerLat,lon:bbox.centerLon,detail:true});
-
-  let cnt=0;
-  await Promise.all(pts.slice(0,25).map(async({lat,lon,detail})=>{
-    const vars=detail?'temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code,visibility,uv_index,cloud_cover':'temperature_2m,weather_code,wind_speed_10m';
-    try{
-      const r=await fetch(`/api/weather?lat=${lat.toFixed(2)}&lon=${lon.toFixed(2)}&vars=${vars}`);
-      if(!r.ok) return;
-      const d=await r.json(); if(!d.current) return;
-      const cur=d.current,temp=cur.temperature_2m??'?';
-      const label=detail
-        ?`${weatherEmoji(cur.weather_code??0)} ${temp}°C  💨${cur.wind_speed_10m??'?'}km/h\n💧${cur.relative_humidity_2m??'?'}%  ☁${cur.cloud_cover??'?'}%\n👁${((cur.visibility??10000)/1000).toFixed(1)}km  UV:${cur.uv_index??'?'}`
-        :`${weatherEmoji(cur.weather_code??0)}${Math.round(temp)}°`;
-      ds.entities.add({
-        id:`wx_${lat.toFixed(1)}_${lon.toFixed(1)}`,
-        position:Cesium.Cartesian3.fromDegrees(lon,lat,500),
-        label:{text:label,font:detail?'10px Share Tech Mono':'9px Share Tech Mono',
-          fillColor:Cesium.Color.fromCssColorString(tempColor(temp)),
-          outlineColor:Cesium.Color.BLACK,outlineWidth:2,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
-          showBackground:true,backgroundColor:Cesium.Color.BLACK.withAlpha(0.65),
-          backgroundPadding:new Cesium.Cartesian2(4,3),
-          translucencyByDistance:new Cesium.NearFarScalar(1e5,1,8e6,0.3),
-          scaleByDistance:new Cesium.NearFarScalar(1e4,1.2,5e6,0.6),
-          horizontalOrigin:Cesium.HorizontalOrigin.CENTER,verticalOrigin:Cesium.VerticalOrigin.BOTTOM,
-          heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-          disableDepthTestDistance:Number.POSITIVE_INFINITY},
-        properties:{type:'weather',data:cur,lat,lon},
-      }); cnt++;
-    } catch{}
-  }));
-  S.viewer.dataSources.add(ds); S.layers.weather.ds=ds;
-  document.getElementById('weather-count').textContent=cnt;
-  addLog(`WEATHER: ${cnt} NODES`);
-}
-
-function weatherEmoji(c){if(c===0)return'☀️';if(c<=3)return'⛅';if(c<=48)return'🌫️';if(c<=67)return'🌧️';if(c<=77)return'❄️';if(c<=82)return'🌦️';return'⛈️';}
-function tempColor(c){if(c<-20)return'#88aaff';if(c<0)return'#aaccff';if(c<10)return'#88ffee';if(c<20)return'#aaffaa';if(c<30)return'#ffee44';if(c<40)return'#ff8800';return'#ff2222';}
-
-// ── WILDFIRES ─────────────────────────────────────────────────────────────────
-async function refreshWildfires(bbox){
-  if(!S.viewer||!bbox) return;
-  if(S.layers.wildfires.ds) S.viewer.dataSources.remove(S.layers.wildfires.ds,true);
-  try{
-    const r=await fetch(`/api/wildfires?minLat=${bbox.minLat.toFixed(2)}&maxLat=${bbox.maxLat.toFixed(2)}&minLon=${bbox.minLon.toFixed(2)}&maxLon=${bbox.maxLon.toFixed(2)}`);
-    if(!r.ok) throw new Error();
-    renderWildfires(await r.json());
-  } catch{ addLog('FIRMS: UNAVAILABLE'); showToast('Active fires: FIRMS feed unavailable', 'warn'); }
-}
-
-function renderWildfires(fires){
-  if(!S.viewer) return;
-  const ds=new Cesium.CustomDataSource('wildfires');
-  for(const f of fires){
-    const frp=f.frp||0,size=Math.min(12,4+frp/20);
-    const col=frp>500?'#ff0000':frp>100?'#ff5500':'#ff9900';
-    ds.entities.add({
-      id:`fire_${f.lat}_${f.lon}`,name:`Active Fire — ${f.acq_date||''}`,
-      position:Cesium.Cartesian3.fromDegrees(f.lon,f.lat,100),
-      point:{pixelSize:size,color:Cesium.Color.fromCssColorString(col).withAlpha(0.9),
-        outlineColor:Cesium.Color.YELLOW.withAlpha(0.5),outlineWidth:2,
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-        scaleByDistance:new Cesium.NearFarScalar(1e3,2,5e6,0.5)},
-      label:{text:`🔥 ${Math.round(frp)}MW\n${f.acq_date||''}`,font:'8px Share Tech Mono',
-        fillColor:Cesium.Color.fromCssColorString(col),
-        outlineColor:Cesium.Color.BLACK,outlineWidth:2,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
-        translucencyByDistance:new Cesium.NearFarScalar(5e3,1,1e6,0),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-        showBackground:true,backgroundColor:Cesium.Color.BLACK.withAlpha(0.65),
-        backgroundPadding:new Cesium.Cartesian2(3,2),pixelOffset:new Cesium.Cartesian2(14,0)},
-      properties:{type:'fire',data:f},
-    });
-  }
-  S.viewer.dataSources.add(ds); S.layers.wildfires.ds=ds;
-  document.getElementById('fire-count').textContent=fires.length;
-  addLog(`FIRMS: ${fires.length} ACTIVE FIRES`);
-}
-
-// ── SHODAN ────────────────────────────────────────────────────────────────────
-async function loadShodanPresets(){
-  try{
-    const r=await fetch('/api/shodan/presets');const d=await r.json();
-    const sel=document.getElementById('shodan-preset-select');
-    if(sel) d.presets.forEach(p=>{const o=document.createElement('option');o.value=p.query;o.textContent=p.label;sel.appendChild(o);});
-    sel?.addEventListener('change',()=>{const qi=document.getElementById('shodan-query-input');if(qi&&sel.value)qi.value=sel.value;});
-  } catch{}
-}
-
-async function executeShodanSearch(){
-  const localKey=S.shodan.key||localStorage.getItem('shodan_key')||'';
-  const serverHasKey = serverStatus.shodan;
-  const query=document.getElementById('shodan-query-input')?.value?.trim();
-  if(!query){addLog('SHODAN: NO QUERY');return;}
-  if(!localKey && !serverHasKey){
-    addLog('SHODAN: NO API KEY');
-    document.getElementById('shodan-key-prompt').style.display='block';
+  if (!visible.length) {
+    list.innerHTML = `<div class="intel-empty">No articles found<br><small>Try a different search or timespan</small></div>`;
     return;
   }
-  const btn=document.getElementById('shodan-search-btn');
-  if(btn){btn.disabled=true;btn.textContent='Scanning...';}
-  addLog(`SHODAN: ${query.substring(0,28)}`);
-  const headers={'Content-Type':'application/json'};
-  if(localKey) headers['x-shodan-key']=localKey;  // only send if user provided one locally
-  try{
-    const r=await fetch('/api/shodan/search',{method:'POST',headers,body:JSON.stringify({query})});
-    const data=await r.json(); if(!r.ok) throw new Error(data.error||`HTTP ${r.status}`);
-    renderShodanLayer(data.results);
-    document.getElementById('shodan-result-count').textContent=`${data.results.length} / ${data.total?.toLocaleString()||'?'} results`;
-    addLog(`SHODAN: ${data.results.length} DEVICES`);
-    refreshShodanCredits();
-  } catch(e){addLog(`SHODAN: ${e.message.substring(0,35)}`);}
-  finally{if(btn){btn.disabled=false;btn.textContent='▶ Execute Scan';}}
+
+  list.innerHTML = '';
+  for (const art of visible) {
+    const corrClass = art.corroboration >= 3 ? 'corroborated-high' : art.corroboration >= 2 ? 'corroborated-med' : '';
+    const toneClass = (art.tone != null && art.tone < -5) ? 'tone-negative' : '';
+
+    const dateStr = art.date ? art.date.substring(0,8).replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3') : '';
+    const lang = art.language && art.language !== 'English' ? `<span class="intel-lang">${art.language}</span>` : '';
+    const country = art.country ? `<span class="intel-country">${art.country}</span>` : '';
+
+    // Tone bar: map tone (-100 to +100) to a colour bar
+    const toneVal = art.tone ?? 0;
+    const toneWidth = Math.abs(toneVal);
+    const toneColor = toneVal < 0 ? '#ef4444' : '#22c55e';
+
+    const div = document.createElement('div');
+    div.className = `intel-item ${corrClass} ${toneClass}`.trim();
+    div.innerHTML = `
+      ${art.corroboration > 1 ? `<span class="intel-corr">×${art.corroboration}</span>` : ''}
+      <div class="intel-title">${escHtml(art.title)}</div>
+      <div class="intel-meta">
+        <span class="intel-source">${escHtml(art.source || '')}</span>
+        ${lang}${country}
+        <span class="intel-date">${dateStr}</span>
+      </div>
+      <div class="intel-tone-bar"><div class="intel-tone-fill" style="width:${toneWidth}%;background:${toneColor}"></div></div>`;
+    div.addEventListener('click', () => window.open(art.url, '_blank'));
+    list.appendChild(div);
+  }
 }
 
-function renderShodanLayer(devices){
-  if(!S.viewer) return;
-  if(S.layers.shodan.ds) S.viewer.dataSources.remove(S.layers.shodan.ds,true);
-  const ds=new Cesium.CustomDataSource('shodan');
-  for(const d of devices){
-    if(!d.lat||!d.lon) continue;
-    const hv=d.vulns?.length>0;
-    const color=Cesium.Color.fromCssColorString(hv?'#ff2222':'#ff00ff').withAlpha(0.9);
+async function fetchIntelEvents(query, timespan) {
+  try {
+    const q = query || 'conflict attack protest';
+    const r = await fetch(`/api/intel/events?q=${encodeURIComponent(q)}&timespan=${timespan||'24h'}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    renderIntelEvents(data.features || []);
+  } catch {}
+}
+
+function renderIntelEvents(features) {
+  if (S.intelDs) S.viewer.dataSources.remove(S.intelDs, true);
+  const ds = new Cesium.CustomDataSource('intel_events');
+
+  for (const f of features) {
+    const intensity = Math.min(1, (f.count || 1) / 20);
+    const size = Math.max(4, Math.min(14, 4 + intensity * 10));
+    const alpha = 0.5 + intensity * 0.4;
+
     ds.entities.add({
-      id:`shodan_${d.ip}`,name:d.ip,
-      position:Cesium.Cartesian3.fromDegrees(d.lon,d.lat,100),
-      point:{pixelSize:hv?7:5,color,outlineColor:color.withAlpha(0.3),outlineWidth:hv?4:2,
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND,
-        scaleByDistance:new Cesium.NearFarScalar(1e3,2,5e5,1)},
-      label:S.detMode==='full'?{text:`${d.ip}\n${d.product||d.port}`,font:'8px Share Tech Mono',
-        fillColor:color,outlineColor:Cesium.Color.BLACK,outlineWidth:2,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset:new Cesium.Cartesian2(8,0),
-        translucencyByDistance:new Cesium.NearFarScalar(1e4,1,5e5,0),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND}:undefined,
-      properties:{type:'shodan',data:d},
+      position: Cesium.Cartesian3.fromDegrees(f.lon, f.lat, 0),
+      point: {
+        pixelSize: size,
+        color: Cesium.Color.fromCssColorString('#06b6d4').withAlpha(alpha),
+        outlineColor: Cesium.Color.fromCssColorString('#06b6d4').withAlpha(0.2),
+        outlineWidth: 6,
+      },
+      properties: { type: 'intel_event', ...f },
     });
   }
-  S.viewer.dataSources.add(ds); S.layers.shodan.ds=ds; S.layers.shodan.on=true;
-  document.getElementById('shodan-count').textContent=devices.length;
+
+  S.viewer.dataSources.add(ds);
+  S.intelDs = ds;
 }
 
-function clearShodanLayer(){
-  if(S.layers.shodan.ds) S.viewer?.dataSources.remove(S.layers.shodan.ds,true);
-  S.layers.shodan.ds=null;S.layers.shodan.on=false;
-  document.getElementById('shodan-count').textContent='0';
+function escHtml(str) {
+  return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-async function refreshShodanCredits(){
-  const key=S.shodan.key||localStorage.getItem('shodan_key')||'';
-  try{
-    const headers=key?{'x-shodan-key':key}:{};
-    const r=await fetch('/api/shodan/credits',{headers});
-    const d=await r.json(); updateCreditDisplay(d);
-  } catch{}
-}
+// Intel search interaction
+document.getElementById('intel-go').addEventListener('click', () => {
+  fetchIntel(document.getElementById('intel-q').value, document.getElementById('intel-span').value);
+});
+document.getElementById('intel-q').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('intel-go').click();
+});
+document.getElementById('intel-refresh').addEventListener('click', () => fetchIntel());
+document.getElementById('intel-close').addEventListener('click', () => {
+  document.getElementById('intel-panel').style.display = 'none';
+  document.getElementById('cesiumContainer').style.right = '0';
+  document.querySelector('[data-layer="intel"]')?.classList.remove('on');
+  S.layers.intel = false;
+});
 
-function updateCreditDisplay(d){
-  const el=document.getElementById('shodan-credit-display'); if(!el) return;
-  if(!d.configured){el.innerHTML='<span class="muted-text">No key configured</span>';return;}
-  const q24=d.local?.last_24h?.q||0,c24=d.local?.last_24h?.c||0,acct=d.account;
-  el.innerHTML=`
-    <div class="credit-row"><span class="muted-text">Queries 24h</span><span class="cv">${q24}</span></div>
-    <div class="credit-row"><span class="muted-text">Credits 24h</span><span class="cv">${c24}</span></div>
-    ${acct?`<div class="credit-row"><span class="muted-text">Plan</span><span class="cv">${acct.plan||'?'}</span></div>
-    <div class="credit-row"><span class="muted-text">Query credits</span><span class="cv ${acct.query_credits<10?'cv-warn':''}">${acct.query_credits??'?'}</span></div>`
-    :'<div class="muted-text" style="font-size:8px">Offline — local stats only</div>'}`;
-}
+// Filter tag buttons
+document.querySelectorAll('.ftag').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.ftag').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const q = btn.dataset.q;
+    if (q) {
+      document.getElementById('intel-q').value = q;
+      fetchIntel(q, document.getElementById('intel-span').value);
+    } else {
+      document.getElementById('intel-q').value = '';
+      fetchIntel('', document.getElementById('intel-span').value);
+    }
+  });
+});
 
-// ── PLAYBACK ──────────────────────────────────────────────────────────────────
-async function initPlayback(){
-  try{
-    const r=await fetch('/api/playback/range');const d=await r.json();
-    if(!d.available||!d.earliest){addLog('PLAYBACK: NO DATA');document.getElementById('playback-status').textContent='NO DATA';return;}
-    S.playback.range={earliest:d.earliest,latest:d.latest};S.playback.currentTs=d.latest;
-    document.getElementById('playback-status').textContent='READY';
-    await buildTimeline(d.layers?.[0]||'flights');updatePlaybackDisplay();
-    addLog(`PLAYBACK: ${Math.round((d.latest-d.earliest)/3600000)}h`);
-  } catch(e){addLog(`PLAYBACK: ${e.message}`);}
-}
+// ─── AI QUERY ─────────────────────────────────────────────────────────────────
+document.getElementById('ai-send').addEventListener('click', sendAIQuery);
+document.getElementById('ai-in').addEventListener('keydown', e => { if (e.key === 'Enter') sendAIQuery(); });
+document.getElementById('ai-dismiss').addEventListener('click', () => {
+  document.getElementById('ai-response').classList.add('hidden');
+});
 
-async function buildTimeline(layer){
-  try{
-    const{earliest,latest}=S.playback.range;
-    const r=await fetch(`/api/playback/timeline?layer=${layer}&from=${earliest}&to=${latest}`);
-    renderTimeline((await r.json()).points||[]);
-  } catch{}
-}
+async function sendAIQuery() {
+  const query = document.getElementById('ai-in').value.trim();
+  if (!query) return;
 
-function renderTimeline(points){
-  const canvas=document.getElementById('timeline-canvas');if(!canvas||!points.length)return;
-  const ctx=canvas.getContext('2d'),W=canvas.width,H=canvas.height;
-  ctx.clearRect(0,0,W,H);
-  const{earliest,latest}=S.playback.range,span=latest-earliest||1;
-  const maxCnt=Math.max(...points.map(p=>p[1]),1);
-  ctx.fillStyle='rgba(0,20,10,0.7)';ctx.fillRect(0,0,W,H);
-  ctx.strokeStyle='rgba(0,255,136,0.1)';ctx.lineWidth=1;
-  for(let i=0;i<=4;i++){const y=H-(i/4)*H;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
-  ctx.beginPath();ctx.moveTo(0,H);
-  for(const[ts,cnt]of points){const x=((ts-earliest)/span)*W,y=H-(cnt/maxCnt)*(H-4);ctx.lineTo(x,y);}
-  ctx.lineTo(W,H);ctx.closePath();ctx.fillStyle='rgba(0,255,136,0.12)';ctx.fill();
-  ctx.beginPath();
-  for(let i=0;i<points.length;i++){const[ts,cnt]=points[i];const x=((ts-earliest)/span)*W,y=H-(cnt/maxCnt)*(H-4);i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}
-  ctx.strokeStyle='rgba(0,255,136,0.7)';ctx.lineWidth=1.5;ctx.stroke();
-  drawTimelineCursor();
-}
+  const { lat, lon, altKm } = getCameraInfo();
+  const respDiv = document.getElementById('ai-response');
+  const textDiv = document.getElementById('ai-text');
 
-function drawTimelineCursor(){
-  const canvas=document.getElementById('timeline-canvas');if(!canvas||!S.playback.currentTs)return;
-  const ctx=canvas.getContext('2d'),{earliest,latest}=S.playback.range;
-  const x=((S.playback.currentTs-earliest)/(latest-earliest||1))*canvas.width;
-  ctx.strokeStyle='#ff3344';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);ctx.stroke();
-}
+  respDiv.classList.remove('hidden');
+  textDiv.textContent = 'Querying ARGUS intelligence…';
 
-async function seekPlayback(ts){
-  S.playback.currentTs=ts;updatePlaybackDisplay();
-  const layers=['flights','military','quakes'].filter(k=>S.layers[k]?.on);
-  for(const layer of layers){
-    try{
-      const r=await fetch(`/api/playback/frame?layer=${layer}&ts=${ts}`);const d=await r.json();
-      if(layer==='flights'||layer==='military') renderFlights(d.data?.states||[],layer==='military');
-      else if(layer==='quakes') renderQuakes(d.data?.features||[]);
-    } catch{}
+  const context = {
+    view: { lat: lat.toFixed(2), lon: lon.toFixed(2), altKm: altKm.toFixed(0) },
+    layers: S.layers,
+    counts: {
+      satellites: S.tleData.length,
+      flights: document.getElementById('cnt-air').textContent,
+      ships: document.getElementById('cnt-ais').textContent,
+    },
+    intelArticles: S.intelArticles.slice(0, 5).map(a => ({ title: a.title, source: a.source, country: a.country })),
+  };
+
+  try {
+    const r = await fetch('/api/ai/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, context }),
+    });
+    const data = await r.json();
+    textDiv.textContent = data.response || data.error || 'No response';
+  } catch(e) {
+    textDiv.textContent = 'AI query failed: ' + e.message;
   }
-  drawTimelineCursor();
 }
 
-function updatePlaybackDisplay(){
-  const ts=S.playback.currentTs;if(!ts)return;
-  document.getElementById('playback-time').textContent=new Date(ts).toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
-}
+// ─── ENTITY CLICK / INFO PANEL ────────────────────────────────────────────────
+const handler = new Cesium.ScreenSpaceEventHandler(S.viewer.canvas);
+handler.setInputAction(click => {
+  const picked = S.viewer.scene.pick(click.position);
+  if (!Cesium.defined(picked) || !picked.id) {
+    document.getElementById('info-box').classList.add('hidden');
+    return;
+  }
+  const entity = picked.id;
+  showInfoPanel(entity);
+}, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 
-function togglePlayback(){
-  if(S.playback.playing){
-    clearInterval(S.playback.playInterval);S.playback.playing=false;
-    document.getElementById('pb-play-btn').textContent='▶ Play';addLog('PLAYBACK PAUSED');
+// Double-click to track
+handler.setInputAction(click => {
+  const picked = S.viewer.scene.pick(click.position);
+  if (Cesium.defined(picked) && picked.id) {
+    S.viewer.trackedEntity = picked.id;
+    toast(`Tracking: ${picked.id.name}`, 'info', 3000);
   } else {
-    S.playback.playing=true;document.getElementById('pb-play-btn').textContent='⏸ Pause';addLog('PLAYBACK RUNNING');
-    const step=30000*(S.playback.speed||1);
-    S.playback.playInterval=setInterval(async()=>{
-      const next=(S.playback.currentTs||S.playback.range.earliest)+step;
-      if(next>S.playback.range.latest){togglePlayback();return;}
-      await seekPlayback(next);
-      const s=document.getElementById('pb-scrubber');
-      if(s)s.value=((next-S.playback.range.earliest)/(S.playback.range.latest-S.playback.range.earliest))*100;
-    },500);
+    S.viewer.trackedEntity = undefined;
   }
-}
+}, Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
 
-async function refreshStorageStats(){
-  try{
-    const r=await fetch('/api/storage/stats');const d=await r.json();
-    const el=document.getElementById('storage-stats');if(!el)return;
-    if(!d.available){el.textContent='DB OFFLINE';return;}
-    const mb=(d.db_bytes/1024/1024).toFixed(1);
-    const lines=d.layers.map(l=>`${l.layer.toUpperCase().padEnd(8)} ${l.frames}fr ${((l.latest-l.earliest)/3600000).toFixed(1)}h`);
-    el.innerHTML=`<div class="stat-row"><span class="muted-text">DB size</span><span class="val-green">${mb} MB</span></div>${lines.map(l=>`<div style="font-size:9px;color:var(--text-muted);font-family:var(--font-mono)">${l}</div>`).join('')}`;
-  } catch{}
-}
+function showInfoPanel(entity) {
+  const props = entity.properties;
+  if (!props) return;
+  const type  = props.type?.getValue?.() || props.type || 'unknown';
+  const name  = entity.name || entity.id;
+  const box   = document.getElementById('info-box');
+  const icon  = document.getElementById('info-icon');
+  const nameEl= document.getElementById('info-name');
+  const body  = document.getElementById('info-body');
 
-// ── CLICK HANDLER ─────────────────────────────────────────────────────────────
-function onGlobeClick(movement){
-  const picked=S.viewer.scene.pick(movement.position);
-  if(!picked?.id){hideDetail();return;}
-  const ent=picked.id; if(!ent.properties) return;
-  S._lastEnt=ent;
-  const type=ent.properties.type?.getValue();
-  const data=ent.properties.data?.getValue();
-  if(type==='meshtastic'){showMeshNodeDetail(data);return;}
-  showDetail(type,ent.name,data,ent.properties.airline?.getValue(),ent.properties.online?.getValue());
-}
+  S.selectedEntity = entity;
 
-function showDetail(type,name,data,airline,online){
-  document.getElementById('dp-type-badge').textContent=(type||'UNK').toUpperCase().slice(0,8);
-  document.getElementById('dp-title').textContent=name||'Unknown';
-  let html='';
+  const icons  = { flight:'✈', military:'★', satellite:'◎', ship:'⚓', quake:'⚡', cctv:'📷', fire:'🔥', mesh:'📡', intel_event:'◈' };
+  icon.textContent  = icons[type] || '●';
+  nameEl.textContent = name.substring(0, 24).toUpperCase();
 
-  if(type==='satellite'){
-    const pos=data?.pos||{};
-    html=dpRow('Name',name)+dpRow('Lat',(pos.lat||0).toFixed(3)+'°')+dpRow('Lon',(pos.lng||0).toFixed(3)+'°')+dpRow('Altitude',Math.round(pos.alt||0)+' km');
-  } else if(type==='flight'||type==='military'){
-    const s=data||[];
-    const al=airline?`<div class="dp-airline" style="background:${airline.color}15;border-left-color:${airline.color}">${airline.name}</div>`:'';
-    html=al+dpRow('Callsign',(s[1]||'N/A').trim())+dpRow('ICAO24',s[0]||'N/A')+dpRow('Country',s[2]||'N/A')+dpRow('Altitude',Math.round(s[7]||0)+' m')+dpRow('Speed',Math.round(s[9]||0)+' m/s')+dpRow('Track',Math.round(s[10]||0)+'°')+dpRow('Position',`${(+s[6]||0).toFixed(3)}°, ${(+s[5]||0).toFixed(3)}°`);
-  } else if(type==='ship'){
-    const d=data||{},t=+(d.type||0);
-    const st=t>=80?'Tanker':t>=70?'Cargo':t>=60?'Passenger':t>=50?'High Speed':'Other';
-    html=dpRow('Name',d.name||'Unknown')+dpRow('MMSI',d.mmsi||'N/A')+dpRow('Type',st)+dpRow('Flag',d.flag||'N/A')+dpRow('Speed',`${(+(d.sog||0)).toFixed(1)} kt`)+dpRow('Course',`${Math.round(d.cog||0)}°`)+dpRow('Destination',(d.dest||'Unknown').substring(0,24));
-  } else if(type==='gpsjam'){
-    html=dpRow('Type','GPS Interference')+dpRow('Level',`${data?.level||'?'} / 3`)+dpRow('Area',data?.label||'Unknown')+dpRow('Source','gpsjam.org');
-  } else if(type==='cctv'){
-    const d=data||{};
-    html=dpRow('Type',d.type||'Fixed camera')+dpRow('Operator',d.operator||'Unknown')+dpRow('Mount',d.mount||'pole')+dpRow('ID',d.id||'N/A');
-  } else if(type==='quake'){
-    const d=data||{};
-    html=dpRow('Magnitude','M'+((d.mag||0).toFixed(1)))+dpRow('Location',d.place||'Unknown')+dpRow('Depth',(d.dmin||0)+' km')+dpRow('Time',d.time?new Date(d.time).toUTCString():'N/A');
-  } else if(type==='sensor'){
-    const d=data||{};
-    html=dpRow('Network',d.network)+dpRow('Code',d.code)+dpRow('Name',d.name||'—')+dpRow('Elevation',`${d.elev||0}m`)+dpRow('Position',`${d.lat?.toFixed(3)}°, ${d.lon?.toFixed(3)}°`);
-  } else if(type==='fire'){
-    const d=data||{};
-    html=dpRow('FRP',`${d.frp||0} MW`)+dpRow('Date',d.acq_date||'—')+dpRow('Confidence',d.confidence||'—')+dpRow('Brightness',d.brightness||'—');
-  } else if(type==='shodan'){
-    const d=data||{};
-    const vb=d.vulns?.length?`<div style="margin:4px 0">${d.vulns.map(v=>`<span class="vuln-badge">${v}</span>`).join('')}</div>`:'';
-    html=dpRow('IP',d.ip)+dpRow('Port',`${d.port}/${d.transport||'tcp'}`)+dpRow('Org',d.org||'N/A')+dpRow('Product',d.product||'N/A')+dpRow('Location',`${d.city||''} ${d.country||''}`)+vb+(d.link?`<a href="${d.link}" target="_blank" class="shodan-link">🔗 View on Shodan</a>`:'');
-  } else if(type==='weather'){
-    const d=data||{};
-    html=dpRow('Temperature',`${d.temperature_2m??'?'}°C`)+dpRow('Wind',`${d.wind_speed_10m??'?'} km/h`)+dpRow('Humidity',`${d.relative_humidity_2m??'?'}%`)+dpRow('Cloud Cover',`${d.cloud_cover??'?'}%`);
+  const rows = [];
+  const addRow = (k, v) => { if (v != null && v !== '' && v !== undefined) rows.push(`<div class="info-row"><span class="info-key">${k}</span><span class="info-val">${escHtml(String(v))}</span></div>`); };
+
+  if (type === 'flight' || type === 'military') {
+    addRow('ICAO',     props.icao?.getValue?.() || props.icao);
+    addRow('CALLSIGN', props.callsign?.getValue?.() || props.callsign);
+    addRow('ALT',      `${(props.altFt?.getValue?.() || props.altFt || 0).toLocaleString()} ft`);
+    addRow('SPEED',    `${props.spdKt?.getValue?.() || props.spdKt || 0} kt`);
+    addRow('TRACK',    `${Math.round(props.track?.getValue?.() || props.track || 0)}°`);
+    addRow('COUNTRY',  props.country?.getValue?.() || props.country);
+    addRow('STATUS',   props.onGround?.getValue?.() ? 'ON GROUND' : 'AIRBORNE');
+  } else if (type === 'ship') {
+    addRow('MMSI',   props.mmsi?.getValue?.() || props.mmsi);
+    addRow('SPEED',  `${props.speed?.getValue?.() || props.speed || 0} kt`);
+    addRow('COURSE', `${props.course?.getValue?.() || props.course || 0}°`);
+  } else if (type === 'satellite') {
+    addRow('ALT',    `${Math.round(props.alt?.getValue?.() || props.alt || 0)} km`);
+    addRow('LAT',    `${(props.lat?.getValue?.() || props.lat || 0).toFixed(2)}°`);
+    addRow('LON',    `${(props.lon?.getValue?.() || props.lon || 0).toFixed(2)}°`);
+  } else if (type === 'quake') {
+    addRow('MAG',   `M${props.mag?.getValue?.() || props.mag}`);
+    addRow('DEPTH', `${props.depth?.getValue?.() || props.depth || 0} km`);
+    addRow('PLACE', props.place?.getValue?.() || props.place);
+    const time = props.time?.getValue?.() || props.time;
+    if (time) addRow('TIME', new Date(time).toUTCString().substring(0, 25));
+  } else if (type === 'intel_event') {
+    addRow('LOCATION', props.name?.getValue?.() || props.name);
+    addRow('ARTICLES', props.count?.getValue?.() || props.count);
   }
 
-  document.getElementById('dp-content').innerHTML=html||'<div class="muted-text">No data</div>';
-  document.getElementById('detail-panel').classList.remove('hidden');
+  body.innerHTML = rows.join('') || '<div class="dim small" style="padding:4px">No details available</div>';
+  box.classList.remove('hidden');
 }
 
-function dpRow(k,v){ return `<div class="dp-row"><span class="dp-key">${k}</span><span class="dp-val">${v}</span></div>`; }
-function hideDetail(){ document.getElementById('detail-panel').classList.add('hidden'); }
-
-// ── TRACKING ──────────────────────────────────────────────────────────────────
-function lockTrack(ent){
-  S.tracking=ent; S.viewer.trackedEntity=ent;
-  document.getElementById('tracking-info').innerHTML=`<div class="track-item"><span>Target: </span>${ent.name}</div><div class="track-item"><span>Status: </span>LOCKED</div>`;
-  document.getElementById('clear-track-btn').style.display='block';
-  addLog(`LOCKED: ${ent.name}`);
-}
-function clearTrack(){
-  S.tracking=null;S.viewer.trackedEntity=undefined;
-  document.getElementById('tracking-info').innerHTML='<div class="no-track">No target locked</div>';
-  document.getElementById('clear-track-btn').style.display='none';
-  addLog('TARGET RELEASED');
-}
-
-// ── COORDS / LOD ──────────────────────────────────────────────────────────────
-function getViewBbox(){
-  if(!S.viewer) return null;
-  try{
-    const rect=S.viewer.camera.computeViewRectangle(); if(!rect) return null;
-    return{minLat:Cesium.Math.toDegrees(rect.south),maxLat:Cesium.Math.toDegrees(rect.north),minLon:Cesium.Math.toDegrees(rect.west),maxLon:Cesium.Math.toDegrees(rect.east),centerLat:Cesium.Math.toDegrees((rect.south+rect.north)/2),centerLon:Cesium.Math.toDegrees((rect.west+rect.east)/2)};
-  } catch{return null;}
-}
-function getCameraAltitude(){ return S.viewer?.camera.positionCartographic.height??1e9; }
-function getLODLevel(alt){ return alt>LOD.GLOBAL?'GLOBAL':alt>LOD.REGIONAL?'REGIONAL':alt>LOD.CITY?'CITY':'STREET'; }
-
-function updateCoords(){
-  if(!S.viewer) return;
-  const c=S.viewer.camera.positionCartographic,alt=c.height,km=alt/1000;
-  document.getElementById('lat-display').textContent=Cesium.Math.toDegrees(c.latitude).toFixed(3)+'°';
-  document.getElementById('lon-display').textContent=Cesium.Math.toDegrees(c.longitude).toFixed(3)+'°';
-  document.getElementById('alt-display').textContent=km>1000?(km/1000).toFixed(1)+'Mkm':Math.round(km)+'km';
-  const newLOD=getLODLevel(alt);
-  if(newLOD!==currentLOD){
-    currentLOD=newLOD;
-    const el=document.getElementById('lod-indicator');
-    if(el){el.textContent=`LOD: ${newLOD}`;el.className=`lod-badge lod-${newLOD.toLowerCase()}`;}
-    addLog(`LOD → ${newLOD}`);
+document.getElementById('info-close').addEventListener('click', () => {
+  document.getElementById('info-box').classList.add('hidden');
+});
+document.getElementById('info-track').addEventListener('click', () => {
+  if (S.selectedEntity) {
+    S.viewer.trackedEntity = S.selectedEntity;
+    toast(`Tracking: ${S.selectedEntity.name}`, 'info', 2000);
   }
-  lastViewBbox=getViewBbox();
-  clearTimeout(lodDebounceTimer);
-  lodDebounceTimer=setTimeout(onCameraSettled,CONFIG.lodDebounce);
-}
-
-function onCameraSettled(){
-  const bbox=lastViewBbox; if(!bbox) return;
-  const lod=getLODLevel(getCameraAltitude());
-  if(S.layers.flights.on)  refreshFlightsBbox(bbox,lod,false);
-  if(S.layers.military.on) refreshFlightsBbox(bbox,lod,true);
-  if(S.layers.ships.on&&lod!=='GLOBAL') refreshShipsBbox(bbox);
-  if(S.layers.weather.on)  refreshWeather(bbox,lod);
-  if(S.layers.wildfires.on&&lod!=='STREET') refreshWildfires(bbox);
-  if(S.layers.cctv.on&&(lod==='CITY'||lod==='STREET')){
-    clearTimeout(S._cctvTimer);S._cctvTimer=setTimeout(()=>loadCctv(bbox),500);
+});
+document.getElementById('info-shodan').addEventListener('click', () => {
+  if (!S.selectedEntity) return;
+  const props = S.selectedEntity.properties;
+  const country = props?.country?.getValue?.() || props?.country || '';
+  if (country) {
+    document.getElementById('shodan-preset').value = '';
+    document.getElementById('shodan-key').focus();
+    toast(`Set Shodan key then search for country:${country}`, 'info', 4000);
   }
-  if(S.layers.traffic.on&&(lod==='CITY'||lod==='STREET')) loadTraffic();
-}
+});
 
-function startClock(){
-  const tick=()=>{
-    const n=new Date();
-    document.getElementById('clock').textContent=n.toLocaleTimeString('en-GB',{hour12:false});
-    document.getElementById('utc-clock').textContent=n.toISOString().substring(11,19);
-  }; tick(); setInterval(tick,1000);
-}
+// ─── SHODAN ───────────────────────────────────────────────────────────────────
+document.getElementById('shodan-go').addEventListener('click', async () => {
+  const key   = document.getElementById('shodan-key').value.trim();
+  const query = document.getElementById('shodan-preset').value;
+  if (!query) { toast('Select a Shodan preset', 'warn'); return; }
+  if (!key)   { toast('Enter Shodan API key', 'warn'); return; }
 
-function addLog(msg){
-  S.logHistory.unshift(msg);if(S.logHistory.length>8)S.logHistory.pop();
-  const el=document.getElementById('event-log');
-  if(el) el.innerHTML=`<span class="log-label">EVT</span><span class="log-sep">//</span>${S.logHistory.slice(0,3).map(m=>`<span class="log-item">${m}</span>`).join('')}`;
-}
+  if (S.shodanDs) { S.viewer.dataSources.remove(S.shodanDs, true); S.shodanDs = null; }
+  toast('Searching Shodan…', 'info', 3000);
 
-// Toast notification — unobtrusive failure/warning indicator
-const _toastQ = [];
-let _toastActive = false;
-function showToast(msg, level='info') {
-  _toastQ.push({msg, level});
-  if (!_toastActive) processToastQ();
-}
-function processToastQ() {
-  if (!_toastQ.length) { _toastActive = false; return; }
-  _toastActive = true;
-  const {msg, level} = _toastQ.shift();
-  const colors = { info:'var(--green)', warn:'var(--amber)', error:'var(--red)' };
-  const el = document.createElement('div');
-  el.className = 'argus-toast';
-  el.style.cssText = `position:fixed;bottom:38px;left:50%;transform:translateX(-50%) translateY(8px);z-index:500;
-    background:rgba(4,14,10,0.95);border:1px solid ${colors[level]||colors.info};
-    color:${colors[level]||colors.info};font-family:var(--font-mono);font-size:10px;
-    letter-spacing:0.1em;padding:6px 16px;opacity:0;transition:all 0.25s ease;
-    pointer-events:none;white-space:nowrap;border-radius:2px;
-    box-shadow:0 0 12px rgba(0,0,0,0.6)`;
-  document.body.appendChild(el);
-  // Animate in
-  requestAnimationFrame(()=>{
-    el.style.opacity='0.92';
-    el.style.transform='translateX(-50%) translateY(0)';
-  });
-  setTimeout(()=>{
-    el.style.opacity='0';
-    el.style.transform='translateX(-50%) translateY(8px)';
-    setTimeout(()=>{ el.remove(); processToastQ(); }, 280);
-  }, 2800);
-}
-
-function flyTo(name){
-  const p=PRESETS[name];if(!p||!S.viewer)return;
-  S.viewer.camera.flyTo({destination:Cesium.Cartesian3.fromDegrees(p.lon,p.lat,p.alt),orientation:{heading:0,pitch:Cesium.Math.toRadians(p.pitch||-45),roll:0},duration:2});
-  addLog(`→ ${name.toUpperCase()}`);
-}
-
-// ── UI SETUP ──────────────────────────────────────────────────────────────────
-function setupUI(){
-  const tl=(id,key,onFn,offFn)=>{
-    document.getElementById(id)?.addEventListener('change',e=>{
-      S.layers[key].on=e.target.checked;
-      if(e.target.checked)onFn();else offFn?.();
+  try {
+    const r = await fetch(`/api/shodan/search?q=${encodeURIComponent(query)}`, {
+      headers: { 'x-shodan-key': key }
     });
-  };
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    const matches = data.matches || [];
 
-  tl('toggle-satellites','satellites',
-    ()=>{loadSatellites();},
-    ()=>{if(S.layers.satellites.ds)S.viewer?.dataSources.remove(S.layers.satellites.ds,true);clearInterval(S.intervals.sat);}
-  );
-  tl('toggle-flights','flights',
-    ()=>{loadFlights(false);S.intervals.flights=setInterval(()=>loadFlights(false),CONFIG.flightUpdateInterval);},
-    ()=>{if(S.layers.flights.ds)S.viewer?.dataSources.remove(S.layers.flights.ds,true);clearInterval(S.intervals.flights);document.getElementById('flight-count').textContent='0';}
-  );
-  tl('toggle-military','military',
-    ()=>{loadFlights(true);S.intervals.mil=setInterval(()=>loadFlights(true),CONFIG.militaryUpdateInterval);},
-    ()=>{if(S.layers.military.ds)S.viewer?.dataSources.remove(S.layers.military.ds,true);clearInterval(S.intervals.mil);document.getElementById('mil-count').textContent='0';}
-  );
-  tl('toggle-ships','ships',
-    ()=>{loadShips();S.intervals.ships=setInterval(loadShips,CONFIG.shipUpdateInterval);},
-    ()=>{if(S.layers.ships.ds)S.viewer?.dataSources.remove(S.layers.ships.ds,true);clearInterval(S.intervals.ships);document.getElementById('ship-count').textContent='0';}
-  );
-  tl('toggle-traffic','traffic',loadTraffic,clearTraffic);
-  tl('toggle-cctv','cctv',
-    ()=>loadCctv(lastViewBbox),
-    ()=>{if(S.layers.cctv.ds)S.viewer?.dataSources.remove(S.layers.cctv.ds,true);document.getElementById('cctv-count').textContent='0';}
-  );
-  tl('toggle-meshtastic','meshtastic',
-    ()=>{loadMeshtastic();S.intervals.mesh=setInterval(loadMeshtastic,CONFIG.meshtasticUpdateInterval);},
-    ()=>{if(S.layers.meshtastic.ds)S.viewer?.dataSources.remove(S.layers.meshtastic.ds,true);clearInterval(S.intervals.mesh);document.getElementById('mesh-count').textContent='0';}
-  );
-  tl('toggle-quakes','quakes',
-    ()=>{loadQuakes();S.intervals.quakes=setInterval(loadQuakes,CONFIG.quakeUpdateInterval);},
-    ()=>{if(S.layers.quakes.ds)S.viewer?.dataSources.remove(S.layers.quakes.ds,true);clearInterval(S.intervals.quakes);document.getElementById('quake-count').textContent='0';}
-  );
-  tl('toggle-sensors','sensors',
-    ()=>loadSeismicStations(),
-    ()=>{if(S.layers.sensors.ds)S.viewer?.dataSources.remove(S.layers.sensors.ds,true);document.getElementById('sensor-count').textContent='0';}
-  );
-  tl('toggle-wildfires','wildfires',
-    ()=>{refreshWildfires(lastViewBbox||getViewBbox());S.intervals.fires=setInterval(()=>refreshWildfires(lastViewBbox||getViewBbox()),CONFIG.fireUpdateInterval);},
-    ()=>{if(S.layers.wildfires.ds)S.viewer?.dataSources.remove(S.layers.wildfires.ds,true);clearInterval(S.intervals.fires);document.getElementById('fire-count').textContent='0';}
-  );
-  tl('toggle-gpsjam','gpsjam',
-    ()=>{loadGpsJam();S.intervals.gpsjam=setInterval(loadGpsJam,CONFIG.gpsjamUpdateInterval);},
-    ()=>{if(S.layers.gpsjam.ds)S.viewer?.dataSources.remove(S.layers.gpsjam.ds,true);clearInterval(S.intervals.gpsjam);document.getElementById('jam-count').textContent='0';}
-  );
-  tl('toggle-weather','weather',
-    ()=>{refreshWeather(lastViewBbox||getViewBbox(),currentLOD);S.intervals.weather=setInterval(()=>refreshWeather(lastViewBbox||getViewBbox(),currentLOD),CONFIG.weatherUpdateInterval);},
-    ()=>{if(S.layers.weather.ds)S.viewer?.dataSources.remove(S.layers.weather.ds,true);clearInterval(S.intervals.weather);document.getElementById('weather-count').textContent='0';}
-  );
-  document.getElementById('toggle-shodan')?.addEventListener('change',e=>{if(!e.target.checked)clearShodanLayer();});
+    const ds = new Cesium.CustomDataSource('shodan');
+    for (const m of matches) {
+      if (!m.location?.latitude || !m.location?.longitude) continue;
+      ds.entities.add({
+        id: `shodan_${m.ip_str}`,
+        name: m.ip_str,
+        position: Cesium.Cartesian3.fromDegrees(m.location.longitude, m.location.latitude, 0),
+        point: {
+          pixelSize: 7,
+          color: Cesium.Color.fromCssColorString('#ff3300').withAlpha(0.9),
+          outlineColor: Cesium.Color.fromCssColorString('#ff3300').withAlpha(0.3),
+          outlineWidth: 5,
+        },
+        properties: { type: 'shodan', ip: m.ip_str, port: m.port, org: m.org, country: m.location?.country_name },
+      });
+    }
+    S.viewer.dataSources.add(ds);
+    S.shodanDs = ds;
+    toast(`Shodan: ${matches.length} results`, 'ok', 4000);
+    log(`Shodan: ${matches.length} matches for "${query}"`);
+  } catch(e) { toast(`Shodan: ${e.message}`, 'error'); }
+});
 
-  // SAT imagery
-  const sti=document.getElementById('toggle-sat-imagery');
-  const sts=document.getElementById('sat-imagery-select');
-  sti?.addEventListener('change',()=>{
-    if(sti.checked){const k=sts?.value;if(k&&k!=='none')setGibsLayer(k);else{if(sts)sts.value='modis_true';setGibsLayer('modis_true');}}
-    else setGibsLayer(null);
-  });
-  sts?.addEventListener('change',e=>{
-    const k=e.target.value;
-    if(k==='none'){if(sti)sti.checked=false;setGibsLayer(null);}
-    else{if(sti)sti.checked=true;setGibsLayer(k);}
-  });
+// ─── STATUS CHECK ─────────────────────────────────────────────────────────────
+async function checkStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const data = await r.json();
+    const aisPill   = document.getElementById('pill-aisstream');
+    const shodanPill= document.getElementById('pill-shodan');
 
-  // Detection mode
-  document.querySelectorAll('.det-btn').forEach(btn=>btn.addEventListener('click',()=>{
-    document.querySelectorAll('.det-btn').forEach(b=>b.classList.remove('active'));
-    btn.classList.add('active');S.detMode=btn.dataset.mode;
-    if(S.layers.satellites.on)renderSatellites();
-    addLog(`DETAIL: ${btn.dataset.mode.toUpperCase()}`);
-  }));
-
-  // Vision mode
-  document.querySelectorAll('.vision-btn').forEach(btn=>btn.addEventListener('click',()=>{
-    document.querySelectorAll('.vision-btn').forEach(b=>b.classList.remove('active'));
-    btn.classList.add('active');
-    document.body.className=document.body.className.replace(/mode-\w+/g,'').trim();
-    const m=btn.dataset.mode;
-    if(m!=='normal') document.body.classList.add(`mode-${m}`);
-    document.getElementById('scanlines').style.opacity={crt:'0.85',nvg:'0.5',flir:'0.4'}[m]||'0.5';
-    addLog(`DISPLAY: ${m.toUpperCase()}`);
-  }));
-
-  // Presets
-  document.querySelectorAll('.preset-btn').forEach(btn=>btn.addEventListener('click',()=>flyTo(btn.dataset.preset)));
-
-  // Detail panel
-  document.getElementById('dp-close')?.addEventListener('click',hideDetail);
-  document.getElementById('dp-track-btn')?.addEventListener('click',()=>{if(S._lastEnt)lockTrack(S._lastEnt);hideDetail();});
-  document.getElementById('clear-track-btn')?.addEventListener('click',clearTrack);
-
-  // Flight filters
-  setupFlightFilters();
-
-  // Shodan
-  document.getElementById('shodan-search-btn')?.addEventListener('click',executeShodanSearch);
-  document.getElementById('shodan-query-input')?.addEventListener('keydown',e=>{if(e.key==='Enter')executeShodanSearch();});
-  document.getElementById('shodan-save-key-btn')?.addEventListener('click',()=>{
-    const k=document.getElementById('shodan-key-input')?.value?.trim();if(!k)return;
-    S.shodan.key=k;localStorage.setItem('shodan_key',k);
-    document.getElementById('shodan-key-prompt').style.display='none';
-    addLog('SHODAN KEY SAVED');refreshShodanCredits();
-  });
-  const saved=localStorage.getItem('shodan_key'); if(saved)S.shodan.key=saved;
-  document.getElementById('shodan-credit-refresh')?.addEventListener('click',refreshShodanCredits);
-
-  // Playback
-  document.getElementById('pb-init-btn')?.addEventListener('click',initPlayback);
-  document.getElementById('pb-play-btn')?.addEventListener('click',togglePlayback);
-  document.getElementById('pb-speed')?.addEventListener('change',e=>{S.playback.speed=parseFloat(e.target.value)||1;});
-  document.getElementById('pb-scrubber')?.addEventListener('input',e=>{
-    const pct=parseFloat(e.target.value)/100;
-    seekPlayback(Math.round(S.playback.range.earliest+pct*(S.playback.range.latest-S.playback.range.earliest)));
-  });
-  document.getElementById('timeline-canvas')?.addEventListener('click',e=>{
-    const pct=e.offsetX/e.target.width;
-    const ts=S.playback.range.earliest+pct*(S.playback.range.latest-S.playback.range.earliest);
-    if(ts){seekPlayback(Math.round(ts));const s=document.getElementById('pb-scrubber');if(s)s.value=pct*100;}
-  });
-  document.getElementById('storage-refresh-btn')?.addEventListener('click',refreshStorageStats);
-
-  // Keyboard
-  document.addEventListener('keydown',e=>{
-    if(e.target.tagName==='INPUT') return;
-    if(e.key==='Escape'){hideDetail();clearTrack();}
-    if(e.key==='f'||e.key==='F') document.getElementById('filter-panel')?.classList.toggle('hidden');
-  });
-
-  // Tabs
-  document.querySelectorAll('.tab-btn').forEach(btn=>btn.addEventListener('click',()=>{
-    const t=btn.dataset.tab;
-    document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
-    document.querySelectorAll('.tab-pane').forEach(p=>p.classList.add('hidden'));
-    btn.classList.add('active');
-    document.getElementById(`tab-${t}`)?.classList.remove('hidden');
-  }));
+    if (aisPill) {
+      const dot = aisPill.querySelector('.dot');
+      if (data.ws_connected) { dot.className='dot green'; if(data.ship_count) aisPill.title=`AISStream: ${data.ship_count} ships`; }
+      else if (data.aisstream) { dot.className='dot amber'; }
+      else { dot.className='dot red'; }
+    }
+    if (shodanPill) {
+      const dot = shodanPill.querySelector('.dot');
+      dot.className = data.shodan ? 'dot green' : 'dot red';
+    }
+  } catch {}
 }
 
-function setupFlightFilters(){
-  const apply=()=>{
-    S.filters.flights.minAlt  =parseInt(document.getElementById('f-min-alt')?.value||0);
-    S.filters.flights.maxAlt  =parseInt(document.getElementById('f-max-alt')?.value||45000);
-    S.filters.flights.minSpd  =parseInt(document.getElementById('f-min-spd')?.value||0);
-    S.filters.flights.maxSpd  =parseInt(document.getElementById('f-max-spd')?.value||1200);
-    S.filters.flights.country =document.getElementById('f-country')?.value?.trim()||'';
-    S.filters.flights.callsign=document.getElementById('f-callsign')?.value?.trim()||'';
-    S.filters.flights.showUnknown=document.getElementById('f-show-unknown')?.checked??true;
-    if(S.layers.flights.on)applyFlightFilters(false);
-    if(S.layers.military.on)applyFlightFilters(true);
-    addLog('FILTERS APPLIED');
-  };
-  const reset=()=>{
-    ['f-min-alt','f-max-alt','f-min-spd','f-max-spd'].forEach((id,i)=>{const el=document.getElementById(id);if(el)el.value=[0,45000,0,1200][i];});
-    const fc=document.getElementById('f-country');if(fc)fc.value='';
-    const fs=document.getElementById('f-callsign');if(fs)fs.value='';
-    const fu=document.getElementById('f-show-unknown');if(fu)fu.checked=true;
-    apply();
-  };
-  document.getElementById('filter-apply-btn')?.addEventListener('click',apply);
-  document.getElementById('filter-reset-btn')?.addEventListener('click',reset);
-  ['f-country','f-callsign'].forEach(id=>document.getElementById(id)?.addEventListener('keydown',e=>{if(e.key==='Enter')apply();}));
+// ─── DEBUG SOURCES ────────────────────────────────────────────────────────────
+document.getElementById('btn-debug').addEventListener('click', async () => {
+  const out = document.getElementById('debug-out');
+  out.textContent = 'Checking…';
+  try {
+    const r = await fetch('/api/debug/sources');
+    const data = await r.json();
+    const lines = [];
+    for (const [name, s] of Object.entries(data.sources || {})) {
+      const ok = s.ok === true || s.ws_connected;
+      const sym = ok ? '✓' : '✗';
+      const cls = ok ? 'debug-ok' : 'debug-fail';
+      const detail = s.count != null ? ` (${s.count})` : s.lines ? ` (${s.lines}L)` : s.cached != null ? ` (${s.cached} cached)` : '';
+      lines.push(`<span class="${cls}">${sym} ${name}${detail}</span>`);
+    }
+    out.innerHTML = lines.join('\n');
+  } catch(e) { out.textContent = 'Error: ' + e.message; }
+});
+
+// ─── FULLSCREEN ───────────────────────────────────────────────────────────────
+document.getElementById('btn-fullscreen').addEventListener('click', () => {
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+  else document.exitFullscreen();
+});
+
+// ─── REFRESH INTERVALS ────────────────────────────────────────────────────────
+function startPolling() {
+  fetchFlights();
+  fetchMilitary();
+  fetchShips();
+  fetchQuakes();
+
+  S.intervals.flights  = setInterval(fetchFlights,  CFG.refreshFlights);
+  S.intervals.military = setInterval(fetchMilitary, CFG.refreshMilitary);
+  S.intervals.ships    = setInterval(fetchShips,    CFG.refreshShips);
+  S.intervals.quakes   = setInterval(fetchQuakes,   CFG.refreshQuakes);
+  S.intervals.status   = setInterval(checkStatus,   30000);
+  S.intervals.intel    = setInterval(() => { if (S.layers.intel) fetchIntel(); }, CFG.refreshIntel);
+}
+
+// On camera move stop, refresh viewport-dependent layers
+let cameraMoveTimer = null;
+S.viewer.camera.moveEnd.addEventListener(() => {
+  clearTimeout(cameraMoveTimer);
+  cameraMoveTimer = setTimeout(() => {
+    if (S.layers.flights)   fetchFlights();
+    if (S.layers.ships)     fetchShips();
+    if (S.layers.cctv)      fetchCCTV();
+    if (S.layers.wildfires) fetchFires();
+  }, 800);
+});
+
+// ─── PLAYBACK ─────────────────────────────────────────────────────────────────
+async function initPlayback() {
+  try {
+    const r = await fetch('/api/playback/range');
+    const data = await r.json();
+    const pb = document.getElementById('pb-status');
+    if (data.available && data.earliest) {
+      const from = new Date(data.earliest).toISOString().substring(0,16);
+      const to   = new Date(data.latest).toISOString().substring(0,16);
+      pb.textContent = `${from} → ${to}`;
+    } else {
+      pb.textContent = 'No archive data';
+    }
+  } catch { document.getElementById('pb-status').textContent = 'Archive unavailable'; }
+}
+
+// ─── INIT ─────────────────────────────────────────────────────────────────────
+async function init() {
+  log('ARGUS v7.0 initialising…');
+
+  // Load initial data
+  await loadSatellites();
+  startPolling();
+  checkStatus();
+  fetchIntel();
+  initPlayback();
+
+  // Fly to reasonable starting position
+  S.viewer.camera.flyTo({
+    destination: Cesium.Cartesian3.fromDegrees(10, 48, 12000000),
+    duration: 2,
+  });
+
+  log('All systems nominal', 'ok');
+  toast('ARGUS v7.0 online', 'ok', 3000);
+}
+
+// Wait for satellite.js to be ready
+if (typeof satellite !== 'undefined') {
+  init();
+} else {
+  window.addEventListener('load', init);
 }

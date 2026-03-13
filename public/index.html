@@ -1,400 +1,206 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ARGUS // GLOBAL INTELLIGENCE SYSTEM</title>
-  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
-  <script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
-  <link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
-  <link rel="stylesheet" href="css/style.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ARGUS v7 — Geospatial Intelligence</title>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/satellite.js/4.1.3/satellite.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-  <div id="scanlines"></div>
-  <div id="vignette"></div>
-  <div id="cesiumContainer"></div>
 
-  <!-- TOP BAR -->
-  <div id="topbar">
-    <div class="tb-left">
-      <div class="logo-mark">▲</div>
-      <div class="tb-brand">
-        <span class="sys-label">ARGUS</span>
-        <span class="sys-sublabel">GLOBAL INTELLIGENCE SYSTEM v5.0</span>
-      </div>
-      <div class="tb-status">
-        <span class="status-dot active"></span>
-        <span class="status-text">UPLINK ACTIVE</span>
-      </div>
+<div id="topbar">
+  <div id="tb-left">
+    <div class="logo">
+      <svg width="20" height="20" viewBox="0 0 20 20"><polygon points="10,1 19,18 1,18" fill="none" stroke="#f59e0b" stroke-width="1.5"/><circle cx="10" cy="10" r="3" fill="#f59e0b"/><line x1="10" y1="4" x2="10" y2="7" stroke="#f59e0b" stroke-width="1"/><line x1="10" y1="13" x2="10" y2="16" stroke="#f59e0b" stroke-width="1"/><line x1="4" y1="10" x2="7" y2="10" stroke="#f59e0b" stroke-width="1"/><line x1="13" y1="10" x2="16" y2="10" stroke="#f59e0b" stroke-width="1"/></svg>
+      <span class="logo-text">ARGUS</span>
+      <span class="logo-ver">7.0</span>
     </div>
-    <div class="tb-center">
-      <div class="time-block">
-        <span class="time-label">LOCAL</span>
-        <span id="clock" class="time-val">--:--:--</span>
-      </div>
-      <div class="time-sep">|</div>
-      <div class="time-block">
-        <span class="time-label">UTC</span>
-        <span id="utc-clock" class="time-val">--:--:--</span>
-      </div>
-      <div class="time-sep">|</div>
-      <div class="threat-block">
-        <span class="threat-label">THREAT</span>
-        <span class="threat-val">GUARDED</span>
-      </div>
+    <div class="tb-divider"></div>
+    <span id="clock" class="mono">--:--:--Z</span>
+    <div class="tb-divider"></div>
+    <span id="loc-display" class="mono dim small">--°N --°E ALT:---km</span>
+  </div>
+
+  <div id="tb-layers">
+    <button class="lbtn on" data-layer="satellites">SAT <span class="lbtn-count" id="cnt-sat">0</span></button>
+    <button class="lbtn on" data-layer="flights">AIR <span class="lbtn-count" id="cnt-air">0</span></button>
+    <button class="lbtn on" data-layer="military">MIL <span class="lbtn-count" id="cnt-mil">0</span></button>
+    <button class="lbtn on" data-layer="ships">AIS <span class="lbtn-count" id="cnt-ais">0</span></button>
+    <button class="lbtn on" data-layer="quakes">SEIS <span class="lbtn-count" id="cnt-quake">0</span></button>
+    <button class="lbtn" data-layer="cctv">CCTV <span class="lbtn-count" id="cnt-cctv">0</span></button>
+    <button class="lbtn" data-layer="wildfires">FIRE <span class="lbtn-count" id="cnt-fire">0</span></button>
+    <button class="lbtn" data-layer="jamming">JAM</button>
+    <button class="lbtn" data-layer="mesh">MESH <span class="lbtn-count" id="cnt-mesh">0</span></button>
+    <button class="lbtn on" data-layer="intel">INTEL</button>
+  </div>
+
+  <div id="tb-right">
+    <div class="status-pill" id="pill-aisstream" title="AISStream WebSocket">
+      <span class="dot red"></span>AIS
     </div>
-    <div class="tb-right">
-      <div class="coord-block">
-        <div class="coord-row"><span class="c-lbl">LAT</span><span id="lat-display" class="c-val">---.---°</span></div>
-        <div class="coord-row"><span class="c-lbl">LON</span><span id="lon-display" class="c-val">---.---°</span></div>
-      </div>
-      <div class="coord-block">
-        <div class="coord-row"><span class="c-lbl">ALT</span><span id="alt-display" class="c-val">---km</span></div>
-        <div class="coord-row">
-          <span id="lod-indicator" class="lod-badge lod-global">LOD: GLOBAL</span>
-          <span id="token-status" style="font-size:8px;color:var(--text-muted);letter-spacing:0.1em;margin-left:8px">INIT...</span>
-        </div>
-      </div>
+    <div class="status-pill" id="pill-shodan" title="Shodan API">
+      <span class="dot red"></span>SDN
+    </div>
+    <div class="tb-divider"></div>
+    <button class="icon-btn" id="btn-settings" title="Settings">⚙</button>
+    <button class="icon-btn" id="btn-fullscreen" title="Fullscreen">⛶</button>
+  </div>
+</div>
+
+<!-- GLOBE -->
+<div id="cesiumContainer"></div>
+
+<!-- LEFT SIDEBAR -->
+<div id="sidebar">
+  <div class="sb-block">
+    <div class="sb-label">VIEW</div>
+    <div class="btn-row">
+      <button class="mode-btn active" id="btn-3d">3D</button>
+      <button class="mode-btn" id="btn-2d">2D</button>
+      <button class="mode-btn" id="btn-cv">CV</button>
     </div>
   </div>
 
-  <!-- LEFT PANEL -->
-  <div id="left-panel">
-    <div class="tab-bar">
-      <button class="tab-btn active" data-tab="layers">LAYERS</button>
-      <button class="tab-btn" data-tab="intel">INTEL</button>
-      <button class="tab-btn" data-tab="playback">PLAYBACK</button>
+  <div class="sb-block">
+    <div class="sb-label">BASEMAP</div>
+    <select id="basemap-sel" class="sb-sel">
+      <option value="dark">Dark Tile</option>
+      <option value="satellite">Satellite</option>
+      <option value="terrain">Terrain</option>
+      <option value="void">Void</option>
+    </select>
+  </div>
+
+  <div class="sb-block">
+    <div class="sb-label">SATELLITE GROUPS</div>
+    <label class="chk"><input type="checkbox" checked data-satgrp="visual"> Visual (~150)</label>
+    <label class="chk"><input type="checkbox" data-satgrp="space-stations"> Stations</label>
+    <label class="chk"><input type="checkbox" data-satgrp="starlink"> Starlink</label>
+    <label class="chk"><input type="checkbox" data-satgrp="weather"> Weather</label>
+    <label class="chk"><input type="checkbox" data-satgrp="gps"> GPS/GNSS</label>
+    <label class="chk"><input type="checkbox" data-satgrp="geo"> GEO Belt</label>
+    <button class="sb-btn mt4" id="reload-sats">↺ RELOAD TLE</button>
+  </div>
+
+  <div class="sb-block">
+    <div class="sb-label">SHODAN</div>
+    <input type="password" id="shodan-key" class="sb-input" placeholder="API key">
+    <select id="shodan-preset" class="sb-sel mt4">
+      <option value="">Preset query…</option>
+      <option value="has_screenshot:true product:webcam">IP Cameras</option>
+      <option value="port:102 product:S7">SCADA/S7</option>
+      <option value="tag:ics">Industrial Control</option>
+      <option value="port:3389 os:Windows">Exposed RDP</option>
+      <option value="authentication disabled port:5900">VNC No Auth</option>
+      <option value="port:30003 dump1090">ADS-B Receivers</option>
+      <option value="SolarEdge tag:iot">Solar Inverters</option>
+    </select>
+    <button class="sb-btn mt4" id="shodan-go">⌕ SEARCH</button>
+  </div>
+
+  <div class="sb-block">
+    <div class="sb-label">TRACK PLAYBACK</div>
+    <div id="pb-status" class="mono dim tiny">Querying archive…</div>
+    <input type="range" id="pb-slider" min="0" max="100" value="100" class="slider">
+    <div id="pb-time" class="mono amber tiny">● LIVE</div>
+  </div>
+
+  <div class="sb-block">
+    <div class="sb-label">DEBUG</div>
+    <button class="sb-btn" id="btn-debug">CHECK SOURCES</button>
+    <div id="debug-out" class="mono tiny dim mt4"></div>
+  </div>
+</div>
+
+<!-- INTEL PANEL (right) -->
+<div id="intel-panel">
+  <div class="panel-hdr">
+    <div class="panel-hdr-left">
+      <span class="panel-icon">◈</span>
+      <span class="panel-title">INTELLIGENCE FEED</span>
     </div>
-
-    <!-- TAB: LAYERS -->
-    <div class="tab-pane" id="tab-layers">
-
-      <div class="layer-section">
-        <div class="layer-section-title">ORBITAL</div>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-satellites" checked>
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">🛰</span>
-          <span class="layer-name">Satellites</span>
-          <span class="layer-count" id="sat-count">0</span>
-        </label>
-      </div>
-
-      <div class="layer-section">
-        <div class="layer-section-title">AVIATION</div>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-flights">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">✈</span>
-          <span class="layer-name">Commercial Flights</span>
-          <span class="layer-count" id="flight-count">0</span>
-        </label>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-military">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">★</span>
-          <span class="layer-name">Military Flights</span>
-          <span class="layer-count" id="mil-count">0</span>
-        </label>
-        <div id="filter-stats" class="filter-stats-mini"></div>
-        <button class="sub-btn" onclick="document.getElementById('filter-panel').classList.toggle('hidden')">⚙ Flight Filters</button>
-      </div>
-
-      <div class="layer-section">
-        <div class="layer-section-title">MARITIME</div>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-ships">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">⛵</span>
-          <span class="layer-name">AIS Vessels</span>
-          <span class="layer-count" id="ship-count">0</span>
-        </label>
-      </div>
-
-      <div class="layer-section">
-        <div class="layer-section-title">GROUND</div>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-traffic">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">🛣</span>
-          <span class="layer-name">Road Network</span>
-          <span class="layer-count" id="traffic-count">0</span>
-        </label>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-cctv">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">📷</span>
-          <span class="layer-name">CCTV Cameras</span>
-          <span class="layer-count" id="cctv-count">0</span>
-        </label>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-meshtastic">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">📡</span>
-          <span class="layer-name">Meshtastic Nodes</span>
-          <span class="layer-count" id="mesh-count">0</span>
-        </label>
-      </div>
-
-      <div class="layer-section">
-        <div class="layer-section-title">GEOPHYSICAL</div>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-quakes">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">📈</span>
-          <span class="layer-name">Seismic Events</span>
-          <span class="layer-count" id="quake-count">0</span>
-        </label>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-sensors">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">🔬</span>
-          <span class="layer-name">Seismic Stations</span>
-          <span class="layer-count" id="sensor-count">0</span>
-        </label>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-wildfires">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">🔥</span>
-          <span class="layer-name">Active Fires</span>
-          <span class="layer-count" id="fire-count">0</span>
-        </label>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-gpsjam">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">⚡</span>
-          <span class="layer-name">GPS Jamming</span>
-          <span class="layer-count" id="jam-count">0</span>
-        </label>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-weather">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">🌡</span>
-          <span class="layer-name">Weather Grid</span>
-          <span class="layer-count" id="weather-count">0</span>
-        </label>
-      </div>
-
-      <div class="layer-section">
-        <div class="layer-section-title">SATELLITE IMAGERY</div>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-sat-imagery">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">🌍</span>
-          <span class="layer-name">Overlay</span>
-        </label>
-        <select id="sat-imagery-select" class="layer-select">
-          <option value="none">— Select product —</option>
-          <option value="modis_true">MODIS True Colour</option>
-          <option value="viirs_true">VIIRS True Colour</option>
-          <option value="nightlights">VIIRS Night Lights</option>
-          <option value="sst">Sea Surface Temp</option>
-          <option value="land_temp">Land Surface Temp</option>
-          <option value="rain_radar">Rain Rate (GPM)</option>
-        </select>
-      </div>
-
-      <div class="layer-section">
-        <div class="layer-section-title">OSINT</div>
-        <label class="layer-row">
-          <input type="checkbox" id="toggle-shodan">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="layer-icon">🔍</span>
-          <span class="layer-name">Shodan Devices</span>
-          <span class="layer-count" id="shodan-count">0</span>
-        </label>
-      </div>
-
-      <div class="section-divider"></div>
-      <div class="layer-section-title" style="margin-bottom:8px">DISPLAY MODE</div>
-      <div class="det-group">
-        <button class="det-btn active" data-mode="sparse">SPARSE</button>
-        <button class="det-btn" data-mode="full">FULL LABELS</button>
-      </div>
-
-      <div class="section-divider"></div>
-      <div class="layer-section-title" style="margin-bottom:8px">TARGET LOCK</div>
-      <div id="tracking-info"><div class="no-track">No target locked</div></div>
-      <button id="clear-track-btn" style="display:none" class="danger-btn">Release Target</button>
-    </div>
-
-    <!-- TAB: INTEL -->
-    <div class="tab-pane hidden" id="tab-intel">
-      <div class="section-header">SHODAN OSINT</div>
-
-      <div id="shodan-key-prompt" style="display:none; margin-bottom:10px">
-        <div class="warn-box">⚠ API Key Required</div>
-        <input type="password" id="shodan-key-input" class="text-input" placeholder="Enter Shodan API key...">
-        <button id="shodan-save-key-btn" class="action-btn full-w mt-4">Save Key</button>
-      </div>
-
-      <select id="shodan-preset-select" class="layer-select" style="margin-bottom:6px">
-        <option value="">— Preset query —</option>
-      </select>
-      <input type="text" id="shodan-query-input" class="text-input" placeholder='e.g. port:8080 country:GB'>
-      <button id="shodan-search-btn" class="action-btn full-w mt-4">▶ Execute Scan</button>
-      <div id="shodan-result-count" class="result-note"></div>
-
-      <div class="section-divider"></div>
-      <div class="section-header">
-        CREDIT USAGE
-        <button id="shodan-credit-refresh" class="icon-btn">↺</button>
-      </div>
-      <div id="shodan-credit-display" class="credit-display">
-        <span class="muted-text">Loading...</span>
-      </div>
-      <div class="info-note">Results cached 1h · 1 credit/search</div>
-
-      <div class="section-divider"></div>
-      <div class="section-header">MESHTASTIC</div>
-      <div id="mesh-panel" class="mesh-panel">
-        <div class="mesh-stat-row">
-          <span class="muted-text">Nodes online:</span>
-          <span id="mesh-online-count" class="val-green">—</span>
-        </div>
-        <div id="mesh-messages" class="mesh-messages">
-          <div class="muted-text" style="padding:8px 0">Toggle Meshtastic layer to load messages</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- TAB: PLAYBACK -->
-    <div class="tab-pane hidden" id="tab-playback">
-      <div class="section-header">TIME MACHINE</div>
-      <div class="stat-row"><span class="muted-text">Status</span><span id="playback-status" class="val-green">NOT INITIALISED</span></div>
-      <div class="stat-row"><span class="muted-text">Current</span><span id="playback-time" class="val-green">—</span></div>
-      <button id="pb-init-btn" class="action-btn full-w mt-4">⟳ Load Timeline</button>
-
-      <div class="section-divider"></div>
-      <div class="section-header">TIMELINE</div>
-      <canvas id="timeline-canvas" width="196" height="50" style="width:100%;cursor:crosshair;display:block;border:1px solid var(--border)"></canvas>
-      <input type="range" id="pb-scrubber" min="0" max="100" value="100" step="0.1" class="pb-scrubber">
-
-      <div class="pb-controls">
-        <button id="pb-play-btn" class="action-btn">▶ Play</button>
-        <select id="pb-speed" class="layer-select" style="flex:1">
-          <option value="1">1× speed</option>
-          <option value="4">4× speed</option>
-          <option value="12">12× speed</option>
-          <option value="60">60× speed</option>
-          <option value="360">360× speed</option>
-        </select>
-      </div>
-
-      <div class="section-divider"></div>
-      <div class="section-header">
-        STORAGE
-        <button id="storage-refresh-btn" class="icon-btn">↺</button>
-      </div>
-      <div id="storage-stats" class="storage-stats">Loading...</div>
-      <div class="info-note">7-day retention · Delta compressed</div>
+    <div class="panel-hdr-right">
+      <span id="intel-src-badge" class="badge">GDELT · 100+ LANG</span>
+      <button class="icon-btn" id="intel-close">✕</button>
     </div>
   </div>
 
-  <!-- RIGHT PANEL -->
-  <div id="right-panel">
-    <div class="section-header">DISPLAY</div>
-    <div class="vision-modes">
-      <button class="vision-btn active" data-mode="normal">STANDARD</button>
-      <button class="vision-btn" data-mode="crt">CRT</button>
-      <button class="vision-btn" data-mode="nvg">NVG</button>
-      <button class="vision-btn" data-mode="flir">FLIR</button>
-    </div>
-
-    <div class="section-divider"></div>
-    <div class="section-header">CAMERA</div>
-    <div class="preset-grid">
-      <button class="preset-btn" data-preset="global">GLOBAL</button>
-      <button class="preset-btn" data-preset="london">LONDON</button>
-      <button class="preset-btn" data-preset="nyc">NEW YORK</button>
-      <button class="preset-btn" data-preset="dc">WASHINGTON</button>
-      <button class="preset-btn" data-preset="moscow">MOSCOW</button>
-      <button class="preset-btn" data-preset="beijing">BEIJING</button>
-      <button class="preset-btn" data-preset="dubai">DUBAI</button>
-      <button class="preset-btn" data-preset="sydney">SYDNEY</button>
-    </div>
+  <div id="intel-search">
+    <input type="text" id="intel-q" class="intel-input" placeholder="Search all global media in English…">
+    <select id="intel-span" class="intel-sel">
+      <option value="1h">1h</option>
+      <option value="6h">6h</option>
+      <option value="12h">12h</option>
+      <option value="24h" selected>24h</option>
+      <option value="7d">7d</option>
+    </select>
+    <button id="intel-go" class="intel-btn">⌕</button>
   </div>
 
-  <!-- FLIGHT FILTER PANEL -->
-  <div id="filter-panel" class="float-panel hidden">
-    <div class="fp-header">
-      <span>✈ FLIGHT FILTERS</span>
-      <button onclick="document.getElementById('filter-panel').classList.add('hidden')" class="icon-btn">✕</button>
-    </div>
-    <div class="fp-grid">
-      <div class="fp-group"><label>Min Alt (m)</label><input type="number" id="f-min-alt" class="text-input" value="0"></div>
-      <div class="fp-group"><label>Max Alt (m)</label><input type="number" id="f-max-alt" class="text-input" value="45000"></div>
-      <div class="fp-group"><label>Min Speed</label><input type="number" id="f-min-spd" class="text-input" value="0"></div>
-      <div class="fp-group"><label>Max Speed</label><input type="number" id="f-max-spd" class="text-input" value="1200"></div>
-      <div class="fp-group" style="grid-column:span 2"><label>Country Code</label><input type="text" id="f-country" class="text-input" placeholder="GB, US, DE..."></div>
-      <div class="fp-group" style="grid-column:span 2"><label>Callsign Contains</label><input type="text" id="f-callsign" class="text-input" placeholder="BAW, UNITED..."></div>
-      <div class="fp-group" style="grid-column:span 2">
-        <label class="layer-row" style="padding:0">
-          <input type="checkbox" id="f-show-unknown" checked>
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span style="margin-left:6px;font-size:11px">Show unknown callsigns</span>
-        </label>
-      </div>
-    </div>
-    <div class="fp-actions">
-      <button id="filter-apply-btn" class="action-btn">Apply</button>
-      <button id="filter-reset-btn" class="action-btn dim-btn">Reset</button>
-    </div>
+  <div id="intel-filters">
+    <button class="ftag active" data-q="">ALL</button>
+    <button class="ftag" data-q="conflict OR attack OR war">CONFLICT</button>
+    <button class="ftag" data-q="military OR troops OR airstrike">MILITARY</button>
+    <button class="ftag" data-q="protest OR riot OR demonstration">PROTEST</button>
+    <button class="ftag" data-q="earthquake OR flood OR disaster OR hurricane">DISASTER</button>
+    <button class="ftag" data-q="cyber OR hack OR malware OR breach">CYBER</button>
+    <button class="ftag" data-q="nuclear OR chemical OR biological OR weapons">WMD</button>
   </div>
 
-  <!-- BOTTOM BAR -->
-  <div id="bottombar">
-    <div class="log-strip" id="event-log">
-      <span class="log-label">EVT</span>
-      <span class="log-sep">//</span>
-      <span class="log-item">SYSTEM INITIALISED</span>
-    </div>
-    <div class="bb-sources">
-      NASA GIBS · CELESTRAK · OPENSKY · USGS · OSM · FIRMS · OPEN-METEO · AISSTREAM · GPSJAM · MESHTASTIC
-    </div>
-  </div>
+  <div id="intel-items"></div>
 
-  <!-- TOKEN MODAL -->
-  <div id="token-modal" class="modal-overlay">
-    <div class="modal-box">
-      <div class="modal-eyebrow">INITIALISATION REQUIRED</div>
-      <div class="modal-title">ARGUS<br>GLOBAL INTELLIGENCE</div>
-      <div class="modal-body">Enter a Cesium Ion token to enable photorealistic 3D globe tiles. Free tokens at <strong>ion.cesium.com</strong></div>
-      <input type="text" id="cesium-token-input" class="text-input" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6Ikp...">
-      <div class="modal-actions">
-        <button id="token-submit-btn" class="action-btn">Initialise System</button>
-        <button id="token-skip-btn" class="dim-btn">Use Default (Limited)</button>
-      </div>
-      <div style="margin-top:10px;text-align:center">
-        <button onclick="localStorage.removeItem('cesium_token');location.reload()" style="background:none;border:none;color:var(--text-muted);font-size:9px;cursor:pointer;font-family:var(--font-mono);letter-spacing:0.1em">⟳ Clear saved token &amp; re-enter</button>
-      </div>
-    </div>
+  <div id="intel-footer">
+    <span id="intel-count" class="mono dim tiny">—</span>
+    <span class="dim tiny"> · GDELT updates every 15min</span>
+    <button id="intel-refresh" class="tiny-btn">↺ REFRESH</button>
   </div>
+</div>
 
-  <!-- DETAIL PANEL -->
-  <div id="detail-panel" class="hidden">
-    <div class="dp-header">
-      <span id="dp-type-badge" class="dp-badge">UNK</span>
-      <span id="dp-title" class="dp-title">TARGET</span>
-      <button id="dp-close" class="icon-btn">✕</button>
-    </div>
-    <div id="dp-content"></div>
-    <button id="dp-track-btn" class="dp-track-btn">🎯 Lock Target</button>
+<!-- AI QUERY -->
+<div id="ai-bar">
+  <div class="ai-prefix">◈ ARGUS AI</div>
+  <input type="text" id="ai-in" placeholder="Natural language query… (e.g. 'What's happening over the Mediterranean?')">
+  <button id="ai-send">ASK</button>
+</div>
+
+<div id="ai-response" class="hidden">
+  <div class="air-hdr">
+    <span>◈ INTELLIGENCE BRIEF</span>
+    <button id="ai-dismiss">✕</button>
   </div>
+  <div id="ai-text"></div>
+</div>
 
-  <!-- MESHTASTIC MESSAGE MODAL -->
-  <div id="mesh-modal" class="modal-overlay hidden">
-    <div class="modal-box" style="max-width:520px">
-      <div class="dp-header" style="margin-bottom:12px">
-        <span class="dp-badge">📡</span>
-        <span id="mesh-modal-name" class="dp-title">NODE</span>
-        <button onclick="document.getElementById('mesh-modal').classList.add('hidden')" class="icon-btn">✕</button>
-      </div>
-      <div id="mesh-modal-info" style="font-size:11px;color:var(--text-dim);margin-bottom:12px;line-height:1.8"></div>
-      <div class="section-header" style="margin-bottom:8px">RECENT MESSAGES</div>
-      <div id="mesh-modal-messages" style="max-height:300px;overflow-y:auto;font-size:11px"></div>
-    </div>
+<!-- ENTITY INFO -->
+<div id="info-box" class="hidden">
+  <div id="info-hdr">
+    <span id="info-icon">●</span>
+    <span id="info-name">Entity</span>
+    <button id="info-close">✕</button>
   </div>
+  <div id="info-body"></div>
+  <div id="info-actions">
+    <button class="act-btn" id="info-track">📍 TRACK</button>
+    <button class="act-btn" id="info-shodan">🔍 SHODAN</button>
+  </div>
+</div>
 
-  <script src="js/app.js"></script>
+<!-- TOASTS -->
+<div id="toasts"></div>
+
+<!-- LOG -->
+<div id="log-wrap">
+  <div id="log-hdr" onclick="toggleLog()">
+    <span id="log-arrow">▶</span> SYSTEM LOG
+    <span id="log-dot" class="dot green" style="margin-left:6px"></span>
+  </div>
+  <div id="log-body"></div>
+</div>
+
+<script src="js/app.js"></script>
 </body>
 </html>

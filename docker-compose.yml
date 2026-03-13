@@ -1,41 +1,14 @@
-version: '3.9'
-
+version: '3.8'
 services:
   argus:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: argus
-    restart: unless-stopped
+    build: .
     ports:
       - "3000:3000"
-    environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - DATA_DIR=/app/data
-      # Set your Shodan API key here (or leave blank and enter it in the UI)
-      - SHODAN_API_KEY=${SHODAN_API_KEY:-}
     volumes:
-      # Persist database across container restarts / rebuilds
-      - argus_data:/app/data
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
+      - argus_data:/data
+    environment:
+      - SHODAN_API_KEY=${SHODAN_API_KEY:-}
+      - AISSTREAM_KEY=${AISSTREAM_KEY:-}
+    restart: unless-stopped
 volumes:
   argus_data:
-    driver: local
