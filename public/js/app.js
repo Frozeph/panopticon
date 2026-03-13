@@ -90,7 +90,11 @@ updateClock();
 Cesium.Ion.defaultAccessToken = CFG.cesiumToken;
 
 S.viewer = new Cesium.Viewer('cesiumContainer', {
-  imageryProvider:        false,
+  imageryProvider:        new Cesium.UrlTemplateImageryProvider({
+    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
+    credit: '© CARTO © OpenStreetMap contributors',
+  }),
   terrainProvider:        new Cesium.EllipsoidTerrainProvider(),
   timeline:               false,
   animation:              false,
@@ -104,23 +108,21 @@ S.viewer = new Cesium.Viewer('cesiumContainer', {
   selectionIndicator:     false,
   skyBox:                 false,
   skyAtmosphere:          new Cesium.SkyAtmosphere(),
-  requestRenderMode:      false,   // continuous render needed for moving sats
+  requestRenderMode:      false,
   scene3DOnly:            false,
 });
 
-// Set dark void background
+// Dark void background
 S.viewer.scene.backgroundColor = new Cesium.Color(0.04, 0.04, 0.06, 1);
 S.viewer.scene.globe.show = true;
 
-// Apply initial dark basemap
-applyBasemap('dark');
-
 // ─── BASEMAP ──────────────────────────────────────────────────────────────────
-// CesiumJS 1.114: IonImageryProvider is now async — must use fromAssetId()
+// No Ion dependency — use free tile providers so it works without a Cesium token
 async function applyBasemap(mode) {
-  S.viewer.imageryLayers.removeAll();
-  // Reset to flat ellipsoid terrain first
-  S.viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+  try {
+    S.viewer.imageryLayers.removeAll();
+    S.viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+  } catch(e) { console.warn('Layer clear error:', String(e)); }
 
   const layers = S.viewer.imageryLayers;
 
@@ -129,31 +131,37 @@ async function applyBasemap(mode) {
       layers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
         url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
         subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
-        credit: '© CARTO © OpenStreetMap',
+        credit: '© CARTO © OpenStreetMap contributors',
       }));
+
     } else if (mode === 'satellite') {
-      // Async Ion provider — CesiumJS 1.109+
-      const provider = await Cesium.IonImageryProvider.fromAssetId(3);
-      layers.addImageryProvider(provider);
+      // ESRI World Imagery — free, no API key, global high-res satellite
+      layers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
+        url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        minimumLevel: 0, maximumLevel: 19,
+        credit: '© Esri, Maxar, Earthstar Geographics',
+      }));
+
     } else if (mode === 'terrain') {
-      // Satellite imagery base
-      const imgProvider = await Cesium.IonImageryProvider.fromAssetId(3);
-      layers.addImageryProvider(imgProvider);
-      // World terrain with async API
+      // ESRI satellite base + OpenTopoMap overlay for terrain context
+      layers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
+        url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        minimumLevel: 0, maximumLevel: 18,
+        credit: '© Esri, Maxar',
+      }));
+      // Add terrain provider (no Ion needed — use Cesium's ellipsoid with visual height exaggeration)
       try {
-        S.viewer.terrainProvider = await Cesium.CesiumTerrainProvider.fromIon(1);
-      } catch {
-        // Fallback: terrain without Ion if token missing
-        S.viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
-      }
+        S.viewer.scene.globe.terrainExaggeration = 2.0;
+      } catch {}
     }
   } catch(e) {
-    console.warn('Basemap load failed, falling back to dark tiles:', e.message);
+    // Fallback: always dark tiles if anything fails
+    console.warn('Basemap error, falling back to dark tiles:', String(e));
     try {
       layers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
         url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
         subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
-        credit: '© CARTO © OpenStreetMap',
+        credit: '© CARTO',
       }));
     } catch {}
   }

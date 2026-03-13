@@ -21,16 +21,26 @@ app.use(express.static(path.join(__dirname, 'public')));
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ─── HTTP FETCH HELPER ────────────────────────────────────────────────────────
+// Use a real browser UA — many public APIs block bot-identified clients
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0';
+
 function fetchUrl(url, opts = {}) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
     const req = lib.get(url, {
-      headers: { 'User-Agent': 'ARGUS-Intelligence/7.0 (self-hosted)', 'Accept': '*/*', ...opts.headers },
+      headers: {
+        'User-Agent':      BROWSER_UA,
+        'Accept':          'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection':      'keep-alive',
+        ...opts.headers,
+      },
       timeout: opts.timeout || 15000,
     }, res => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, data: Buffer.concat(chunks).toString() }));
+      res.on('end', () => resolve({ status: res.statusCode, data: Buffer.concat(chunks).toString(), headers: res.headers }));
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
@@ -180,21 +190,69 @@ app.get('/api/ships', async (req, res) => {
     return res.json({ ships:ships.slice(0,2000), _src:'cached', _count:ships.length });
   }
 
-  const bHdrs = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
-    'Accept': 'application/json, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-  };
+  const log = (src, msg) => console.log(`[Ships/${src}] ${msg}`);
 
-  // Source A: Kystverket (Norwegian Coastal Admin) - genuinely free public AIS
+  // ── Source A: Digitraffic (Finnish Transport Agency) — genuinely free public API
+  // Provides global AIS from receiver network, open data licence, no auth needed
+  try {
+    const r = await fetchUrl('https://meri.digitraffic.fi/api/ais/v1/locations', {
+      headers: { 'Digitraffic-User': 'ARGUS/7.0 github.com/Frozeph/panopticon', 'Accept': 'application/json' },
+      timeout: 20000,
+    });
+    log('digitraffic', `HTTP ${r.status}, ${r.data.length} bytes`);
+    if (r.status === 200) {
+      const d = JSON.parse(r.data);
+      const features = d.features || (Array.isArray(d) ? d : []);
+      const ships = features.slice(0, 5000).map(f => {
+        const p = f.properties || f;
+        const g = f.geometry?.coordinates;
+        return {
+          mmsi:    String(p.mmsi || ''),
+          name:    '',
+          lat:     g ? parseFloat(g[1]) : parseFloat(p.lat || 0),
+          lon:     g ? parseFloat(g[0]) : parseFloat(p.lon || 0),
+          speed:   parseFloat(p.sog || 0),
+          course:  parseFloat(p.cog || 0),
+          heading: parseFloat(p.heading || 511),
+          ts:      Date.now(),
+        };
+      }).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90 && s.mmsi);
+
+      // Fetch vessel names separately
+      if (ships.length > 0) {
+        try {
+          const vr = await fetchUrl('https://meri.digitraffic.fi/api/ais/v1/vessels', {
+            headers: { 'Digitraffic-User': 'ARGUS/7.0 github.com/Frozeph/panopticon' }, timeout: 15000,
+          });
+          if (vr.status === 200) {
+            const vd = JSON.parse(vr.data);
+            const vesselMap = new Map();
+            (vd.features || vd || []).forEach(v => {
+              const p = v.properties || v;
+              if (p.mmsi) vesselMap.set(String(p.mmsi), (p.name || p.shipName || '').trim());
+            });
+            ships.forEach(s => { if (vesselMap.has(s.mmsi)) s.name = vesselMap.get(s.mmsi); });
+          }
+        } catch {}
+        shipFallback = { data: ships, ts: Date.now() };
+        let out = hasBbox ? ships.filter(s=>s.lat>=minLat&&s.lat<=maxLat&&s.lon>=minLon&&s.lon<=maxLon) : ships;
+        log('digitraffic', `returning ${out.length} ships`);
+        return res.json({ ships: out.slice(0, 3000), _src: 'digitraffic', _count: out.length });
+      }
+    }
+  } catch(e) { log('digitraffic', `error: ${e.message}`); }
+
+  // ── Source B: Kystverket (Norwegian Coastal Admin)
   try {
     const r = await fetchUrl('https://kystdatahuset.no/ws/api/ais/positions/all', {
-      headers: { ...bHdrs, 'Referer':'https://kystdatahuset.no/' }, timeout: 12000,
+      headers: { 'Referer': 'https://kystdatahuset.no/', 'Accept': 'application/json' },
+      timeout: 12000,
     });
+    log('kystverket', `HTTP ${r.status}`);
     if (r.status === 200 && r.data.length > 100) {
       const parsed = JSON.parse(r.data);
       const arr = Array.isArray(parsed) ? parsed : (parsed.features || parsed.data || []);
-      const ships = arr.slice(0,3000).map(s => {
+      const ships = arr.slice(0, 3000).map(s => {
         const p = s.properties || s;
         const g = s.geometry?.coordinates;
         return {
@@ -205,56 +263,31 @@ app.get('/api/ships', async (req, res) => {
           speed:  parseFloat(p.sog || p.speed || 0),
           course: parseFloat(p.cog || p.course || 0),
           type:   parseInt(p.shipType || 0),
-          ts: Date.now(),
+          ts:     Date.now(),
         };
-      }).filter(s => s.lat && s.lon && Math.abs(s.lat)<=90 && s.mmsi);
+      }).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90 && s.mmsi);
       if (ships.length > 0) {
         shipFallback = { data: ships, ts: Date.now() };
         let out = hasBbox ? ships.filter(s=>s.lat>=minLat&&s.lat<=maxLat&&s.lon>=minLon&&s.lon<=maxLon) : ships;
-        return res.json({ ships: out.slice(0,2000), _src:'kystverket', _count:out.length });
+        return res.json({ ships: out.slice(0, 2000), _src: 'kystverket', _count: out.length });
       }
     }
-  } catch(e) { console.warn('[Ships] Kystverket:', e.message); }
+  } catch(e) { log('kystverket', `error: ${e.message}`); }
 
-  // Source B: BarentsWatch open AIS (Norwegian government, free)
-  try {
-    const r = await fetchUrl('https://www.barentswatch.no/bwapi/v2/ais/openpositions?modelType=Simple&projection=Normal', {
-      headers: { ...bHdrs, 'Referer':'https://www.barentswatch.no/' }, timeout: 12000,
-    });
-    if (r.status === 200) {
-      const arr = JSON.parse(r.data);
-      const ships = (Array.isArray(arr) ? arr : []).slice(0,3000).map(s => ({
-        mmsi:    String(s.mmsi || ''),
-        name:    (s.name || s.shipName || '').trim(),
-        lat:     parseFloat(s.latitude || s.lat || 0),
-        lon:     parseFloat(s.longitude || s.lon || 0),
-        speed:   parseFloat(s.speedOverGround || s.sog || 0),
-        course:  parseFloat(s.courseOverGround || s.cog || 0),
-        heading: parseFloat(s.trueHeading || 511),
-        type:    parseInt(s.shipType || 0),
-        ts: Date.now(),
-      })).filter(s => s.lat && s.lon && s.mmsi);
-      if (ships.length > 0) {
-        shipFallback = { data: ships, ts: Date.now() };
-        let out = hasBbox ? ships.filter(s=>s.lat>=minLat&&s.lat<=maxLat&&s.lon>=minLon&&s.lon<=maxLon) : ships;
-        return res.json({ ships: out.slice(0,2000), _src:'barentswatch', _count:out.length });
-      }
-    }
-  } catch(e) { console.warn('[Ships] BarentsWatch:', e.message); }
-
-  // Source C: VesselFinder
+  // ── Source C: VesselFinder
   try {
     const vfLat1 = hasBbox ? minLat : -70, vfLat2 = hasBbox ? maxLat : 70;
     const vfLon1 = hasBbox ? minLon : -180, vfLon2 = hasBbox ? maxLon : 180;
     const url = `https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=${vfLat1}&minlon=${vfLon1}&maxlat=${vfLat2}&maxlon=${vfLon2}&z=3`;
     const r = await fetchUrl(url, {
-      headers: { ...bHdrs, 'Referer':'https://www.vesselfinder.com/map', 'Origin':'https://www.vesselfinder.com' },
+      headers: { 'Referer': 'https://www.vesselfinder.com/', 'Accept': 'application/json' },
       timeout: 15000,
     });
+    log('vesselfinder', `HTTP ${r.status}, ${r.data.length} bytes`);
     if (r.status === 200 && r.data.length > 10) {
       const raw = JSON.parse(r.data);
       const arr = Array.isArray(raw) ? raw : (raw.vessels || raw.data || []);
-      const ships = arr.slice(0,3000).map(s => ({
+      const ships = arr.slice(0, 3000).map(s => ({
         mmsi:   String(s[0] || s.mmsi || ''),
         name:   (s[1] || s.name || '').trim(),
         lat:    parseFloat(s[2] ?? s.lat ?? 0),
@@ -262,24 +295,25 @@ app.get('/api/ships', async (req, res) => {
         speed:  parseFloat(s[4] || 0) / 10,
         course: parseFloat(s[5] || 0),
         type:   parseInt(s[7] || 0),
-        ts: Date.now(),
-      })).filter(s => s.lat && s.lon && Math.abs(s.lat)<=90);
+        ts:     Date.now(),
+      })).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90);
       if (ships.length > 0) {
         shipFallback = { data: ships, ts: Date.now() };
         let out = hasBbox ? ships.filter(s=>s.lat>=vfLat1&&s.lat<=vfLat2&&s.lon>=vfLon1&&s.lon<=vfLon2) : ships;
-        return res.json({ ships: out.slice(0,2000), _src:'vesselfinder', _count:out.length });
+        return res.json({ ships: out.slice(0, 2000), _src: 'vesselfinder', _count: out.length });
       }
     }
-  } catch(e) { console.warn('[Ships] VF:', e.message); }
+  } catch(e) { log('vesselfinder', `error: ${e.message}`); }
 
-  // Stale cache always beats empty
+  // Always serve stale over empty
   if (shipFallback.data) {
     let ships = shipFallback.data;
     if (hasBbox) ships = ships.filter(s=>s.lat>=minLat&&s.lat<=maxLat&&s.lon>=minLon&&s.lon<=maxLon);
-    return res.json({ ships:ships.slice(0,2000), _src:'stale_cache', _count:ships.length });
+    return res.json({ ships: ships.slice(0, 2000), _src: 'stale_cache', _count: ships.length });
   }
 
-  res.json({ ships:[], _src:'none', _count:0, hint:'Set AISSTREAM_KEY (free: aisstream.io) for live global AIS' });
+  res.json({ ships: [], _src: 'none', _count: 0,
+    hint: 'All AIS sources failed — check server logs. Get a free AISSTREAM_KEY at aisstream.io for reliable live data.' });
 });
 
 
@@ -328,39 +362,44 @@ const gdeltCache = new Map();
 let   gdeltInFlight = new Map(); // prevent duplicate in-flight requests
 
 async function fetchGdelt(url, cacheKey, maxAge) {
-  // Serve stale if we have it while revalidating in background
-  const cached = gdeltCache.get(cacheKey);
-  const isStale = cached && Date.now() - cached.ts > maxAge;
-  const isFresh = cached && !isStale;
+  const cached  = gdeltCache.get(cacheKey);
+  const isFresh = cached && (Date.now() - cached.ts < maxAge);
   if (isFresh) return { data: cached.data, stale: false };
 
-  // Deduplicate concurrent requests for same key
   if (gdeltInFlight.has(cacheKey)) {
-    const result = await gdeltInFlight.get(cacheKey).catch(() => null);
-    return { data: result || cached?.data, stale: !!cached };
+    try { return { data: await gdeltInFlight.get(cacheKey), stale: false }; }
+    catch { return { data: cached?.data, stale: true }; }
   }
 
-  const req = (async () => {
-    // Small delay to avoid hammering — GDELT is a shared public resource
-    await new Promise(r => setTimeout(r, 200));
-    const r = await fetchUrl(url, { timeout: 20000 });
-    if (r.status === 503 || r.status === 429) {
-      if (cached) return cached.data; // return stale on rate limit
-      throw new Error(`GDELT rate limited (${r.status}) — try again in 60s`);
+  const doFetch = async () => {
+    // GDELT needs browser-like headers and referer — blocks API-looking clients
+    const gdeltHeaders = {
+      'User-Agent':   BROWSER_UA,
+      'Referer':      'https://www.gdeltproject.org/',
+      'Accept':       'application/json, */*',
+      'Origin':       'https://www.gdeltproject.org',
+      'Cache-Control':'no-cache',
+    };
+    const r = await fetchUrl(url, { headers: gdeltHeaders, timeout: 25000 });
+    if (r.status === 429 || r.status === 503) {
+      if (cached) { console.warn(`[GDELT] ${r.status} — serving stale cache`); return cached.data; }
+      throw new Error(`GDELT ${r.status} — rate limited, no cache yet`);
     }
-    if (r.status !== 200) throw new Error(`GDELT ${r.status}`);
-    return JSON.parse(r.data);
-  })();
-
-  gdeltInFlight.set(cacheKey, req);
-  try {
-    const data = await req;
+    if (r.status !== 200) throw new Error(`GDELT HTTP ${r.status}`);
+    const data = JSON.parse(r.data);
     gdeltCache.set(cacheKey, { data, ts: Date.now() });
+    return data;
+  };
+
+  const promise = doFetch();
+  gdeltInFlight.set(cacheKey, promise);
+  try {
+    const data = await promise;
     gdeltInFlight.delete(cacheKey);
     return { data, stale: false };
   } catch(e) {
     gdeltInFlight.delete(cacheKey);
-    if (cached) return { data: cached.data, stale: true }; // serve stale on error
+    if (cached) { console.warn('[GDELT] error, serving stale:', e.message); return { data: cached.data, stale: true }; }
     throw e;
   }
 }
@@ -369,48 +408,61 @@ app.get('/api/intel/feed', async (req, res) => {
   const keyword  = (req.query.q || '').replace(/[^\w\s"'()|&-]/g, '').trim();
   const timespan = ['1h','6h','12h','24h','7d'].includes(req.query.timespan) ? req.query.timespan : '24h';
   const maxrecs  = Math.min(parseInt(req.query.limit) || 50, 250);
+  const query    = keyword || 'war OR attack OR military OR protest OR disaster';
+  const cacheKey = `feed_${query}_${timespan}`;
 
-  // Simpler default query — broad terms less likely to 503
-  const query = keyword || 'war OR attack OR military OR protest OR disaster OR earthquake';
-  const cacheKey = `feed_${query}_${timespan}_${maxrecs}`;
-  const cacheAge = 5 * 60 * 1000; // 5 min
-
+  // Try v2 DOC API first
+  let articles = null;
   try {
     const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(query)}&mode=artlist&maxrecords=${maxrecs}&timespan=${timespan}&sort=DateDesc&format=json`;
-    const { data, stale } = await fetchGdelt(url, cacheKey, cacheAge);
-
-    const articles = (data.articles || []).map((a, i) => ({
-      id:            i,
-      url:           a.url,
-      title:         a.title || '(no title)',
-      source:        a.domain,
-      language:      a.language || 'English',
-      country:       a.sourcecountry || '',
-      image:         a.socialimage || null,
-      date:          a.seendate,
-      tone:          a.tone != null ? parseFloat(a.tone) : null,
-    }));
-
-    // Corroboration: group by first 5 words of title
-    const titleMap = new Map();
-    for (const art of articles) {
-      const key = art.title.toLowerCase().replace(/[^a-z0-9 ]/g,'').split(' ').slice(0,5).join(' ');
-      if (!titleMap.has(key)) titleMap.set(key, 0);
-      titleMap.set(key, titleMap.get(key) + 1);
-    }
-    for (const art of articles) {
-      const key = art.title.toLowerCase().replace(/[^a-z0-9 ]/g,'').split(' ').slice(0,5).join(' ');
-      art.corroboration = titleMap.get(key) || 1;
-    }
-    articles.sort((a, b) => (b.corroboration - a.corroboration));
-
-    const payload = { articles, count: articles.length, query, timespan, ts: Date.now(), stale };
-    if (!stale) gdeltCache.set(cacheKey, { data, ts: Date.now() });
-    res.set('Cache-Control', 'max-age=300').json(payload);
+    const { data, stale } = await fetchGdelt(url, cacheKey, 5*60*1000);
+    articles = data.articles || [];
+    if (stale) res.set('X-Cache','stale');
   } catch(e) {
-    console.warn('[GDELT] feed error:', e.message);
-    res.status(503).json({ articles: [], error: e.message, query, hint: 'GDELT may be temporarily rate-limited. Cached data will serve once available.' });
+    console.warn('[GDELT v2] failed:', e.message, '— trying v1');
   }
+
+  // Fallback: GDELT v1 full-text search (different endpoint, often works when v2 is down)
+  if (!articles) {
+    try {
+      const v1Key = `v1_${query}_${timespan}`;
+      const v1url = `https://api.gdeltproject.org/api/v1/search_ftxtsearch/search?q=${encodeURIComponent(query)}&output=artlist&maxrecords=${maxrecs}&format=json`;
+      const { data } = await fetchGdelt(v1url, v1Key, 5*60*1000);
+      // v1 uses same article list format
+      articles = data.articles || data.artlist || [];
+    } catch(e) {
+      console.warn('[GDELT v1] also failed:', e.message);
+    }
+  }
+
+  if (!articles) {
+    return res.status(503).json({ articles: [], error: 'GDELT unavailable on both v1 and v2 endpoints', query });
+  }
+
+  const mapped = articles.map((a, i) => ({
+    id:            i,
+    url:           a.url,
+    title:         a.title || '(no title)',
+    source:        a.domain,
+    language:      a.language || 'English',
+    country:       a.sourcecountry || '',
+    date:          a.seendate,
+    tone:          a.tone != null ? parseFloat(a.tone) : null,
+  }));
+
+  // Corroboration score
+  const titleMap = new Map();
+  for (const art of mapped) {
+    const key = art.title.toLowerCase().replace(/[^a-z0-9 ]/g,'').split(' ').slice(0,5).join(' ');
+    titleMap.set(key, (titleMap.get(key) || 0) + 1);
+  }
+  for (const art of mapped) {
+    const key = art.title.toLowerCase().replace(/[^a-z0-9 ]/g,'').split(' ').slice(0,5).join(' ');
+    art.corroboration = titleMap.get(key) || 1;
+  }
+  mapped.sort((a, b) => b.corroboration - a.corroboration);
+
+  res.set('Cache-Control','max-age=300').json({ articles: mapped, count: mapped.length, query, timespan, ts: Date.now() });
 });
 
 // GDELT geographic events — for map pins
@@ -789,6 +841,21 @@ app.get('/api/enrich/satellite/:norad', async (req, res) => {
   }
 
   res.json(setCache(ck, result));
+});
+
+app.get('/api/debug/ships', async (req, res) => {
+  const results = {};
+  const test = async (name, url, hdrs={}) => {
+    try {
+      const r = await fetchUrl(url, { headers: hdrs, timeout: 10000 });
+      results[name] = { status: r.status, bytes: r.data.length, preview: r.data.substring(0,100) };
+    } catch(e) { results[name] = { error: e.message }; }
+  };
+  await test('digitraffic_locations', 'https://meri.digitraffic.fi/api/ais/v1/locations', { 'Digitraffic-User': 'ARGUS/7.0' });
+  await test('kystverket',  'https://kystdatahuset.no/ws/api/ais/positions/all', { 'Referer':'https://kystdatahuset.no/' });
+  await test('vesselfinder','https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=50&minlon=-5&maxlat=60&maxlon=10&z=5', { 'Referer':'https://www.vesselfinder.com/' });
+  await test('gdelt_v2', 'https://api.gdeltproject.org/api/v2/doc/doc?query=war&mode=artlist&maxrecords=2&timespan=1h&format=json', { 'Referer':'https://www.gdeltproject.org/' });
+  res.json({ ts: new Date().toISOString(), shipCache: shipPositions.size, fallbackAge: shipFallback.ts ? Date.now()-shipFallback.ts : null, results });
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
