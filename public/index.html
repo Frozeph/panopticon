@@ -18,7 +18,7 @@
   <div id="topbar">
     <div class="tb-left">
       <span class="sys-label">ARGUS</span>
-      <span class="sys-sublabel">GLOBAL INTELLIGENCE SYSTEM // v2.0</span>
+      <span class="sys-sublabel">GLOBAL INTELLIGENCE SYSTEM // v3.0</span>
     </div>
     <div class="tb-center">
       <div class="status-row">
@@ -112,6 +112,24 @@
           <span class="layer-name">WEATHER GRID</span>
           <span class="layer-count" id="weather-count">0</span>
         </label>
+      </div>
+
+      <div class="layer-group">
+        <div class="layer-group-title">// SAT IMAGERY</div>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-sat-imagery">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="layer-name">SATELLITE VIEW</span>
+        </label>
+        <select id="sat-imagery-select" class="imagery-select">
+          <option value="none">— Select Layer —</option>
+          <option value="modis_true">MODIS True Colour</option>
+          <option value="viirs_true">VIIRS True Colour</option>
+          <option value="nightlights">VIIRS Nighttime Lights</option>
+          <option value="sst">Sea Surface Temp</option>
+          <option value="land_temp">Land Surface Temp</option>
+          <option value="rain_radar">Rain Radar (GPM)</option>
+        </select>
         <label class="layer-toggle">
           <input type="checkbox" id="toggle-wildfires">
           <span class="toggle-track"><span class="toggle-thumb"></span></span>

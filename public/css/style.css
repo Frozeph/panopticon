@@ -110,23 +110,23 @@ body.mode-crt #cesiumContainer { animation: crt-flicker 0.1s infinite; }
 #topbar {
   position: fixed; top: 0; left: 0; right: 0;
   z-index: 100;
-  height: 56px;
+  height: 52px;
   display: flex; align-items: center; justify-content: space-between;
-  padding: 0 16px;
-  background: linear-gradient(180deg, rgba(0,10,0,0.95) 0%, rgba(0,10,0,0.7) 100%);
-  border-bottom: 1px solid var(--panel-border-bright);
-  box-shadow: 0 0 20px rgba(0,255,65,0.1);
+  padding: 0 20px;
+  background: rgba(0, 6, 0, 0.97);
+  border-bottom: 1px solid rgba(0,255,65,0.3);
+  box-shadow: 0 1px 0 rgba(0,255,65,0.08), 0 4px 24px rgba(0,0,0,0.8);
 }
 
-.tb-left { display: flex; flex-direction: column; gap: 2px; }
+.tb-left { display: flex; align-items: baseline; gap: 12px; }
 .sys-label {
   font-family: var(--font-display);
-  font-size: 18px; font-weight: 900;
-  letter-spacing: 0.2em;
+  font-size: 16px; font-weight: 900;
+  letter-spacing: 0.25em;
   color: var(--green);
-  text-shadow: 0 0 12px var(--green);
+  text-shadow: 0 0 16px rgba(0,255,65,0.5);
 }
-.sys-sublabel { font-size: 9px; color: var(--text-muted); letter-spacing: 0.15em; }
+.sys-sublabel { font-size: 8px; color: var(--text-muted); letter-spacing: 0.18em; margin-top: 1px; }
 
 .tb-center { display: flex; flex-direction: column; align-items: center; gap: 3px; }
 .status-row {
@@ -156,28 +156,38 @@ body.mode-crt #cesiumContainer { animation: crt-flicker 0.1s infinite; }
 #left-panel, #right-panel {
   position: fixed; top: 64px;
   z-index: 100;
-  width: 220px;
-  background: var(--panel-bg);
+  width: 236px;
+  background: rgba(0, 8, 0, 0.92);
   border: 1px solid var(--panel-border);
-  padding: 12px;
-  backdrop-filter: blur(8px);
-  max-height: calc(100vh - 120px);
+  padding: 14px;
+  backdrop-filter: blur(12px);
+  max-height: calc(100vh - 100px);
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--green-dark) transparent;
+  box-shadow: 0 4px 32px rgba(0,0,0,0.6), inset 0 1px 0 rgba(0,255,65,0.08);
 }
-#left-panel { left: 12px; border-left: 2px solid var(--panel-border-bright); }
-#right-panel { right: 12px; border-right: 2px solid var(--panel-border-bright); }
+#left-panel {
+  left: 12px;
+  border-left: 2px solid var(--panel-border-bright);
+  border-top: 1px solid var(--panel-border-bright);
+}
+#right-panel {
+  right: 12px;
+  border-right: 2px solid var(--panel-border-bright);
+  border-top: 1px solid var(--panel-border-bright);
+}
 
 .panel-header {
   font-family: var(--font-display);
-  font-size: 9px; font-weight: 700;
-  letter-spacing: 0.2em;
+  font-size: 8px; font-weight: 700;
+  letter-spacing: 0.25em;
   color: var(--green);
-  text-shadow: 0 0 8px var(--green);
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--panel-border);
+  text-shadow: 0 0 10px rgba(0,255,65,0.6);
+  padding-bottom: 7px;
+  border-bottom: 1px solid rgba(0,255,65,0.15);
   margin-bottom: 10px;
+  display: flex; align-items: center; justify-content: space-between;
 }
 
 .panel-section-gap { height: 16px; }
@@ -354,11 +364,12 @@ body.mode-crt #cesiumContainer { animation: crt-flicker 0.1s infinite; }
 #bottombar {
   position: fixed; bottom: 0; left: 0; right: 0;
   z-index: 100;
-  height: 32px;
+  height: 30px;
   display: flex; align-items: center; justify-content: space-between;
-  padding: 0 16px;
-  background: linear-gradient(0deg, rgba(0,10,0,0.95) 0%, rgba(0,10,0,0.7) 100%);
-  border-top: 1px solid var(--panel-border);
+  padding: 0 20px;
+  background: rgba(0, 6, 0, 0.97);
+  border-top: 1px solid rgba(0,255,65,0.2);
+  box-shadow: 0 -1px 0 rgba(0,255,65,0.05);
   font-size: 10px;
 }
 
@@ -580,6 +591,27 @@ body.mode-crt #cesiumContainer { animation: crt-flicker 0.1s infinite; }
   cursor: pointer;
 }
 .text-select option { background: #000a00; }
+
+/* Satellite imagery layer selector */
+.imagery-select {
+  width: 100%;
+  background: rgba(0,20,0,0.85);
+  border: 1px solid rgba(0,255,65,0.2);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  padding: 5px 6px;
+  outline: none;
+  cursor: pointer;
+  margin-top: 5px;
+  border-left: 2px solid rgba(0,255,65,0.4);
+  transition: border-color 0.2s;
+}
+.imagery-select:hover, .imagery-select:focus {
+  border-color: var(--green);
+  color: var(--green);
+}
+.imagery-select option { background: #000a00; }
 
 .action-btn {
   background: rgba(0,255,65,0.08);

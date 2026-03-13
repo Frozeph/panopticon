@@ -536,35 +536,48 @@ function clearTraffic() {
 
 // ─── NASA GIBS SATELLITE IMAGERY ──────────────────────────────────────────────
 const GIBS_LAYERS = {
-  'MODIS Terra (True Color)': {
+  modis_true: {
+    label: 'MODIS Terra True Colour',
     url: 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.jpg',
     tileMatrixSetID: 'GoogleMapsCompatible', format: 'image/jpeg', maximumLevel: 9,
   },
-  'VIIRS Nighttime Lights': {
+  viirs_true: {
+    label: 'VIIRS True Colour',
+    url: 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.jpg',
+    tileMatrixSetID: 'GoogleMapsCompatible', format: 'image/jpeg', maximumLevel: 9,
+  },
+  nightlights: {
+    label: 'VIIRS Nighttime Lights',
     url: 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_Black_Marble/default/2016-01-01/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.jpg',
     tileMatrixSetID: 'GoogleMapsCompatible', format: 'image/jpeg', maximumLevel: 8,
   },
-  'MODIS Sea Surface Temp': {
+  sst: {
+    label: 'Sea Surface Temperature',
+    url: 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/GHRSST_L4_MUR_Sea_Surface_Temperature/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.png',
+    tileMatrixSetID: 'GoogleMapsCompatible', format: 'image/png', maximumLevel: 7,
+  },
+  land_temp: {
+    label: 'Land Surface Temperature',
     url: 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_Land_Surface_Temp_Day/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.png',
     tileMatrixSetID: 'GoogleMapsCompatible', format: 'image/png', maximumLevel: 7,
   },
-  'Suomi VIIRS (True Color)': {
-    url: 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.jpg',
-    tileMatrixSetID: 'GoogleMapsCompatible', format: 'image/jpeg', maximumLevel: 9,
+  rain_radar: {
+    label: 'GPM Rain Rate',
+    url: 'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/GPM_3IMERGDE_06_precipitationCal/default/{Time}/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.png',
+    tileMatrixSetID: 'GoogleMapsCompatible', format: 'image/png', maximumLevel: 6,
   },
 };
 
 let gibsLayer = null;
 
-async function setGibsLayer(name) {
+async function setGibsLayer(key) {
   if (!S.viewer) return;
-  // Remove existing GIBS layer
   if (gibsLayer) {
     S.viewer.imageryLayers.remove(gibsLayer, true);
     gibsLayer = null;
   }
-  if (!name || name === 'none') { addLog('SAT IMAGERY: OFF'); return; }
-  const def = GIBS_LAYERS[name];
+  if (!key || key === 'none') { addLog('SAT IMAGERY: OFF'); return; }
+  const def = GIBS_LAYERS[key];
   if (!def) return;
 
   const today = new Date().toISOString().slice(0,10);
@@ -572,7 +585,7 @@ async function setGibsLayer(name) {
 
   try {
     const provider = await Cesium.WebMapTileServiceImageryProvider.fromUrl(url, {
-      layer:          name,
+      layer:          key,
       style:          'default',
       tileMatrixSetID: def.tileMatrixSetID,
       format:         def.format,
@@ -581,9 +594,9 @@ async function setGibsLayer(name) {
     });
     gibsLayer = S.viewer.imageryLayers.addImageryProvider(provider);
     gibsLayer.alpha = 0.85;
-    addLog(`SAT IMAGERY: ${name.toUpperCase()}`);
+    addLog(`SAT IMG: ${def.label.toUpperCase()}`);
   } catch(e) {
-    addLog(`GIBS ERROR: ${e.message.substring(0,30)}`);
+    addLog(`GIBS ERR: ${e.message.substring(0,25)}`);
   }
 }
 
@@ -1515,7 +1528,32 @@ function setupUI() {
     () => { if(S.layers.wildfires.ds) S.viewer?.dataSources.remove(S.layers.wildfires.ds,true); clearInterval(S.intervals.fires); document.getElementById('fire-count').textContent='0'; }
   );
 
-  // NASA GIBS satellite imagery selector
+  // Satellite imagery toggle + selector
+  const satImgToggle = document.getElementById('toggle-sat-imagery');
+  const satImgSelect = document.getElementById('sat-imagery-select');
+
+  satImgToggle?.addEventListener('change', () => {
+    if (satImgToggle.checked) {
+      const key = satImgSelect?.value;
+      if (key && key !== 'none') setGibsLayer(key);
+      else { satImgSelect.value = 'modis_true'; setGibsLayer('modis_true'); }
+    } else {
+      setGibsLayer(null);
+    }
+  });
+
+  satImgSelect?.addEventListener('change', e => {
+    const key = e.target.value;
+    if (key === 'none') {
+      satImgToggle.checked = false;
+      setGibsLayer(null);
+    } else {
+      satImgToggle.checked = true;
+      setGibsLayer(key);
+    }
+  });
+
+  // Legacy gibs-select fallback
   document.getElementById('gibs-select')?.addEventListener('change', e => {
     setGibsLayer(e.target.value === 'none' ? null : e.target.value);
   });
