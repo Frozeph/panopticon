@@ -718,18 +718,7 @@ app.get('/api/seismic/stations', async (req, res) => {
     res.set('Cache-Control', 'max-age=3600');
     res.json(stationCache.data);
   } catch (e) {
-    // Fallback: well-known IRIS/USGS global stations
-    const fallback = [
-      { id:'IU.ANMO', name:'Albuquerque NM', network:'IU', code:'ANMO', lat:34.946, lon:-106.457, elev:1740 },
-      { id:'IU.COLA', name:'College AK',     network:'IU', code:'COLA', lat:64.874, lon:-147.861, elev:84 },
-      { id:'IU.MAJO', name:'Matsushiro Japan',network:'IU', code:'MAJO', lat:36.541, lon:138.207, elev:418 },
-      { id:'IU.TATO', name:'Taipei Taiwan',  network:'IU', code:'TATO', lat:24.975, lon:121.497, elev:74 },
-      { id:'II.BFO',  name:'Black Forest Germany',network:'II', code:'BFO', lat:48.330, lon:8.330, elev:589 },
-      { id:'II.MSVF', name:'Monasavu Fiji',  network:'II', code:'MSVF', lat:-17.747, lon:178.053, elev:620 },
-      { id:'G.ECH',   name:'Echery France',  network:'G',  code:'ECH',  lat:48.216, lon:7.159, elev:580 },
-      { id:'IC.BJT',  name:'Beijing China',  network:'IC', code:'BJT',  lat:40.018, lon:116.168, elev:120 },
-    ];
-    res.json({ stations: fallback, total: fallback.length, fallback: true });
+    res.status(503).json({ stations: [], error: e.message });
   }
 });
 
@@ -741,6 +730,44 @@ app.get('/api/health', (req, res) => {
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
+
+// Status — tells frontend which keys are configured server-side
+app.get('/api/status', (req, res) => {
+  res.json({
+    shodan:    !!(process.env.SHODAN_API_KEY),
+    aisstream: !!(process.env.AISSTREAM_KEY),
+  });
+});
+
+// Debug flights
+app.get('/api/debug/flights', async (req, res) => {
+  try {
+    const start = Date.now();
+    const r = await fetchUrl('https://opensky-network.org/api/states/all');
+    const ms = Date.now() - start;
+    if (r.status !== 200) return res.json({ ok: false, status: r.status, ms, snippet: String(r.data || '').substring(0, 300) });
+    const d = JSON.parse(r.data);
+    res.json({ ok: true, ms, count: (d.states || []).length, sample: (d.states || []).slice(0, 2) });
+  } catch (e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Debug ships
+app.get('/api/debug/ships', async (req, res) => {
+  const aisKey = process.env.AISSTREAM_KEY || '';
+  const out = { aisstream_key_present: !!aisKey, results: [] };
+  if (aisKey) {
+    try {
+      const r = await fetchUrl('https://api.aisstream.io/v0/latest-positions', { headers: { 'Authorization': `Bearer ${aisKey}`, 'Accept': 'application/json' } });
+      out.results.push({ src: 'aisstream', status: r.status, bytes: (r.data||'').length, snippet: String(r.data||'').substring(0,300) });
+    } catch (e) { out.results.push({ src: 'aisstream', error: e.message }); }
+  }
+  try {
+    const r = await fetchUrl('https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=45&minlon=-10&maxlat=60&maxlon=10&z=4', { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.vesselfinder.com/' } });
+    out.results.push({ src: 'vesselfinder', status: r.status, bytes: (r.data||'').length, snippet: String(r.data||'').substring(0,300) });
+  } catch (e) { out.results.push({ src: 'vesselfinder', error: e.message }); }
+  res.json(out);
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔══════════════════════════════════════════════╗

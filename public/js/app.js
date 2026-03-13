@@ -47,6 +47,21 @@ function meshIcon(online) { const c=online?'#00ff88':'#888'; return svg(18,18,`<
 function stationIcon()    { return svg(16,16,`<rect x="3" y="8" width="10" height="6" fill="none" stroke="#00ddff" stroke-width="1.2"/><line x1="8" y1="2" x2="8" y2="8" stroke="#00ddff" stroke-width="1.5"/><circle cx="8" cy="2" r="1.5" fill="#00ddff"/>`); }
 
 // ── STATE ─────────────────────────────────────────────────────────────────────
+let serverStatus = { shodan: false, aisstream: false };
+
+async function checkServerStatus() {
+  try {
+    const r = await fetch('/api/status');
+    if (r.ok) serverStatus = await r.json();
+    console.log('[ARGUS] Server status:', serverStatus);
+    if (serverStatus.shodan) {
+      addLog('SHODAN: KEY CONFIGURED (SERVER)');
+      const prompt = document.getElementById('shodan-key-prompt');
+      if (prompt) prompt.style.display = 'none';
+    }
+  } catch (e) { console.warn('[ARGUS] status check failed:', e.message); }
+}
+
 const S = {
   viewer:null,
   layers:{
@@ -75,6 +90,7 @@ const S = {
 
 // ── BOOT ──────────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded',()=>{
+  checkServerStatus();
   setupTokenModal(); setupUI(); startClock();
   loadShodanPresets(); refreshStorageStats(); refreshShodanCredits();
 });
@@ -99,6 +115,14 @@ function setupTokenModal() {
 
 async function initCesium(token) {
   Cesium.Ion.defaultAccessToken = token;
+  // Show token status in topbar
+  const tokenIndicator = document.getElementById('token-status');
+  const isDefault = token.startsWith('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlYWE1');
+  if (tokenIndicator) {
+    tokenIndicator.textContent = isDefault ? '⚠ DEFAULT TOKEN' : '✓ CESIUM TOKEN';
+    tokenIndicator.style.color = isDefault ? 'var(--amber)' : 'var(--green)';
+    tokenIndicator.title = isDefault ? 'Using limited default token. Enter your own at ion.cesium.com for full features.' : 'Custom Cesium Ion token active';
+  }
   const terrainProvider = await Cesium.createWorldTerrainAsync().catch(()=>undefined);
   S.viewer = new Cesium.Viewer('cesiumContainer',{
     terrainProvider, imageryProvider:false, baseLayerPicker:false,
@@ -145,7 +169,10 @@ async function loadSatellites() {
       if(r.ok){ const t=await r.text(); all=all.concat(parseTLE(t)); }
     } catch{}
   }
-  if(!all.length) all=demoTLE();
+  if(!all.length) {
+    showToast('TLE: No satellite data received', 'warn');
+    return;
+  }
   const seen=new Set();
   S.tleData=all.filter(s=>{if(seen.has(s.name))return false;seen.add(s.name);return true;});
   document.getElementById('sat-count').textContent=S.tleData.length;
@@ -163,14 +190,7 @@ function parseTLE(txt) {
   return out;
 }
 
-function demoTLE() {
-  return [
-    {name:'ISS (ZARYA)',  tle1:'1 25544U 98067A   24001.50000000  .00016717  00000-0  10270-3 0  9993',tle2:'2 25544  51.6400 208.9163 0006317  86.9006  73.1692 15.49560026430115'},
-    {name:'TIANGONG',     tle1:'1 48274U 21035A   24001.50000000  .00016717  00000-0  10270-3 0  9994',tle2:'2 48274  41.4700 208.9163 0006317  86.9006  73.1692 15.59560026430115'},
-    {name:'HUBBLE (HST)', tle1:'1 20580U 90037B   24001.50000000  .00001000  00000-0  10000-3 0  9995',tle2:'2 20580  28.4700 180.9163 0002817  86.9006  73.1692 15.09560026430115'},
-    {name:'NOAA-19',      tle1:'1 33591U 09005A   24001.50000000  .00000100  00000-0  10000-3 0  9996',tle2:'2 33591  99.1700 208.9163 0012817  86.9006  73.1692 14.12560026430115'},
-  ];
-}
+
 
 function renderSatellites() {
   if(!S.layers.satellites.on||!S.viewer) return;
@@ -252,7 +272,10 @@ async function loadFlights(mil=false) {
     }
     applyFlightFilters(mil);
   } catch(e){
-    addLog(`${mil?'MIL':'CIVIL'} FEED: ${e.message.substring(0,28)}`);
+    const msg = e.message||'unknown error';
+    console.warn(`[ARGUS] ${mil?'Military':'Flights'} fetch failed:`, msg);
+    addLog(`${mil?'MIL':'CIVIL'}: ${msg.substring(0,28)}`);
+    showToast(`${mil?'Military':'Flights'}: ${msg.substring(0,40)}`, 'warn');
     if(mil) S.rawMilitary=[]; else S.rawFlights=[];
     applyFlightFilters(mil);
   }
@@ -276,48 +299,92 @@ function applyFlightFilters(mil=false){
   renderFlights(filtered,mil);
 }
 
-function renderFlights(states,mil=false){
-  if(!S.viewer) return;
-  const key=mil?'military':'flights';
-  if(S.layers[key].ds) S.viewer.dataSources.remove(S.layers[key].ds,true);
-  const ds=new Cesium.CustomDataSource(key);
-  const full=S.detMode==='full';
-  for(const s of states){
-    if(!s||s[5]==null||s[6]==null) continue;
-    const lon=+s[5],lat=+s[6],alt=+(s[13]||s[7]||1000)+500;
-    if(isNaN(lon)||isNaN(lat)) continue;
-    const cs=(s[1]||s[0]||'UNKN').trim()||'UNKN';
-    const airline=S.airlineMap[cs];
-    const hex=mil?'#ff8c00':(airline?.color||'#00aaff');
-    const color=Cesium.Color.fromCssColorString(hex).withAlpha(0.95);
+function renderFlights(states, mil=false) {
+  if (!S.viewer) return;
+  const key = mil ? 'military' : 'flights';
+  if (S.layers[key].ds) S.viewer.dataSources.remove(S.layers[key].ds, true);
+  const ds = new Cesium.CustomDataSource(key);
+  const full = S.detMode === 'full';
+
+  for (const s of states) {
+    if (!s || s[5] == null || s[6] == null) continue;
+    const lon = +s[5], lat = +s[6];
+    const altM = +(s[13] || s[7] || 0);
+    if (isNaN(lon) || isNaN(lat)) continue;
+    const icao = s[0] || '';
+    const cs   = (s[1] || icao || 'UNKN').trim() || 'UNKN';
+    const onGround  = s[8] === true || altM < 50;
+    const trackDeg  = +(s[10] || 0);
+    const spdKt     = Math.round(+(s[9] || 0) * 1.944);
+    const altFt     = Math.round(altM * 3.28084);
+    const color     = altitudeColor(altM, onGround);
+    const cat       = getAircraftCategory(cs, mil);
+    const iconSize  = cat === 'heli' ? 20 : mil ? 22 : 20;
+    const cesColor  = Cesium.Color.fromCssColorString(color);
+    const airline   = S.airlineMap[cs];
+    const renderAlt = onGround ? 10 : Math.max(altM, 100);
+
+    // Trail
+    if (!S._flightTrails) S._flightTrails = new Map();
+    if (!S._flightTrails.has(icao)) S._flightTrails.set(icao, []);
+    const trail = S._flightTrails.get(icao);
+    trail.push([lon, lat, renderAlt]);
+    if (trail.length > 8) trail.shift();
+
+    if (trail.length >= 2) {
+      ds.entities.add({
+        id: `${key}_trail_${icao}`,
+        polyline: {
+          positions: trail.map(p => Cesium.Cartesian3.fromDegrees(p[0], p[1], p[2])),
+          width: 1.5,
+          material: new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.05, color: cesColor.withAlpha(0.45) }),
+          arcType: Cesium.ArcType.NONE,
+          clampToGround: onGround,
+        },
+      });
+    }
+
+    const labelText = full
+      ? [cs, airline ? airline.name.substring(0,16) : '', `${altFt.toLocaleString()}ft  ${spdKt}kt`].filter(Boolean).join('\n')
+      : cs + '\n' + (onGround ? 'GND' : Math.round(altFt/100)*100 + 'ft');
+
     ds.entities.add({
-      id:`${key}_${s[0]}`,name:cs,
-      position:Cesium.Cartesian3.fromDegrees(lon,lat,alt),
-      billboard:{
-        image:planeIcon(hex,mil),
-        width:mil?20:16,height:mil?20:16,
-        rotation:Cesium.Math.toRadians(-(+(s[10]||0))),
-        alignedAxis:Cesium.Cartesian3.UNIT_Z,
-        scaleByDistance:new Cesium.NearFarScalar(1e4,1.8,5e6,0.7),
-        translucencyByDistance:new Cesium.NearFarScalar(1e6,1,1e7,0.2),
+      id: `${key}_${icao}`,
+      name: cs,
+      position: Cesium.Cartesian3.fromDegrees(lon, lat, renderAlt),
+      billboard: {
+        image: planeIcon(color, cat, iconSize),
+        width: iconSize, height: iconSize,
+        rotation: Cesium.Math.toRadians(-trackDeg),
+        alignedAxis: Cesium.Cartesian3.UNIT_Z,
+        scaleByDistance:        new Cesium.NearFarScalar(5e3, 1.6, 8e6, 0.5),
+        translucencyByDistance: new Cesium.NearFarScalar(5e5, 1, 1e7, 0.1),
+        disableDepthTestDistance: onGround ? 0 : Number.POSITIVE_INFINITY,
       },
-      label:full?{
-        text:cs.substring(0,8)+(airline?`\n${airline.name.substring(0,14)}`:''),
-        font:'9px Share Tech Mono',fillColor:color,
-        outlineColor:Cesium.Color.BLACK,outlineWidth:2,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset:new Cesium.Cartesian2(10,0),
-        translucencyByDistance:new Cesium.NearFarScalar(5e5,1,5e6,0),
-        showBackground:true,backgroundColor:Cesium.Color.BLACK.withAlpha(0.6),
-        backgroundPadding:new Cesium.Cartesian2(3,2),
-      }:undefined,
-      properties:{type:mil?'military':'flight',data:s,airline},
+      label: {
+        text: labelText,
+        font: '9px Share Tech Mono',
+        fillColor: cesColor,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        pixelOffset: new Cesium.Cartesian2(iconSize/2 + 4, 0),
+        horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
+        verticalOrigin: Cesium.VerticalOrigin.CENTER,
+        translucencyByDistance: new Cesium.NearFarScalar(full ? 2e5 : 5e4, 1, full ? 8e6 : 3e6, 0),
+        showBackground: true,
+        backgroundColor: Cesium.Color.fromBytes(0, 0, 0, 160),
+        backgroundPadding: new Cesium.Cartesian2(4, 3),
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+      properties: { type: mil ? 'military' : 'flight', data: s, airline },
     });
   }
   S.viewer.dataSources.add(ds);
-  S.layers[key].ds=ds;
-  document.getElementById(mil?'mil-count':'flight-count').textContent=states.length;
-  addLog(`${states.length} ${mil?'MIL':'CIVIL'} FLIGHTS`);
-  if(!mil) updateFilterStats(states);
+  S.layers[key].ds = ds;
+  document.getElementById(mil ? 'mil-count' : 'flight-count').textContent = states.length;
+  addLog(`${states.length} ${mil ? 'MIL' : 'CIVIL'} FLIGHTS`);
+  if (!mil) updateFilterStats(states);
 }
 
 function updateFilterStats(states){
@@ -371,7 +438,7 @@ async function loadSeismicStations(){
     const r=await fetch('/api/seismic/stations'); if(!r.ok) throw new Error();
     const data=await r.json();
     renderSeismicStations(data.stations||[]);
-  } catch{ addLog('SEISMIC STATIONS: UNAVAILABLE'); }
+  } catch{ addLog('SEISMIC STATIONS: UNAVAILABLE'); showToast('Seismic stations feed unavailable', 'warn'); }
 }
 
 function renderSeismicStations(stations){
@@ -412,7 +479,7 @@ async function loadGpsJam(){
   try{
     const r=await fetch('/api/gpsjam'); if(!r.ok) throw new Error(`HTTP ${r.status}`);
     renderGpsJam(await r.json());
-  } catch(e){ addLog(`GPSJAM: ${e.message.substring(0,25)}`); }
+  } catch(e){ addLog(`GPSJAM: ${e.message.substring(0,25)}`); showToast(`GPS Jamming feed unavailable`, 'warn'); }
 }
 
 function renderGpsJam(geojson){
@@ -468,7 +535,12 @@ async function loadShips(){
   try{
     const r=await fetch('/api/ships'); if(!r.ok) throw new Error(`HTTP ${r.status}`);
     renderShips(await r.json());
-  } catch(e){ addLog(`AIS: ${e.message.substring(0,25)}`); renderShips([]); }
+  } catch(e){
+    console.warn('[ARGUS] Ships fetch failed:', e.message);
+    addLog(`AIS: ${e.message.substring(0,25)}`);
+    showToast(`AIS vessels: ${e.message.substring(0,40)}`, 'warn');
+    renderShips([]);
+  }
 }
 
 async function refreshShipsBbox(bbox){
@@ -481,39 +553,85 @@ async function refreshShipsBbox(bbox){
   } catch{loadShips();}
 }
 
-function renderShips(ships){
-  if(!S.viewer) return;
-  if(S.layers.ships.ds) S.viewer.dataSources.remove(S.layers.ships.ds,true);
-  const ds=new Cesium.CustomDataSource('ships');
-  for(const s of ships){
-    if(!s.lat||!s.lon) continue;
-    const sog=+(s.sog||0),cog=+(s.cog||0);
-    const name=(s.name||s.mmsi||'UNKNOWN').substring(0,16);
-    const t=+(s.type||0);
-    const hex=t>=80?'#ff4444':t>=70?'#4488ff':t>=60?'#44ff88':'#00ffcc';
+function renderShips(ships) {
+  if (!S.viewer) return;
+  if (S.layers.ships.ds) S.viewer.dataSources.remove(S.layers.ships.ds, true);
+  const ds = new Cesium.CustomDataSource('ships');
+  const full = S.detMode === 'full';
+
+  for (const s of ships) {
+    if (!s.lat || !s.lon) continue;
+    const sog   = +(s.sog  || 0);
+    const cog   = +(s.cog  || 0);
+    const type  = +(s.type || 0);
+    const name  = (s.name || String(s.mmsi) || 'UNKNOWN').substring(0, 20).trim();
+    const mmsi  = String(s.mmsi || '');
+    const color = shipTypeColor(type);
+    const cesColor = Cesium.Color.fromCssColorString(color);
+
+    if (!S._shipTrails) S._shipTrails = new Map();
+    if (!S._shipTrails.has(mmsi)) S._shipTrails.set(mmsi, []);
+    const trail = S._shipTrails.get(mmsi);
+    trail.push([s.lon, s.lat]);
+    if (trail.length > 6) trail.shift();
+
+    if (trail.length >= 2) {
+      ds.entities.add({
+        id: `ship_trail_${mmsi}`,
+        polyline: {
+          positions: trail.map(p => Cesium.Cartesian3.fromDegrees(p[0], p[1], 5)),
+          width: 1.2,
+          material: new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.05, color: cesColor.withAlpha(0.4) }),
+          clampToGround: true,
+        },
+      });
+    }
+
+    const typeLabel = type>=80?'TANKER':type>=70?'CARGO':type>=60?'PASS.':type>=50?'HSC':type>=30?'FISHING':'VESSEL';
+    const labelText = full
+      ? [name, `${typeLabel}  ${sog.toFixed(1)}kt`, s.dest||''].filter(Boolean).join('\n')
+      : name + '\n' + sog.toFixed(1) + 'kt';
+
     ds.entities.add({
-      id:`ship_${s.mmsi}`,name,
-      position:Cesium.Cartesian3.fromDegrees(s.lon,s.lat,10),
-      billboard:{image:shipIcon(hex),width:18,height:18,
-        rotation:Cesium.Math.toRadians(-cog),alignedAxis:Cesium.Cartesian3.UNIT_Z,
-        scaleByDistance:new Cesium.NearFarScalar(1e3,2,5e6,0.6),
-        translucencyByDistance:new Cesium.NearFarScalar(5e5,1,5e6,0.2),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND},
-      label:{text:`${name}\n${sog.toFixed(1)}kt`,font:'8px Share Tech Mono',
-        fillColor:Cesium.Color.fromCssColorString(hex),
-        outlineColor:Cesium.Color.BLACK,outlineWidth:2,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset:new Cesium.Cartesian2(12,0),horizontalOrigin:Cesium.HorizontalOrigin.LEFT,
-        translucencyByDistance:new Cesium.NearFarScalar(5e4,1,1e6,0),
-        showBackground:true,backgroundColor:Cesium.Color.BLACK.withAlpha(0.55),
-        backgroundPadding:new Cesium.Cartesian2(3,2),
-        heightReference:Cesium.HeightReference.CLAMP_TO_GROUND},
-      properties:{type:'ship',data:s},
+      id: `ship_${mmsi}`,
+      name,
+      position: Cesium.Cartesian3.fromDegrees(s.lon, s.lat, 8),
+      billboard: {
+        image: shipIcon(color, type),
+        width: 20, height: 22,
+        rotation: Cesium.Math.toRadians(-cog),
+        alignedAxis: Cesium.Cartesian3.UNIT_Z,
+        scaleByDistance:        new Cesium.NearFarScalar(1e3, 2, 5e6, 0.55),
+        translucencyByDistance: new Cesium.NearFarScalar(3e5, 1, 3e6, 0.1),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+      label: {
+        text: labelText,
+        font: '9px Share Tech Mono',
+        fillColor: cesColor,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        pixelOffset: new Cesium.Cartesian2(14, 0),
+        horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
+        verticalOrigin: Cesium.VerticalOrigin.CENTER,
+        translucencyByDistance: new Cesium.NearFarScalar(3e4, 1, 8e5, 0),
+        showBackground: true,
+        backgroundColor: Cesium.Color.fromBytes(0, 0, 0, 155),
+        backgroundPadding: new Cesium.Cartesian2(4, 3),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+      properties: { type: 'ship', data: s },
     });
   }
-  S.viewer.dataSources.add(ds); S.layers.ships.ds=ds;
-  document.getElementById('ship-count').textContent=ships.length;
+  S.viewer.dataSources.add(ds);
+  S.layers.ships.ds = ds;
+  document.getElementById('ship-count').textContent = ships.length;
   addLog(`${ships.length} VESSELS`);
 }
+
 
 // ── CCTV ──────────────────────────────────────────────────────────────────────
 async function loadCctv(bbox){
@@ -571,7 +689,7 @@ async function loadMeshtastic(){
     const mr=await fetch('/api/meshtastic/messages');
     if(mr.ok){ const md=await mr.json(); S.meshtastic.messages=md.messages||[]; }
     updateMeshPanel();
-  } catch(e){ addLog(`MESHTASTIC: ${e.message.substring(0,28)}`); }
+  } catch(e){ addLog(`MESHTASTIC: ${e.message.substring(0,28)}`); showToast(`Meshtastic: ${e.message.substring(0,40)}`, 'warn'); }
 }
 
 function renderMeshtastic(nodes){
@@ -781,7 +899,7 @@ async function refreshWildfires(bbox){
     const r=await fetch(`/api/wildfires?minLat=${bbox.minLat.toFixed(2)}&maxLat=${bbox.maxLat.toFixed(2)}&minLon=${bbox.minLon.toFixed(2)}&maxLon=${bbox.maxLon.toFixed(2)}`);
     if(!r.ok) throw new Error();
     renderWildfires(await r.json());
-  } catch{addLog('FIRMS: UNAVAILABLE');}
+  } catch{ addLog('FIRMS: UNAVAILABLE'); showToast('Active fires: FIRMS feed unavailable', 'warn'); }
 }
 
 function renderWildfires(fires){
@@ -823,15 +941,22 @@ async function loadShodanPresets(){
 }
 
 async function executeShodanSearch(){
-  const key=S.shodan.key||localStorage.getItem('shodan_key')||'';
+  const localKey=S.shodan.key||localStorage.getItem('shodan_key')||'';
+  const serverHasKey = serverStatus.shodan;
   const query=document.getElementById('shodan-query-input')?.value?.trim();
   if(!query){addLog('SHODAN: NO QUERY');return;}
-  if(!key){addLog('SHODAN: NO API KEY');document.getElementById('shodan-key-prompt').style.display='block';return;}
+  if(!localKey && !serverHasKey){
+    addLog('SHODAN: NO API KEY');
+    document.getElementById('shodan-key-prompt').style.display='block';
+    return;
+  }
   const btn=document.getElementById('shodan-search-btn');
   if(btn){btn.disabled=true;btn.textContent='Scanning...';}
   addLog(`SHODAN: ${query.substring(0,28)}`);
+  const headers={'Content-Type':'application/json'};
+  if(localKey) headers['x-shodan-key']=localKey;  // only send if user provided one locally
   try{
-    const r=await fetch('/api/shodan/search',{method:'POST',headers:{'Content-Type':'application/json','x-shodan-key':key},body:JSON.stringify({query})});
+    const r=await fetch('/api/shodan/search',{method:'POST',headers,body:JSON.stringify({query})});
     const data=await r.json(); if(!r.ok) throw new Error(data.error||`HTTP ${r.status}`);
     renderShodanLayer(data.results);
     document.getElementById('shodan-result-count').textContent=`${data.results.length} / ${data.total?.toLocaleString()||'?'} results`;
@@ -876,7 +1001,8 @@ function clearShodanLayer(){
 async function refreshShodanCredits(){
   const key=S.shodan.key||localStorage.getItem('shodan_key')||'';
   try{
-    const r=await fetch('/api/shodan/credits',{headers:key?{'x-shodan-key':key}:{}});
+    const headers=key?{'x-shodan-key':key}:{};
+    const r=await fetch('/api/shodan/credits',{headers});
     const d=await r.json(); updateCreditDisplay(d);
   } catch{}
 }
@@ -1111,6 +1237,39 @@ function addLog(msg){
   S.logHistory.unshift(msg);if(S.logHistory.length>8)S.logHistory.pop();
   const el=document.getElementById('event-log');
   if(el) el.innerHTML=`<span class="log-label">EVT</span><span class="log-sep">//</span>${S.logHistory.slice(0,3).map(m=>`<span class="log-item">${m}</span>`).join('')}`;
+}
+
+// Toast notification — unobtrusive failure/warning indicator
+const _toastQ = [];
+let _toastActive = false;
+function showToast(msg, level='info') {
+  _toastQ.push({msg, level});
+  if (!_toastActive) processToastQ();
+}
+function processToastQ() {
+  if (!_toastQ.length) { _toastActive = false; return; }
+  _toastActive = true;
+  const {msg, level} = _toastQ.shift();
+  const colors = { info:'var(--green)', warn:'var(--amber)', error:'var(--red)' };
+  const el = document.createElement('div');
+  el.className = 'argus-toast';
+  el.style.cssText = `position:fixed;bottom:38px;left:50%;transform:translateX(-50%) translateY(8px);z-index:500;
+    background:rgba(4,14,10,0.95);border:1px solid ${colors[level]||colors.info};
+    color:${colors[level]||colors.info};font-family:var(--font-mono);font-size:10px;
+    letter-spacing:0.1em;padding:6px 16px;opacity:0;transition:all 0.25s ease;
+    pointer-events:none;white-space:nowrap;border-radius:2px;
+    box-shadow:0 0 12px rgba(0,0,0,0.6)`;
+  document.body.appendChild(el);
+  // Animate in
+  requestAnimationFrame(()=>{
+    el.style.opacity='0.92';
+    el.style.transform='translateX(-50%) translateY(0)';
+  });
+  setTimeout(()=>{
+    el.style.opacity='0';
+    el.style.transform='translateX(-50%) translateY(8px)';
+    setTimeout(()=>{ el.remove(); processToastQ(); }, 280);
+  }, 2800);
 }
 
 function flyTo(name){

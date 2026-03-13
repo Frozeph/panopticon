@@ -49,7 +49,10 @@
       </div>
       <div class="coord-block">
         <div class="coord-row"><span class="c-lbl">ALT</span><span id="alt-display" class="c-val">---km</span></div>
-        <div class="coord-row"><span id="lod-indicator" class="lod-badge lod-global">LOD: GLOBAL</span></div>
+        <div class="coord-row">
+          <span id="lod-indicator" class="lod-badge lod-global">LOD: GLOBAL</span>
+          <span id="token-status" style="font-size:8px;color:var(--text-muted);letter-spacing:0.1em;margin-left:8px">INIT...</span>
+        </div>
       </div>
     </div>
   </div>
@@ -360,6 +363,9 @@
       <div class="modal-actions">
         <button id="token-submit-btn" class="action-btn">Initialise System</button>
         <button id="token-skip-btn" class="dim-btn">Use Default (Limited)</button>
+      </div>
+      <div style="margin-top:10px;text-align:center">
+        <button onclick="localStorage.removeItem('cesium_token');location.reload()" style="background:none;border:none;color:var(--text-muted);font-size:9px;cursor:pointer;font-family:var(--font-mono);letter-spacing:0.1em">⟳ Clear saved token &amp; re-enter</button>
       </div>
     </div>
   </div>
