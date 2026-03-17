@@ -38,7 +38,7 @@ const S = {
   layers: {
     satellites: true, flights: true, military: true, ships: true,
     quakes: true, cctv: false, wildfires: false, jamming: false,
-    mesh: false, intel: true,
+    mesh: false, intel: true, osint: false, maven: false,
   },
   activeSatGroups: new Set(['visual']),
   showFootprints:  false,
@@ -244,8 +244,18 @@ document.querySelectorAll('.lbtn').forEach(btn => {
     if (layer === 'intel') {
       document.getElementById('intel-panel').style.display = on ? 'flex' : 'none';
       document.getElementById('cesiumContainer').style.right = on ? 'var(--intel-w)' : '0';
+      if (on) {
+        // Close competing panels
+        document.getElementById('osint-panel').style.display = 'none';
+        document.getElementById('maven-panel').style.display = 'none';
+        document.querySelector('[data-layer="osint"]')?.classList.remove('on');
+        document.querySelector('[data-layer="maven"]')?.classList.remove('on');
+        S.layers.osint = false; S.layers.maven = false;
+      }
       return;
     }
+    // Skip osint/maven — handled by their own listeners below
+    if (layer === 'osint' || layer === 'maven') return;
 
     if (!on) {
       const dsKey = LAYER_DS_KEY[layer];
@@ -558,8 +568,23 @@ function milIcon(color) {
 async function fetchFlights() {
   if (!S.layers.flights) return;
   const { lat, lon } = getCameraInfo();
-  const dist = Math.min(Math.max(S.cameraAlt / 1000 * 0.5, 100), 250);
 
+  // Global view (camera > 3000km alt): fetch multi-region global data
+  if (S.cameraAlt > 3000000) {
+    try {
+      const r = await fetch('/api/flights/global');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      const states = (data.states || []).filter(s => s[5]!=null && s[6]!=null);
+      renderFlights(states, false);
+      document.getElementById('cnt-air').textContent = states.length;
+      if (data._src) log(`Flights (global): ${states.length} from ${data._src}`);
+      return;
+    } catch(e) { log(`GlobalFlights: ${e.message}`, 'warn'); }
+  }
+
+  // Zoomed-in regional view
+  const dist = Math.min(Math.max(S.cameraAlt / 1000 * 0.5, 100), 250);
   try {
     const r = await fetch(`/api/flights/opensky?lat=${lat.toFixed(2)}&lon=${lon.toFixed(2)}&dist=${Math.round(dist)}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -1451,6 +1476,567 @@ async function init() {
   log('All systems nominal', 'ok');
   toast('ARGUS v7.0 online', 'ok', 3000);
 }
+
+// ─── OSINT SOCIAL FEED ────────────────────────────────────────────────────────
+let osintLoading = false;
+let osintPosts   = [];
+let osintFilter  = '';   // type filter: '', 'social', 'news', 'high-corr'
+
+// Layer toggle handlers for OSINT and MAVEN
+// Note: generic .lbtn handler runs first (toggles .on class + sets S.layers)
+// These handlers add panel-specific logic AFTER the generic one fires
+document.querySelector('[data-layer="osint"]')?.addEventListener('click', () => {
+  // Read final 'on' state (already toggled by generic handler)
+  const on = document.querySelector('[data-layer="osint"]').classList.contains('on');
+  const panel = document.getElementById('osint-panel');
+  panel.style.display = on ? 'flex' : 'none';
+  if (on) {
+    // Mutually exclusive with intel and maven panels
+    document.getElementById('intel-panel').style.display = 'none';
+    document.getElementById('maven-panel').style.display = 'none';
+    document.querySelector('[data-layer="intel"]')?.classList.remove('on');
+    document.querySelector('[data-layer="maven"]')?.classList.remove('on');
+    S.layers.intel = false; S.layers.maven = false;
+    document.getElementById('cesiumContainer').style.right = 'var(--intel-w)';
+    fetchOsint();
+  } else {
+    document.getElementById('cesiumContainer').style.right = '0';
+  }
+});
+
+document.querySelector('[data-layer="maven"]')?.addEventListener('click', () => {
+  const on = document.querySelector('[data-layer="maven"]').classList.contains('on');
+  const panel = document.getElementById('maven-panel');
+  panel.style.display = on ? 'flex' : 'none';
+  if (on) {
+    document.getElementById('intel-panel').style.display = 'none';
+    document.getElementById('osint-panel').style.display = 'none';
+    document.querySelector('[data-layer="intel"]')?.classList.remove('on');
+    document.querySelector('[data-layer="osint"]')?.classList.remove('on');
+    S.layers.intel = false; S.layers.osint = false;
+    document.getElementById('cesiumContainer').style.right = 'var(--intel-w)';
+    loadTripwires();
+  } else {
+    document.getElementById('cesiumContainer').style.right = '0';
+  }
+});
+
+// Close buttons
+document.getElementById('osint-close').addEventListener('click', () => {
+  document.getElementById('osint-panel').style.display = 'none';
+  document.getElementById('cesiumContainer').style.right = '0';
+  document.querySelector('[data-layer="osint"]')?.classList.remove('on');
+  S.layers.osint = false;
+});
+document.getElementById('maven-close').addEventListener('click', () => {
+  document.getElementById('maven-panel').style.display = 'none';
+  document.getElementById('cesiumContainer').style.right = '0';
+  document.querySelector('[data-layer="maven"]')?.classList.remove('on');
+  S.layers.maven = false;
+});
+
+async function fetchOsint(query) {
+  if (osintLoading) return;
+  osintLoading = true;
+  const q = query || document.getElementById('osint-q').value.trim();
+  const list = document.getElementById('osint-items');
+  list.innerHTML = `<div class="intel-loading"><div class="loading-spinner"></div><span>AGGREGATING PUBLIC SOURCES…</span></div>`;
+
+  try {
+    const r = await fetch(`/api/osint/feed${q ? '?q='+encodeURIComponent(q) : ''}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    osintPosts = data.posts || [];
+    document.getElementById('osint-count').textContent = `${data.count} POSTS`;
+    document.getElementById('osint-last-update').textContent = new Date().toISOString().substring(11,16) + 'Z';
+    document.getElementById('cnt-osint').textContent = data.count;
+    renderOsint();
+    log(`OSINT: ${data.count} posts (${data.posts?.filter(p=>p.platform==='reddit').length||0} social, ${data.posts?.filter(p=>p.platform==='rss').length||0} news)`);
+  } catch(e) {
+    list.innerHTML = `<div class="intel-empty">⚠ ${e.message}<br><small>Check server connection</small></div>`;
+    log(`OSINT: ${e.message}`, 'error');
+  } finally { osintLoading = false; }
+}
+
+function renderOsint() {
+  const list = document.getElementById('osint-items');
+  let visible = osintPosts;
+
+  if (osintFilter === 'social')    visible = osintPosts.filter(p => p.platform === 'reddit');
+  else if (osintFilter === 'news') visible = osintPosts.filter(p => p.platform === 'rss');
+  else if (osintFilter === 'high-corr') visible = osintPosts.filter(p => (p.corroboration||1) >= 3);
+
+  if (!visible.length) {
+    list.innerHTML = `<div class="intel-empty">No posts found<br><small>Try a different filter or search term</small></div>`;
+    return;
+  }
+
+  list.innerHTML = '';
+  for (const post of visible.slice(0, 100)) {
+    const corrClass = (post.corroboration||1) >= 4 ? 'corr-high' : (post.corroboration||1) >= 2 ? 'corr-med' : '';
+    const platformClass = post.platform === 'reddit' ? 'platform-reddit' : '';
+    const timeAgo = timeAgoStr(post.date);
+    const isNonEnglish = post.lang && post.lang !== 'en';
+    const langBadge = isNonEnglish ? `<span class="osint-lang-badge">${post.lang.toUpperCase()}</span>` : '';
+    const platformBadge = `<span class="osint-platform">${post.platform === 'reddit' ? '🟠 '+post.source : '📰 '+post.source}</span>`;
+    const scoreStr = post.platform === 'reddit' ? `<span class="osint-score">▲${(post.score||0).toLocaleString()} 💬${post.comments||0}</span>` : '';
+
+    const div = document.createElement('div');
+    div.className = `osint-item ${corrClass} ${platformClass}`.trim();
+    div.innerHTML = `
+      ${(post.corroboration||1) > 1 ? `<span class="osint-corr">×${post.corroboration}</span>` : ''}
+      <div class="osint-title">${escHtml(post.title)}</div>
+      ${post._translated ? `<div class="osint-translated">${escHtml(post._translated)}</div>` : ''}
+      <div class="osint-meta">
+        ${platformBadge}
+        ${langBadge}
+        ${scoreStr}
+        <span class="osint-date">${timeAgo}</span>
+      </div>`;
+
+    // Click: open source URL
+    div.addEventListener('click', () => window.open(post.permalink || post.url, '_blank'));
+
+    // Auto-translate non-English titles (deferred, on visibility)
+    if (isNonEnglish && !post._translated) {
+      const titleDiv = div.querySelector('.osint-title');
+      translateText(post.title, post.lang).then(translated => {
+        if (translated && translated !== post.title) {
+          post._translated = translated;
+          const transEl = div.querySelector('.osint-translated');
+          if (transEl) { transEl.textContent = translated; }
+          else {
+            const t = document.createElement('div');
+            t.className = 'osint-translated';
+            t.textContent = translated;
+            titleDiv.insertAdjacentElement('afterend', t);
+          }
+        }
+      });
+    }
+
+    list.appendChild(div);
+  }
+}
+
+// Translation cache (client-side)
+const clientTransCache = new Map();
+async function translateText(text, fromLang) {
+  if (!text || fromLang === 'en') return null;
+  const key = `${fromLang}_${text.substring(0,40)}`;
+  if (clientTransCache.has(key)) return clientTransCache.get(key);
+  try {
+    const r = await fetch(`/api/translate?text=${encodeURIComponent(text.substring(0,280))}&from=${fromLang}&to=en`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const result = data.translated !== text ? data.translated : null;
+    if (result) clientTransCache.set(key, result);
+    return result;
+  } catch { return null; }
+}
+
+function timeAgoStr(ts) {
+  const diff = Date.now() - (ts || 0);
+  if (diff < 60000)   return `${Math.floor(diff/1000)}s ago`;
+  if (diff < 3600000) return `${Math.floor(diff/60000)}m ago`;
+  if (diff < 86400000)return `${Math.floor(diff/3600000)}h ago`;
+  return `${Math.floor(diff/86400000)}d ago`;
+}
+
+// OSINT search + filter interactions
+document.getElementById('osint-go').addEventListener('click', () => fetchOsint(document.getElementById('osint-q').value));
+document.getElementById('osint-q').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('osint-go').click(); });
+document.getElementById('osint-refresh').addEventListener('click', () => fetchOsint());
+
+document.querySelectorAll('.osftag').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.osftag').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    osintFilter = btn.dataset.type;
+    renderOsint();
+  });
+});
+
+// ─── MAVEN — TRIPWIRE / ALERT SYSTEM ─────────────────────────────────────────
+let tripwireData = [];
+let alertLog = [];
+let mavenCheckInterval = null;
+
+async function loadTripwires() {
+  try {
+    const r = await fetch('/api/tripwires');
+    if (!r.ok) return;
+    const data = await r.json();
+    tripwireData = data.tripwires || [];
+    renderTripwireList();
+  } catch(e) { log(`Tripwires: ${e.message}`, 'warn'); }
+}
+
+function renderTripwireList() {
+  const list = document.getElementById('tripwire-list');
+  if (!tripwireData.length) {
+    list.innerHTML = '<div class="maven-empty">No tripwires set. Click + NEW to create one.</div>';
+    return;
+  }
+  list.innerHTML = '';
+  for (const tw of tripwireData) {
+    const item = document.createElement('div');
+    item.className = `tripwire-item${tw.active ? '' : ' inactive'}`;
+    item.innerHTML = `
+      <div>
+        <div class="tripwire-name">${escHtml(tw.name)}</div>
+        <div class="tripwire-type">${tw.type.toUpperCase()} · ${escHtml(tw.value||'')} ${tw.hits ? `· <span class="tripwire-hits">${tw.hits} HITS</span>` : ''}</div>
+      </div>
+      <div class="tripwire-controls">
+        <button class="tw-ctrl-btn" data-id="${tw.id}" data-action="toggle">${tw.active ? 'PAUSE' : 'RESUME'}</button>
+        <button class="tw-ctrl-btn" data-id="${tw.id}" data-action="delete" style="border-color:rgba(239,68,68,0.4);color:#ef4444">✕</button>
+      </div>`;
+    list.appendChild(item);
+  }
+
+  list.querySelectorAll('.tw-ctrl-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = parseInt(btn.dataset.id);
+      const action = btn.dataset.action;
+      if (action === 'delete') {
+        if (!confirm(`Delete tripwire?`)) return;
+        await fetch(`/api/tripwires/${id}`, { method: 'DELETE' });
+      } else if (action === 'toggle') {
+        const tw = tripwireData.find(t => t.id === id);
+        await fetch(`/api/tripwires/${id}`, { method: 'PATCH', headers: { 'Content-Type':'application/json' }, body: JSON.stringify({ active: !tw.active }) });
+      }
+      loadTripwires();
+    });
+  });
+}
+
+// Tripwire form
+document.getElementById('btn-add-tripwire').addEventListener('click', () => {
+  document.getElementById('tripwire-form').style.display = 'block';
+  document.getElementById('btn-add-tripwire').style.display = 'none';
+});
+document.getElementById('tw-cancel').addEventListener('click', () => {
+  document.getElementById('tripwire-form').style.display = 'none';
+  document.getElementById('btn-add-tripwire').style.display = '';
+});
+document.getElementById('tw-save').addEventListener('click', async () => {
+  const name = document.getElementById('tw-name').value.trim();
+  const type = document.getElementById('tw-type').value;
+  let value = document.getElementById('tw-value').value.trim();
+  const threshold = parseInt(document.getElementById('tw-threshold').value) || 1;
+
+  if (!name) { toast('Enter a tripwire name', 'warn'); return; }
+
+  let bbox = null;
+  if (type === 'bbox') {
+    const b = getViewportBbox();
+    if (b) { bbox = b; value = `${b.minLat.toFixed(1)},${b.minLon.toFixed(1)} → ${b.maxLat.toFixed(1)},${b.maxLon.toFixed(1)}`; }
+    else { toast('Cannot determine bbox — zoom in first', 'warn'); return; }
+  }
+
+  try {
+    const r = await fetch('/api/tripwires', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, type, value, bbox, threshold }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    document.getElementById('tw-name').value = '';
+    document.getElementById('tw-value').value = '';
+    document.getElementById('tripwire-form').style.display = 'none';
+    document.getElementById('btn-add-tripwire').style.display = '';
+    await loadTripwires();
+    toast(`Tripwire "${name}" active`, 'ok');
+  } catch(e) { toast(`Save failed: ${e.message}`, 'error'); }
+});
+document.getElementById('btn-clear-alerts').addEventListener('click', () => {
+  alertLog = [];
+  document.getElementById('maven-alert-log').innerHTML = '<div class="maven-empty">No alerts triggered.</div>';
+});
+
+function addAlert(alert) {
+  alertLog.unshift(alert);
+  if (alertLog.length > 50) alertLog.length = 50;
+  const log_el = document.getElementById('maven-alert-log');
+  const item = document.createElement('div');
+  item.className = 'alert-item';
+  const matchNames = alert.matches.map(m => m.callsign || m.name || m.mmsi || '').filter(Boolean).join(', ');
+  item.innerHTML = `
+    <div class="alert-name">⚡ ${escHtml(alert.tripwire.name)}</div>
+    <div class="alert-detail">${alert.count} match${alert.count>1?'es':''}: ${escHtml(matchNames || '(unnamed)')}</div>
+    <div class="alert-ts">${new Date(alert.ts).toISOString().substring(11,19)}Z · ${alert.tripwire.type.toUpperCase()}</div>`;
+  log_el.prepend(item);
+
+  // Also show as toast notification
+  toast(`⚡ TRIPWIRE: ${alert.tripwire.name} — ${alert.count} match${alert.count>1?'es':''}`, 'warn', 8000);
+  log(`TRIPWIRE ALERT: ${alert.tripwire.name} (${alert.count} matches)`, 'warn');
+}
+
+// Check tripwires every 30s against live data
+async function checkTripwires() {
+  if (!tripwireData.length) return;
+  try {
+    // Collect current entity arrays
+    const flights  = S.flightDs   ? [...S.flightDs.entities.values()].map(e => { const p = e.properties; return [p.icao?.getValue?.()||'', p.callsign?.getValue?.()||'', p.country?.getValue?.()||'', 0,0, p.lon?.getValue?.(),p.lat?.getValue?.(),p.altM?.getValue?.()]; }) : [];
+    const military = S.militaryDs ? [...S.militaryDs.entities.values()].map(e => { const p = e.properties; return [p.icao?.getValue?.()||'', p.callsign?.getValue?.()||'', p.country?.getValue?.()||'', 0,0, p.lon?.getValue?.(),p.lat?.getValue?.(),p.altM?.getValue?.()]; }) : [];
+    const ships    = S.shipDs     ? [...S.shipDs.entities.values()].map(e => { const p = e.properties; return { name: p.name?.getValue?.(), mmsi: p.mmsi?.getValue?.(), lat: p.lat?.getValue?.(), lon: p.lon?.getValue?.() }; }) : [];
+
+    const r = await fetch('/api/tripwires/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ flights, military, ships }),
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    for (const alert of (data.alerts || [])) addAlert(alert);
+  } catch {}
+}
+
+// ─── ENTITY LINK GRAPH (Maven-style link analysis) ────────────────────────────
+document.getElementById('btn-entity-graph').addEventListener('click', () => openEntityGraph());
+document.getElementById('entity-graph-close').addEventListener('click', () => {
+  document.getElementById('entity-graph-modal').style.display = 'none';
+});
+
+function openEntityGraph() {
+  const modal = document.getElementById('entity-graph-modal');
+  modal.style.display = 'flex';
+
+  // Gather all visible entities
+  const nodes = [], edges = [];
+  const seen = new Set();
+
+  const addNode = (id, label, type, color) => {
+    if (!seen.has(id)) { seen.add(id); nodes.push({ id, label, type, color }); }
+  };
+
+  // Add entity node groups
+  const countryMap = new Map(); // country → [entity ids]
+  const operatorMap = new Map(); // operator → [entity ids]
+
+  const processDS = (ds, entityType, color) => {
+    if (!ds) return;
+    let count = 0;
+    for (const entity of ds.entities.values()) {
+      if (count++ > 60) break; // cap for performance
+      const p = entity.properties;
+      const id = entity.id;
+      const callsign = p.callsign?.getValue?.() || p.name?.getValue?.() || entity.name || id;
+      const country  = p.country?.getValue?.() || '';
+      const operator = p.operator?.getValue?.() || '';
+      addNode(id, callsign.substring(0,12), entityType, color);
+      if (country) {
+        if (!countryMap.has(country)) { countryMap.set(country, []); addNode(`country_${country}`, country, 'country', '#06b6d4'); }
+        countryMap.get(country).push(id);
+        edges.push({ from: id, to: `country_${country}` });
+      }
+    }
+  };
+
+  processDS(S.flightDs, 'flight', '#22cc88');
+  processDS(S.militaryDs, 'military', '#ff3333');
+  processDS(S.shipDs, 'ship', '#2299ff');
+  processDS(S.satDs, 'satellite', '#00ffaa');
+
+  drawEntityGraph(nodes, edges);
+}
+
+function drawEntityGraph(nodes, edges) {
+  const canvas = document.getElementById('entity-graph-canvas');
+  const info = document.getElementById('entity-graph-info');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.offsetWidth, H = canvas.offsetHeight;
+  canvas.width = W; canvas.height = H;
+
+  if (!nodes.length) {
+    ctx.fillStyle = '#6b7280';
+    ctx.font = '14px JetBrains Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText('No entities loaded — enable SAT, AIR, MIL or AIS layers', W/2, H/2);
+    info.textContent = 'No data available';
+    return;
+  }
+
+  // Force-directed layout (simple spring simulation)
+  const positions = nodes.map((_, i) => ({
+    x: W/2 + Math.cos(2*Math.PI*i/nodes.length) * Math.min(W,H)*0.35,
+    y: H/2 + Math.sin(2*Math.PI*i/nodes.length) * Math.min(W,H)*0.35,
+    vx: 0, vy: 0,
+  }));
+  const nodeIdx = new Map(nodes.map((n,i) => [n.id, i]));
+
+  // Run simulation steps
+  for (let step = 0; step < 80; step++) {
+    // Repulsion
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i+1; j < nodes.length; j++) {
+        const dx = positions[j].x - positions[i].x || 0.1;
+        const dy = positions[j].y - positions[i].y || 0.1;
+        const d = Math.sqrt(dx*dx+dy*dy) || 1;
+        const f = 800 / (d*d);
+        positions[i].vx -= f*dx/d; positions[i].vy -= f*dy/d;
+        positions[j].vx += f*dx/d; positions[j].vy += f*dy/d;
+      }
+    }
+    // Attraction along edges
+    for (const e of edges) {
+      const ai = nodeIdx.get(e.from), bi = nodeIdx.get(e.to);
+      if (ai==null||bi==null) continue;
+      const dx = positions[bi].x - positions[ai].x;
+      const dy = positions[bi].y - positions[ai].y;
+      const d = Math.sqrt(dx*dx+dy*dy) || 1;
+      const f = (d - 80) * 0.05;
+      positions[ai].vx += f*dx/d; positions[ai].vy += f*dy/d;
+      positions[bi].vx -= f*dx/d; positions[bi].vy -= f*dy/d;
+    }
+    // Centre gravity
+    for (const p of positions) {
+      p.vx += (W/2 - p.x) * 0.01;
+      p.vy += (H/2 - p.y) * 0.01;
+      p.vx *= 0.85; p.vy *= 0.85;
+      p.x = Math.max(30, Math.min(W-30, p.x + p.vx));
+      p.y = Math.max(20, Math.min(H-20, p.y + p.vy));
+    }
+  }
+
+  // Draw
+  ctx.fillStyle = '#0a0b0d';
+  ctx.fillRect(0, 0, W, H);
+
+  // Edges
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  ctx.lineWidth = 1;
+  for (const e of edges) {
+    const ai = nodeIdx.get(e.from), bi = nodeIdx.get(e.to);
+    if (ai==null||bi==null) continue;
+    ctx.beginPath();
+    ctx.moveTo(positions[ai].x, positions[ai].y);
+    ctx.lineTo(positions[bi].x, positions[bi].y);
+    ctx.stroke();
+  }
+
+  // Nodes
+  const typeColors = { flight:'#22cc88', military:'#ff3333', ship:'#2299ff', satellite:'#00ffaa', country:'#06b6d4' };
+  ctx.font = '9px JetBrains Mono';
+  ctx.textAlign = 'center';
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    const p = positions[i];
+    const color = n.color || typeColors[n.type] || '#888';
+    const r = n.type === 'country' ? 7 : 4;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI*2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.lineWidth = 1; ctx.stroke();
+    if (n.type === 'country' || nodes.length < 30) {
+      ctx.fillStyle = color;
+      ctx.fillText(n.label, p.x, p.y - r - 2);
+    }
+  }
+
+  info.textContent = `${nodes.length} entities · ${edges.length} connections · ${nodes.filter(n=>n.type==='country').length} countries`;
+
+  // Click to show node info
+  canvas.onclick = (evt) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = evt.clientX - rect.left, my = evt.clientY - rect.top;
+    for (let i = 0; i < nodes.length; i++) {
+      const p = positions[i];
+      if (Math.abs(p.x-mx) < 12 && Math.abs(p.y-my) < 12) {
+        const n = nodes[i];
+        const edgeCount = edges.filter(e => e.from===n.id || e.to===n.id).length;
+        info.textContent = `${n.type.toUpperCase()} · ${n.label} · ${edgeCount} connections`;
+        return;
+      }
+    }
+    info.textContent = `${nodes.length} entities · ${edges.length} connections`;
+  };
+}
+
+// ─── PATTERN OF LIFE ─────────────────────────────────────────────────────────
+// Client-side: record entity positions periodically, store last ~200 positions per entity
+const polHistory = new Map(); // entityId → [{ts, lat, lon, alt, name}]
+const POL_MAX = 200;
+
+function snapshotEntityPositions() {
+  const now = Date.now();
+  const dataSources = [S.flightDs, S.militaryDs, S.shipDs].filter(Boolean);
+  for (const ds of dataSources) {
+    for (const entity of ds.entities.values()) {
+      const p = entity.properties;
+      const type = p.type?.getValue?.() || '';
+      if (!['flight','military','ship'].includes(type)) continue;
+      const lat = p.lat?.getValue?.();
+      const lon = p.lon?.getValue?.();
+      if (lat==null||lon==null) continue;
+      const id = entity.id;
+      if (!polHistory.has(id)) polHistory.set(id, []);
+      const hist = polHistory.get(id);
+      // Only record if moved significantly or 5+ minutes since last record
+      const last = hist[hist.length-1];
+      if (last && now - last.ts < 60000) continue; // rate limit: 1 per minute
+      hist.push({ ts: now, lat, lon, alt: p.altFt?.getValue?.()||0, name: entity.name });
+      if (hist.length > POL_MAX) hist.shift();
+    }
+  }
+  // Clean up old entries for entities no longer visible
+  if (polHistory.size > 2000) {
+    const cutoff = now - 2 * 3600000; // 2 hours
+    for (const [id, hist] of polHistory) {
+      if (!hist.length || hist[hist.length-1].ts < cutoff) polHistory.delete(id);
+    }
+  }
+}
+// Snapshot positions every 60 seconds
+setInterval(snapshotEntityPositions, 60000);
+
+document.getElementById('btn-pol').addEventListener('click', () => {
+  if (S.selectedEntity) openPatternOfLife(S.selectedEntity);
+  else toast('Click an entity on the map first', 'warn');
+});
+
+function openPatternOfLife(entity) {
+  const modal = document.getElementById('pol-modal');
+  const timeline = document.getElementById('pol-timeline');
+  const stats = document.getElementById('pol-stats');
+  document.getElementById('pol-entity-name').textContent = (entity.name || entity.id).substring(0, 24);
+
+  const hist = polHistory.get(entity.id) || [];
+  modal.style.display = 'flex';
+
+  if (!hist.length) {
+    timeline.innerHTML = '<div class="maven-empty">No history recorded for this entity yet. It will accumulate as data refreshes.</div>';
+    stats.textContent = 'No data';
+    return;
+  }
+
+  timeline.innerHTML = '';
+  for (const entry of [...hist].reverse().slice(0, 100)) {
+    const div = document.createElement('div');
+    div.className = 'pol-entry';
+    div.innerHTML = `
+      <div class="pol-ts">${new Date(entry.ts).toISOString().substring(11,19)}Z</div>
+      <div>
+        <div class="pol-detail">${entry.alt ? Math.round(entry.alt/100)*100 + 'ft' : 'Surface'}</div>
+        <div class="pol-coord">${entry.lat.toFixed(3)}°N ${entry.lon.toFixed(3)}°E</div>
+      </div>`;
+    timeline.appendChild(div);
+  }
+
+  const first = hist[0], last = hist[hist.length-1];
+  const spanMin = Math.round((last.ts - first.ts) / 60000);
+  const lats = hist.map(h => h.lat), lons = hist.map(h => h.lon);
+  const bbox = `${Math.min(...lats).toFixed(2)}°–${Math.max(...lats).toFixed(2)}°N, ${Math.min(...lons).toFixed(2)}°–${Math.max(...lons).toFixed(2)}°E`;
+  stats.textContent = `${hist.length} positions · ${spanMin}min track · Bounds: ${bbox}`;
+}
+
+document.getElementById('pol-close').addEventListener('click', () => {
+  document.getElementById('pol-modal').style.display = 'none';
+});
+
+// ─── START MAVEN TRIPWIRE POLLING ────────────────────────────────────────────
+setInterval(() => { if (tripwireData.length) checkTripwires(); }, 30000);
 
 // Wait for satellite.js to be ready
 if (typeof satellite !== 'undefined') {

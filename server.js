@@ -858,6 +858,329 @@ app.get('/api/debug/ships', async (req, res) => {
   res.json({ ts: new Date().toISOString(), shipCache: shipPositions.size, fallbackAge: shipFallback.ts ? Date.now()-shipFallback.ts : null, results });
 });
 
+// ─── GLOBAL FLIGHTS (multi-region parallel fetch) ────────────────────────────
+let globalFlightCache = { data: null, ts: 0 };
+
+app.get('/api/flights/global', async (req, res) => {
+  if (globalFlightCache.data && Date.now() - globalFlightCache.ts < 10000)
+    return res.json(globalFlightCache.data);
+
+  // Try OpenSky global first (no geo filter, returns all states)
+  try {
+    const r = await fetchUrl('https://opensky-network.org/api/states/all', { timeout: 18000 });
+    if (r.status === 200) {
+      const data = JSON.parse(r.data);
+      if ((data.states || []).length > 0) {
+        const payload = { states: data.states, _src: 'opensky_global', _count: data.states.length, time: data.time || Math.floor(Date.now()/1000) };
+        globalFlightCache = { data: payload, ts: Date.now() };
+        console.log(`[GlobalFlights] OpenSky: ${data.states.length} aircraft`);
+        return res.json(payload);
+      }
+    }
+  } catch(e) { console.warn('[GlobalFlights] OpenSky failed:', e.message); }
+
+  // Fallback: parallel adsb.lol calls at 10 strategic world regions
+  const REGIONS = [
+    [40, -95], [51, 10], [35, 100], [20, 77], [-10, 140],
+    [-10, 25], [-20, -60], [60, 50], [25, 55], [35, -10],
+  ];
+  const allStates = new Map();
+  await Promise.allSettled(REGIONS.map(async ([lat, lon]) => {
+    try {
+      const r = await fetchUrl(`https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/250`, { timeout: 10000 });
+      if (r.status === 200) {
+        const d = JSON.parse(r.data);
+        for (const ac of (d.ac || [])) {
+          const icao = (ac.hex || '').toLowerCase();
+          if (!icao || allStates.has(icao)) continue;
+          allStates.set(icao, [
+            icao, (ac.flight||'').trim(), ac.r||'',
+            Math.floor(Date.now()/1000), Math.floor(Date.now()/1000),
+            ac.lon??null, ac.lat??null,
+            ac.alt_baro != null ? (ac.alt_baro==='ground' ? 0 : Math.round(ac.alt_baro*0.3048)) : null,
+            ac.alt_baro==='ground'||false,
+            ac.gs!=null ? Math.round(ac.gs*0.514444) : null,
+            ac.track??null, null, null,
+            ac.alt_geom!=null ? Math.round(ac.alt_geom*0.3048) : null,
+            ac.squawk||null, false, 0, ac.category||ac.t||null, false,
+          ]);
+        }
+      }
+    } catch {}
+  }));
+  const states = [...allStates.values()].filter(s => s[5]!=null && s[6]!=null);
+  const payload = { states, _src: 'adsblol_multiregion', _count: states.length, time: Math.floor(Date.now()/1000) };
+  globalFlightCache = { data: payload, ts: Date.now() };
+  console.log(`[GlobalFlights] multi-region: ${states.length} aircraft`);
+  res.json(payload);
+});
+
+// ─── OSINT SOCIAL FEED ────────────────────────────────────────────────────────
+const osintCache = new Map();
+
+// Simple RSS/Atom parser
+function parseRSS(xml) {
+  const items = [];
+  const getTag = (str, tag) => {
+    const m = str.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i'));
+    return m ? m[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/<[^>]+>/g, '').trim() : '';
+  };
+  const getLink = (str) => {
+    const m = str.match(/<link[^>]*href="([^"]+)"|<link[^>]*>([^<]+)<\/link>/i);
+    return m ? (m[1]||m[2]||'').trim() : '';
+  };
+  const getDate = (str) => {
+    const m = str.match(/<pubDate[^>]*>([^<]+)<\/pubDate>|<published[^>]*>([^<]+)<\/published>|<updated[^>]*>([^<]+)<\/updated>/i);
+    try { return m ? new Date(m[1]||m[2]||m[3]).getTime() : Date.now(); } catch { return Date.now(); }
+  };
+  const itemRe = /<(?:item|entry)>([\s\S]*?)<\/(?:item|entry)>/g;
+  let match;
+  while ((match = itemRe.exec(xml)) !== null) {
+    const it = match[1];
+    const title = getTag(it, 'title');
+    if (!title) continue;
+    items.push({ title, link: getLink(it), date: getDate(it), description: (getTag(it,'description')||getTag(it,'summary')).substring(0,200) });
+  }
+  return items;
+}
+
+const RSS_FEEDS = [
+  { url: 'https://feeds.bbci.co.uk/news/world/rss.xml',      name: 'BBC World',    lang: 'en' },
+  { url: 'https://www.aljazeera.com/xml/rss/all.xml',         name: 'Al Jazeera',   lang: 'en' },
+  { url: 'https://feeds.skynews.com/feeds/rss/world.xml',     name: 'Sky News',     lang: 'en' },
+  { url: 'https://www.theguardian.com/world/rss',             name: 'The Guardian', lang: 'en' },
+  { url: 'https://rss.dw.com/rdf/rss-en-world',               name: 'DW World',     lang: 'en' },
+  { url: 'https://feeds.npr.org/1004/rss.xml',                name: 'NPR News',     lang: 'en' },
+  { url: 'https://www.france24.com/en/rss',                   name: 'France 24',    lang: 'en' },
+];
+
+const REDDIT_SUBS = ['worldnews','geopolitics','news','ukraine','europe','MiddleEast','worldpolitics','NATOpress'];
+
+// Simple language detection
+function detectLang(text) {
+  if (!text) return 'en';
+  if (/[\u0400-\u04FF]/.test(text)) return 'ru';
+  if (/[\u0600-\u06FF]/.test(text)) return 'ar';
+  if (/[\u4E00-\u9FFF]/.test(text)) return 'zh';
+  if (/[\u0590-\u05FF]/.test(text)) return 'he';
+  if (/[\u0900-\u097F]/.test(text)) return 'hi';
+  if (/[\u0E00-\u0E7F]/.test(text)) return 'th';
+  return 'en';
+}
+
+const STOPWORDS = new Set(['about','after','again','against','all','also','although','among','another','around','because','before','being','between','could','during','every','first','following','from','have','here','just','like','more','most','much','next','only','other','over','same','since','some','such','than','that','their','them','then','there','these','they','this','those','through','under','until','very','want','when','where','which','while','will','with','within','without','would','says','said','have','been','were','what','into','from','over','back','year','would','there','their','news','report','new','shows']);
+
+function computeCorroboration(posts) {
+  const kwSets = posts.map(p => {
+    const words = (p.title||'').toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/).filter(w => w.length > 4 && !STOPWORDS.has(w));
+    const bigrams = [];
+    for (let i = 0; i < words.length-1; i++) bigrams.push(`${words[i]}_${words[i+1]}`);
+    return new Set([...words, ...bigrams]);
+  });
+  return posts.map((p, i) => {
+    let corr = 1;
+    for (let j = 0; j < posts.length; j++) {
+      if (i===j) continue;
+      let overlap = 0;
+      for (const kw of kwSets[i]) { if (kwSets[j].has(kw)) overlap++; }
+      if (overlap >= 2) corr++;
+    }
+    return { ...p, corroboration: corr };
+  });
+}
+
+app.get('/api/osint/feed', async (req, res) => {
+  const keyword = (req.query.q || '').toLowerCase().replace(/[^\w\s-]/g, '').trim();
+  const bucket = Math.floor(Date.now() / 120000); // 2-min cache buckets
+  const cacheKey = `osint_${keyword}_${bucket}`;
+  const cached = osintCache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  const allPosts = [];
+
+  // Parallel Reddit fetches
+  const redditTasks = REDDIT_SUBS.map(sub => fetchUrl(
+    `https://www.reddit.com/r/${sub}/new.json?limit=30&t=day`,
+    { headers: { 'Accept': 'application/json', 'User-Agent': 'ARGUS/7.0 (geospatial intelligence dashboard)' }, timeout: 10000 }
+  ).then(r => {
+    if (r.status !== 200) return;
+    const data = JSON.parse(r.data);
+    for (const c of (data.data?.children || [])) {
+      const d = c.data;
+      allPosts.push({
+        id: `reddit_${d.id}`, title: d.title,
+        url: d.url, permalink: `https://reddit.com${d.permalink}`,
+        source: `r/${d.subreddit}`, type: 'social', platform: 'reddit',
+        score: d.score || 0, comments: d.num_comments || 0,
+        date: (d.created_utc || 0) * 1000,
+        lang: 'en', flair: d.link_flair_text || '',
+        text: d.selftext ? d.selftext.substring(0, 150) : '',
+      });
+    }
+  }).catch(() => {}));
+
+  // Parallel RSS fetches
+  const rssTasks = RSS_FEEDS.map(feed => fetchUrl(feed.url, {
+    timeout: 10000, headers: { 'Accept': 'application/rss+xml,application/xml,text/xml,*/*' }
+  }).then(r => {
+    if (r.status !== 200) return;
+    const items = parseRSS(r.data);
+    for (const item of items) {
+      if (!item.title) continue;
+      allPosts.push({
+        id: `rss_${feed.name}_${item.link}`,
+        title: item.title, url: item.link,
+        source: feed.name, type: 'news', platform: 'rss',
+        date: item.date || Date.now(), lang: detectLang(item.title),
+        description: item.description || '', score: 0, comments: 0,
+      });
+    }
+  }).catch(() => {}));
+
+  await Promise.allSettled([...redditTasks, ...rssTasks]);
+
+  // Keyword filter
+  let filtered = keyword
+    ? allPosts.filter(p => (p.title||'').toLowerCase().includes(keyword) || (p.description||'').toLowerCase().includes(keyword) || (p.flair||'').toLowerCase().includes(keyword) || (p.text||'').toLowerCase().includes(keyword))
+    : allPosts;
+
+  // Deduplicate by URL
+  const seen = new Set();
+  const deduped = filtered.filter(p => { if (!p.url || seen.has(p.url)) return false; seen.add(p.url); return true; });
+
+  // Sort by date (newest first), keep 300
+  deduped.sort((a, b) => (b.date||0) - (a.date||0));
+  const recent = deduped.slice(0, 300);
+
+  // Compute corroboration
+  const withCorr = computeCorroboration(recent);
+
+  // Re-sort: high-corroboration first, then by date
+  withCorr.sort((a, b) => {
+    if (b.corroboration !== a.corroboration) return b.corroboration - a.corroboration;
+    return (b.date||0) - (a.date||0);
+  });
+
+  const result = { posts: withCorr.slice(0, 150), count: withCorr.length, keyword, ts: Date.now() };
+  osintCache.set(cacheKey, result);
+  setTimeout(() => osintCache.delete(cacheKey), 3 * 60 * 1000);
+
+  console.log(`[OSINT] ${result.count} posts (q="${keyword}")`);
+  res.json(result);
+});
+
+// Translation via MyMemory free API
+const transCache = new Map();
+app.get('/api/translate', async (req, res) => {
+  const text = (req.query.text || '').substring(0, 300);
+  const from = req.query.from || 'auto';
+  const to   = req.query.to || 'en';
+  if (!text || text.length < 3) return res.json({ translated: text, cached: true });
+  const detectedLang = detectLang(text);
+  if ((from === 'en' || from === 'auto') && detectedLang === 'en') return res.json({ translated: text, from: 'en', to: 'en', cached: true });
+
+  const cacheKey = `${from}_${to}_${text.substring(0,80)}`;
+  const c = transCache.get(cacheKey);
+  if (c) return res.json(c);
+
+  try {
+    const lp = from === 'auto' ? `${detectedLang}|${to}` : `${from}|${to}`;
+    const r = await fetchUrl(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${lp}`, { timeout: 8000 });
+    if (r.status === 200) {
+      const d = JSON.parse(r.data);
+      const result = { translated: d.responseData?.translatedText || text, from: lp.split('|')[0], to, quality: d.responseData?.match || 0 };
+      transCache.set(cacheKey, result);
+      if (transCache.size > 1000) transCache.clear();
+      return res.json(result);
+    }
+  } catch(e) { console.warn('[Translate]', e.message); }
+  res.json({ translated: text, from, to, error: 'translation_failed' });
+});
+
+// ─── TRIPWIRE / ALERT SYSTEM (Maven-style) ───────────────────────────────────
+const tripwires = new Map();
+let twIdCtr = 1;
+
+app.get('/api/tripwires', (req, res) => res.json({ tripwires: [...tripwires.values()], count: tripwires.size }));
+
+app.post('/api/tripwires', (req, res) => {
+  const { name, type, value, bbox, threshold } = req.body || {};
+  if (!name || !type) return res.status(400).json({ error: 'name and type required' });
+  const tw = { id: twIdCtr++, name, type: type.toLowerCase(), value: value || '', bbox: bbox || null, threshold: parseInt(threshold)||1, active: true, hits: 0, lastHit: null, created: Date.now() };
+  tripwires.set(tw.id, tw);
+  console.log(`[Tripwire] Created: "${name}" (${type})`);
+  res.json(tw);
+});
+
+app.patch('/api/tripwires/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  const tw = tripwires.get(id);
+  if (!tw) return res.status(404).json({ error: 'not found' });
+  Object.assign(tw, { active: req.body.active ?? tw.active });
+  res.json(tw);
+});
+
+app.delete('/api/tripwires/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!tripwires.has(id)) return res.status(404).json({ error: 'not found' });
+  tripwires.delete(id);
+  res.json({ deleted: true });
+});
+
+// Client posts live entity lists; server checks against tripwires and returns alerts
+app.post('/api/tripwires/check', (req, res) => {
+  const { flights = [], military = [], ships = [] } = req.body || {};
+  const alerts = [];
+  const now = Date.now();
+
+  const vehicles = [
+    ...flights.map(s  => ({ vtype:'flight',   callsign:(s[1]||'').trim(), country:(s[2]||''), alt:(s[7]||0)*3.28084, lat:s[6], lon:s[5] })),
+    ...military.map(s => ({ vtype:'military',  callsign:(s[1]||'').trim(), country:(s[2]||''), alt:(s[7]||0)*3.28084, lat:s[6], lon:s[5] })),
+    ...ships.map(s    => ({ vtype:'ship',      name:(s.name||''),          mmsi:s.mmsi,         lat:s.lat,             lon:s.lon })),
+  ];
+
+  for (const tw of tripwires.values()) {
+    if (!tw.active) continue;
+    const matches = [];
+
+    for (const v of vehicles) {
+      let hit = false;
+      if (tw.type === 'callsign' && tw.value) {
+        const pattern = new RegExp('^' + tw.value.replace(/\*/g,'.*').replace(/\?/g,'.') + '$', 'i');
+        if (pattern.test(v.callsign || v.name || '')) hit = true;
+      } else if (tw.type === 'country' && tw.value) {
+        if ((v.country||'').toLowerCase().includes(tw.value.toLowerCase())) hit = true;
+      } else if (tw.type === 'keyword' && tw.value) {
+        const haystack = `${v.callsign||''} ${v.name||''} ${v.country||''}`.toLowerCase();
+        if (haystack.includes(tw.value.toLowerCase())) hit = true;
+      } else if (tw.type === 'bbox' && tw.bbox) {
+        const { minLat, maxLat, minLon, maxLon } = tw.bbox;
+        if (v.lat>=minLat && v.lat<=maxLat && v.lon>=minLon && v.lon<=maxLon) hit = true;
+      } else if (tw.type === 'altitude' && tw.value) {
+        const parts = String(tw.value).split('-').map(Number);
+        if (parts.length === 2 && v.alt >= parts[0] && v.alt <= parts[1]) hit = true;
+      }
+      if (hit) matches.push(v);
+    }
+
+    if (matches.length >= tw.threshold && (!tw.lastHit || now - tw.lastHit > 60000)) {
+      tw.hits += matches.length;
+      tw.lastHit = now;
+      alerts.push({ tripwire: { id: tw.id, name: tw.name, type: tw.type }, matches: matches.slice(0,5), count: matches.length, ts: now });
+    }
+  }
+  res.json({ alerts, checked: tripwires.size });
+});
+
+// ─── PLAYBACK RANGE ───────────────────────────────────────────────────────────
+app.get('/api/playback/range', (req, res) => {
+  if (!db) return res.json({ available: false });
+  try {
+    const row = db.prepare('SELECT MIN(ts) as earliest, MAX(ts) as latest, COUNT(*) as total FROM snapshots').get();
+    res.json({ available: !!(row && row.total > 0), earliest: row?.earliest, latest: row?.latest, total: row?.total });
+  } catch { res.json({ available: false }); }
+});
+
 // ─── START ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`

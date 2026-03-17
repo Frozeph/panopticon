@@ -36,6 +36,8 @@
     <button class="lbtn" data-layer="jamming">JAM</button>
     <button class="lbtn" data-layer="mesh">MESH <span class="lbtn-count" id="cnt-mesh">0</span></button>
     <button class="lbtn on" data-layer="intel">INTEL</button>
+    <button class="lbtn" data-layer="osint">OSINT <span class="lbtn-count" id="cnt-osint">0</span></button>
+    <button class="lbtn" data-layer="maven">MAVEN</button>
   </div>
 
   <div id="tb-right">
@@ -121,6 +123,129 @@
     <div class="sb-label">DEBUG</div>
     <button class="sb-btn" id="btn-debug">CHECK SOURCES</button>
     <div id="debug-out" class="mono tiny dim mt4"></div>
+  </div>
+</div>
+
+<!-- PATTERN OF LIFE MODAL -->
+<div id="pol-modal" style="display:none">
+  <div id="pol-wrap">
+    <div id="pol-hdr">
+      <span>📊 PATTERN OF LIFE — <span id="pol-entity-name">—</span></span>
+      <button id="pol-close">✕</button>
+    </div>
+    <div id="pol-timeline"></div>
+    <div id="pol-stats"></div>
+  </div>
+</div>
+
+<!-- OSINT SOCIAL FEED PANEL (right, same slot as intel-panel) -->
+<div id="osint-panel" style="display:none">
+  <div class="panel-hdr">
+    <div class="panel-hdr-left">
+      <span class="panel-icon">◎</span>
+      <span class="panel-title">OSINT FEED</span>
+    </div>
+    <div class="panel-hdr-right">
+      <span id="osint-src-badge" class="badge">REDDIT · RSS · 100+ SOURCES</span>
+      <button class="icon-btn" id="osint-close">✕</button>
+    </div>
+  </div>
+
+  <div id="osint-search">
+    <input type="text" id="osint-q" class="intel-input" placeholder="Search all local social media in English…">
+    <button id="osint-go" class="intel-btn">⌕</button>
+  </div>
+
+  <div id="osint-filters">
+    <button class="osftag active" data-type="">ALL</button>
+    <button class="osftag" data-type="social">SOCIAL</button>
+    <button class="osftag" data-type="news">NEWS</button>
+    <button class="osftag" data-type="high-corr">CORROBORATED</button>
+  </div>
+
+  <div id="osint-items"></div>
+
+  <div id="osint-footer">
+    <span id="osint-count" class="mono dim tiny">—</span>
+    <span class="dim tiny"> · <span id="osint-last-update">—</span></span>
+    <button id="osint-refresh" class="tiny-btn">↺ REFRESH</button>
+  </div>
+</div>
+
+<!-- MAVEN INTELLIGENCE PANEL (right, same slot) -->
+<div id="maven-panel" style="display:none">
+  <div class="panel-hdr">
+    <div class="panel-hdr-left">
+      <span class="panel-icon" style="color:#a855f7">⚡</span>
+      <span class="panel-title">MAVEN INTELLIGENCE</span>
+    </div>
+    <div class="panel-hdr-right">
+      <span class="badge" style="border-color:rgba(168,85,247,0.3);color:#a855f7">TRIPWIRES · ALERTS</span>
+      <button class="icon-btn" id="maven-close">✕</button>
+    </div>
+  </div>
+
+  <!-- TRIPWIRES SECTION -->
+  <div class="maven-section">
+    <div class="maven-section-hdr">
+      <span>⚡ TRIPWIRES</span>
+      <button class="maven-add-btn" id="btn-add-tripwire">+ NEW</button>
+    </div>
+    <div id="tripwire-list"></div>
+  </div>
+
+  <!-- ADD TRIPWIRE FORM (hidden by default) -->
+  <div id="tripwire-form" style="display:none">
+    <div class="maven-form-hdr">NEW TRIPWIRE</div>
+    <input type="text" id="tw-name" class="maven-input" placeholder="Tripwire name…">
+    <select id="tw-type" class="maven-sel">
+      <option value="callsign">Callsign / Vessel Name (wildcards: * ?)</option>
+      <option value="country">Country code / name</option>
+      <option value="keyword">Keyword match</option>
+      <option value="bbox">Bounding box (auto from view)</option>
+      <option value="altitude">Altitude range (ft: min-max)</option>
+    </select>
+    <input type="text" id="tw-value" class="maven-input" placeholder="Value (e.g. RFF*, 30000-40000)">
+    <input type="number" id="tw-threshold" class="maven-input" placeholder="Min. matches (default: 1)" min="1" max="100">
+    <div style="display:flex;gap:4px;margin-top:4px">
+      <button class="maven-btn" id="tw-save">SAVE</button>
+      <button class="maven-btn" id="tw-cancel" style="background:rgba(239,68,68,0.1);border-color:rgba(239,68,68,0.4);color:#ef4444">CANCEL</button>
+    </div>
+  </div>
+
+  <!-- ALERT LOG -->
+  <div class="maven-section">
+    <div class="maven-section-hdr">
+      <span>🔔 ALERT LOG</span>
+      <button class="tiny-btn" id="btn-clear-alerts">CLEAR</button>
+    </div>
+    <div id="maven-alert-log"></div>
+  </div>
+
+  <!-- LINK ANALYSIS -->
+  <div class="maven-section">
+    <div class="maven-section-hdr"><span>🔗 ENTITY GRAPH</span></div>
+    <div class="dim tiny" style="padding:4px 0 6px">Click any tracked entity on the globe, then press the button below to analyse links between entities and their shared attributes.</div>
+    <button class="maven-btn" id="btn-entity-graph" style="width:100%">⬡ OPEN LINK GRAPH</button>
+  </div>
+
+  <!-- PATTERN OF LIFE -->
+  <div class="maven-section">
+    <div class="maven-section-hdr"><span>📊 PATTERN OF LIFE</span></div>
+    <div class="dim tiny" style="padding:4px 0 6px">Track and analyse entity behaviour over time. Click an entity on the globe then use Track, then view its timeline.</div>
+    <button class="maven-btn" id="btn-pol" style="width:100%">📈 TIMELINE VIEW</button>
+  </div>
+</div>
+
+<!-- ENTITY GRAPH MODAL -->
+<div id="entity-graph-modal" style="display:none">
+  <div id="entity-graph-wrap">
+    <div id="entity-graph-hdr">
+      <span>⬡ ENTITY LINK GRAPH</span>
+      <button id="entity-graph-close">✕</button>
+    </div>
+    <canvas id="entity-graph-canvas"></canvas>
+    <div id="entity-graph-info"></div>
   </div>
 </div>
 
