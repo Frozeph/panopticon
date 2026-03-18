@@ -139,6 +139,22 @@ Cesium.ArcGISTiledElevationTerrainProvider.fromUrl(
 S.viewer.scene.backgroundColor = new Cesium.Color(0.04, 0.04, 0.06, 1);
 S.viewer.scene.globe.show = true;
 
+// 3D Buildings — Cesium OSM Buildings (Ion asset 96188, free tier)
+// Requires a valid Cesium Ion token at cesium.com/ion (free account).
+// Fails silently if the token in CFG.cesiumToken is expired/invalid.
+Cesium.createOsmBuildingsAsync().then(tileset => {
+  S.osmBuildingsTileset = S.viewer.scene.primitives.add(tileset);
+  // Slight style: dim buildings slightly so they don't overpower the dark basemap
+  tileset.style = new Cesium.Cesium3DTileStyle({
+    color: 'color("rgb(60,65,80)", 1.0)',
+  });
+  log('OSM Buildings loaded', 'ok');
+}).catch(() => {
+  // Silently skip — token likely expired. User can update CFG.cesiumToken
+  // with a free token from https://cesium.com/ion/tokens
+  console.info('[Buildings] OSM Buildings unavailable — update CFG.cesiumToken with a free Ion token');
+});
+
 // ─── BASEMAP ──────────────────────────────────────────────────────────────────
 // No Ion dependency — use free tile providers so it works without a Cesium token
 async function applyBasemap(mode) {
@@ -559,18 +575,16 @@ function renderSatFootprints(now) {
           ellipse: {
             semiMinorAxis: accessRadM,
             semiMajorAxis: accessRadM,
-            material:      cesColor.withAlpha(0.03),
+            material:      cesColor.withAlpha(0.10),   // was 0.03 — much more visible
             outline:       true,
-            outlineColor:  cesColor.withAlpha(0.22),
-            outlineWidth:  1,
+            outlineColor:  cesColor.withAlpha(0.60),   // was 0.22
+            outlineWidth:  1.5,
             heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           },
         });
       }
 
       // ── SENSOR SWATH / INSTANTANEOUS FOOTPRINT
-      // For optical/SAR: known swath width (km) → metres radius
-      // For SIGINT/ELINT: no discrete swath, skip inner ring
       if (info.type !== 'elint' && info.swathKm > 0) {
         const swathRadM = (info.swathKm / 2) * 1000;
         ds.entities.add({
@@ -578,10 +592,10 @@ function renderSatFootprints(now) {
           ellipse: {
             semiMinorAxis: isGEO ? 2500000 : swathRadM,
             semiMajorAxis: isGEO ? 2500000 : swathRadM,
-            material:      cesColor.withAlpha(info.type === 'station' ? 0.12 : 0.07),
+            material:      cesColor.withAlpha(info.type === 'station' ? 0.25 : 0.18),  // was 0.12/0.07
             outline:       true,
-            outlineColor:  cesColor.withAlpha(info.type === 'station' ? 0.85 : 0.5),
-            outlineWidth:  info.type === 'station' ? 2 : 1,
+            outlineColor:  cesColor.withAlpha(info.type === 'station' ? 0.95 : 0.85),  // was 0.85/0.5
+            outlineWidth:  info.type === 'station' ? 2.5 : 1.5,
             heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           },
         });
@@ -756,34 +770,40 @@ function renderFlights(states, isMilitary) {
     const onGround = s[8];
 
     if (lon == null || lat == null || isNaN(lon) || isNaN(lat)) continue;
-    if (bbox && (lat < bbox.minLat || lat > bbox.maxLat || lon < bbox.minLon || lon > bbox.maxLon)) {
-      // Skip entities outside viewport when zoomed in enough
-      if (S.cameraAlt < 3000000) continue;
+    // Viewport cull for civil flights only (military data is always global)
+    if (!isMilitary && bbox && S.cameraAlt < 3000000 &&
+        (lat < bbox.minLat || lat > bbox.maxLat || lon < bbox.minLon || lon > bbox.maxLon)) {
+      continue;
     }
 
     const color = isMilitary ? '#ff3333' : altColor(altM);
     const altFt = Math.round((altM || 0) * 3.28084);
     const spdKt = Math.round((speed || 0) * 1.944);
 
+    const cesColor = Cesium.Color.fromCssColorString(color);
+    const displayAlt = Math.max(altM || 0, 10); // keep at least 10m so entity shows above terrain
     ds.entities.add({
       id: `${isMilitary?'mil':'ac'}_${icao}`,
       name: callsign || icao || 'Unknown',
-      position: Cesium.Cartesian3.fromDegrees(lon, lat, altM || 0),
-      billboard: {
-        image: isMilitary ? milIcon(color) : planeIcon(color, track),
-        width: isMilitary ? 14 : 16, height: isMilitary ? 14 : 16,
-        verticalOrigin: Cesium.VerticalOrigin.CENTER,
-        scaleByDistance: new Cesium.NearFarScalar(1e5, 1.5, 5e6, 0.6),
+      position: Cesium.Cartesian3.fromDegrees(lon, lat, displayAlt),
+      // Use point + label — more reliable than SVG billboard in Cesium 1.107+
+      point: {
+        pixelSize: isMilitary ? 7 : 5,
+        color: cesColor.withAlpha(0.95),
+        outlineColor: Cesium.Color.BLACK.withAlpha(0.7),
+        outlineWidth: isMilitary ? 2 : 1,
+        scaleByDistance: new Cesium.NearFarScalar(1e5, 1.8, 8e6, 0.5),
+        heightReference: (altM || 0) < 50 ? Cesium.HeightReference.CLAMP_TO_GROUND : Cesium.HeightReference.NONE,
       },
       label: {
         text: `${callsign||icao}\n${altFt ? altFt.toLocaleString()+'ft' : 'GND'} ${spdKt}kt`,
         font: '10px JetBrains Mono, monospace',
-        fillColor: Cesium.Color.fromCssColorString(color).withAlpha(0.9),
+        fillColor: cesColor.withAlpha(0.95),
         outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
         style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset: new Cesium.Cartesian2(0, -20),
+        pixelOffset: new Cesium.Cartesian2(0, -18),
         translucencyByDistance: new Cesium.NearFarScalar(5e5, 1, 3e6, 0),
-        backgroundColor: new Cesium.Color(0,0,0,0.4),
+        backgroundColor: new Cesium.Color(0,0,0,0.45),
         showBackground: true,
       },
       properties: {
@@ -848,28 +868,41 @@ function renderShips(ships) {
   const ds = new Cesium.CustomDataSource('ships');
 
   for (const s of ships) {
-    if (!s.lat || !s.lon || isNaN(s.lat) || isNaN(s.lon)) continue;
+    // Guard: lat/lon must be present and finite — != null catches both null and undefined
+    // Do NOT use !s.lat || !s.lon as that incorrectly rejects ships at lat=0 or lon=0
+    if (s.lat == null || s.lon == null || isNaN(s.lat) || isNaN(s.lon)) continue;
+    if (Math.abs(s.lat) > 90 || Math.abs(s.lon) > 180) continue;
+
     const color = shipColor(s.type || 0);
+    const cesColor = Cesium.Color.fromCssColorString(color);
     const name  = s.name || s.mmsi || 'UNKNOWN';
+    const isTanker    = s.type >= 80 && s.type <= 89;
+    const isPassenger = s.type >= 60 && s.type <= 69;
+    const isCargo     = s.type >= 70 && s.type <= 79;
+    const dotSize = isTanker ? 8 : isPassenger ? 7 : isCargo ? 6 : 5;
 
     ds.entities.add({
       id: `ship_${s.mmsi || Math.random()}`,
       name,
-      position: Cesium.Cartesian3.fromDegrees(s.lon, s.lat, 10),
-      billboard: {
-        image: shipIcon(color, s.heading || s.course || 0, s.type || 0),
-        width: 14, height: 14,
-        verticalOrigin: Cesium.VerticalOrigin.CENTER,
-        scaleByDistance: new Cesium.NearFarScalar(1e4, 2, 2e6, 0.6),
+      position: Cesium.Cartesian3.fromDegrees(s.lon, s.lat, 5),
+      point: {
+        pixelSize: dotSize,
+        color: cesColor.withAlpha(0.92),
+        outlineColor: Cesium.Color.BLACK.withAlpha(0.6),
+        outlineWidth: 1.5,
+        scaleByDistance: new Cesium.NearFarScalar(1e4, 2, 3e6, 0.5),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
       },
       label: {
-        text: name.substring(0, 10),
+        text: name.length > 10 ? name.substring(0, 10) + '…' : name,
         font: '10px JetBrains Mono, monospace',
-        fillColor: Cesium.Color.fromCssColorString(color).withAlpha(0.9),
+        fillColor: cesColor.withAlpha(0.95),
         outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
         style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset: new Cesium.Cartesian2(0, -16),
-        translucencyByDistance: new Cesium.NearFarScalar(1e5, 1, 1e6, 0),
+        pixelOffset: new Cesium.Cartesian2(0, -14),
+        translucencyByDistance: new Cesium.NearFarScalar(5e4, 1, 8e5, 0),
+        backgroundColor: new Cesium.Color(0,0,0,0.4),
+        showBackground: true,
       },
       properties: { type: 'ship', ...s },
     });
@@ -877,6 +910,7 @@ function renderShips(ships) {
 
   S.viewer.dataSources.add(ds);
   S.shipDs = ds;
+  log(`Ships: ${ds.entities.values.length} rendered`);
 }
 
 // ─── EARTHQUAKES ──────────────────────────────────────────────────────────────
@@ -1045,12 +1079,13 @@ function renderJamming(hexes, date) {
           hierarchy: new Cesium.PolygonHierarchy(
             Cesium.Cartesian3.fromDegreesArray(degArr)
           ),
-          material:         cesColor.withAlpha(alpha * 0.45),
-          outline:          true,
-          outlineColor:     cesColor.withAlpha(Math.min(1, alpha + 0.2)),
-          outlineWidth:     1.5,
-          height:           0,
-          heightReference:  Cesium.HeightReference.CLAMP_TO_GROUND,
+          material:           cesColor.withAlpha(alpha * 0.6),
+          outline:            true,
+          outlineColor:       cesColor.withAlpha(Math.min(1, alpha + 0.3)),
+          outlineWidth:       1.5,
+          // DO NOT set height:0 with terrain — polygons at height:0 go below terrain surface.
+          // classificationType drapes the polygon over terrain correctly.
+          classificationType: Cesium.ClassificationType.TERRAIN,
         },
         properties: { type: 'jamming', probability: pct, hexId: h.h },
       });
@@ -1369,6 +1404,16 @@ function showInfoPanel(entity) {
     R('PLACE',   props.place?.getValue?.() || props.place);
     const time = props.time?.getValue?.() || props.time;
     if (time) R('TIME', new Date(time).toUTCString().substring(0,25));
+  } else if (type === 'fire') {
+    const frp = props.frp?.getValue?.() ?? props.frp;
+    const brightness = props.brightness?.getValue?.() ?? props.brightness;
+    const lat = props.lat?.getValue?.() ?? props.lat;
+    const lon = props.lon?.getValue?.() ?? props.lon;
+    if (frp)        R('POWER',     `${Math.round(frp)} MW (FRP)`);
+    if (brightness) R('BRIGHTNESS',`${Math.round(brightness)} K`);
+    if (lat != null) R('LAT',      `${Number(lat).toFixed(4)}°`);
+    if (lon != null) R('LON',      `${Number(lon).toFixed(4)}°`);
+    rows.push(`<div class="info-row dim tiny" style="flex-direction:column;align-items:flex-start;margin-top:4px"><span>Analysing cause via GDELT…</span></div>`);
   }
 
   rows.push(`<div id="enrich-data" class="enrich-section"><div class="enrich-loading"><span class="loading-spinner" style="width:12px;height:12px;border-width:1.5px"></span><span class="dim tiny" style="margin-left:6px">QUERYING DATABASES…</span></div></div>`);
@@ -1412,6 +1457,42 @@ async function autoEnrich(entity, type, props) {
       const noradId = tleEntry.tle1.substring(2,7).trim();
       if (noradId) url = `/api/enrich/satellite/${noradId}`;
     }
+  }
+
+  // Fire: fetch GDELT cause-analysis context
+  if (type === 'fire') {
+    const lat = props.lat?.getValue?.() ?? props.lat;
+    const lon = props.lon?.getValue?.() ?? props.lon;
+    const frp = props.frp?.getValue?.() ?? props.frp ?? 0;
+    if (lat != null && lon != null) {
+      try {
+        const r = await fetch(`/api/fire/context?lat=${lat}&lon=${lon}&frp=${frp}`);
+        const ctx = await r.json();
+        const rows = [];
+        rows.push(`<div class="info-row"><span class="info-key">INTENSITY</span><span class="info-val">${escHtml(ctx.frpClass||'')}</span></div>`);
+        rows.push(`<div class="info-row"><span class="info-key">LIKELY CAUSE</span><span class="info-val" style="color:#f59e0b;font-weight:600">${escHtml(ctx.cause||'Unknown')}</span></div>`);
+        if (ctx.articles && ctx.articles.length) {
+          rows.push(`<div class="enrich-section-hdr" style="margin-top:8px;font-size:9px;letter-spacing:.1em;color:#888">RELATED NEWS</div>`);
+          for (const a of ctx.articles.slice(0, 4)) {
+            const causeTag = a.cause && a.cause !== 'Unknown / Under Investigation'
+              ? `<span class="osint-event-type et-conflict" style="font-size:8px">${escHtml(a.cause)}</span>` : '';
+            rows.push(`<div class="info-row" style="flex-direction:column;align-items:flex-start;gap:2px">
+              ${causeTag}
+              <a href="${escHtml(a.url||'#')}" target="_blank" class="enrich-link" style="font-size:10px;white-space:normal;text-align:left">${escHtml((a.title||'').substring(0,90))}</a>
+              <span class="dim tiny">${escHtml(a.source||'')} — ${escHtml(a.date||'').substring(0,10)}</span>
+            </div>`);
+          }
+        } else {
+          rows.push(`<div class="dim tiny" style="padding:4px 0">No news articles found nearby</div>`);
+        }
+        enrichDiv.innerHTML = rows.join('');
+      } catch(e) {
+        enrichDiv.innerHTML = `<div class="dim tiny">Context unavailable: ${escHtml(e.message)}</div>`;
+      }
+    } else {
+      enrichDiv.innerHTML = '';
+    }
+    return;
   }
 
   if (!url) { enrichDiv.innerHTML = ''; return; }

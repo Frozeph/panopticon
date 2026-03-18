@@ -221,7 +221,7 @@ app.get('/api/ships', async (req, res) => {
           type:    parseInt(p.shipType || 0),
           ts:      Date.now(),
         };
-      }).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90 && Math.abs(s.lon) <= 180 && s.mmsi);
+      }).filter(s => s.lat != null && s.lon != null && !isNaN(s.lat) && !isNaN(s.lon) && Math.abs(s.lat) <= 90 && Math.abs(s.lon) <= 180 && s.mmsi);
 
       // Fetch vessel names separately
       if (ships.length > 0) {
@@ -621,6 +621,91 @@ app.get('/api/wildfires', async (req, res) => {
   res.set('Cache-Control','max-age=900').json((firmsCache.data||[]).filter(f=>f.lat>=minLat&&f.lat<=maxLat&&f.lon>=minLon&&f.lon<=maxLon).slice(0,2000));
 });
 
+// ─── FIRE CAUSE CONTEXT ───────────────────────────────────────────────────────
+// Given a fire location, pull GDELT news + RSS to surface likely cause
+const fireCauseCache = new Map();
+const FIRE_CAUSE_PATTERNS = [
+  { cause: 'Lightning Strike',   re: /lightning|thunderstorm|electrical storm/i },
+  { cause: 'Agricultural Burn',  re: /agricultural|crop burn|stubble|field burn|controlled burn|prescribed burn|slash.and.burn/i },
+  { cause: 'Arson / Deliberate', re: /arson|deliberately set|suspected arson|incendiary|intentional/i },
+  { cause: 'Power Line / Infrastructure', re: /power line|utility|electricity|transformer|sparks?|downed wire/i },
+  { cause: 'Industrial / Factory', re: /factory|industrial|plant|refinery|warehouse|explosion/i },
+  { cause: 'Drought / Climate',  re: /drought|heat wave|heatwave|climate|dry condition|record heat|hot.dry/i },
+  { cause: 'Military / Conflict',re: /conflict|war|attack|shelling|airstrike|bombing|military operation/i },
+  { cause: 'Campfire / Human',   re: /campfire|campsite|human|accidental|negligence|cigarette/i },
+];
+
+function classifyFireCause(text) {
+  for (const pat of FIRE_CAUSE_PATTERNS) {
+    if (pat.re.test(text)) return pat.cause;
+  }
+  return 'Unknown / Under Investigation';
+}
+
+app.get('/api/fire/context', async (req, res) => {
+  const lat = parseFloat(req.query.lat);
+  const lon = parseFloat(req.query.lon);
+  const frp = parseFloat(req.query.frp) || 0;
+  if (isNaN(lat) || isNaN(lon)) return res.status(400).json({ error: 'lat/lon required' });
+
+  const cacheKey = `fire_${lat.toFixed(1)}_${lon.toFixed(1)}`;
+  const cached = fireCauseCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 30 * 60 * 1000) return res.json(cached.data);
+
+  // Approximate country/region from GDELT query
+  // GDELT V2 DOC API — search for fire news near this location in past 7 days
+  const results = { articles: [], cause: 'Unknown / Under Investigation', frpClass: '', weather: null };
+
+  // FRP classification
+  if (frp > 1000) results.frpClass = 'Extreme (>1000 MW) — major wildfire';
+  else if (frp > 300) results.frpClass = 'High (300–1000 MW) — large fire';
+  else if (frp > 50) results.frpClass = 'Moderate (50–300 MW)';
+  else results.frpClass = 'Low (<50 MW) — small fire or agricultural burn';
+
+  try {
+    // GDELT V2: search within 1 degree of the fire location
+    const latMin = (lat - 1).toFixed(2), latMax = (lat + 1).toFixed(2);
+    const lonMin = (lon - 1).toFixed(2), lonMax = (lon + 1).toFixed(2);
+    const gdeltUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=fire+OR+wildfire+OR+blaze&mode=artlist&maxrecords=10&timespan=7d&format=json&geoloc=${lat.toFixed(2)},${lon.toFixed(2)},100`;
+    const r = await fetchUrl(gdeltUrl, { timeout: 10000 });
+    if (r.status === 200) {
+      const d = JSON.parse(r.data);
+      const arts = d.articles || [];
+      const combined = arts.map(a => `${a.title} ${a.seendescription || ''}`).join(' ');
+      results.cause = classifyFireCause(combined) !== 'Unknown / Under Investigation'
+        ? classifyFireCause(combined)
+        : results.cause;
+      results.articles = arts.slice(0, 5).map(a => ({
+        title: (a.title || '').substring(0, 120),
+        url: a.url,
+        source: a.domain,
+        date: a.seendate,
+        cause: classifyFireCause(`${a.title} ${a.seendescription || ''}`),
+      }));
+    }
+  } catch(e) { console.warn('[FireContext] GDELT:', e.message); }
+
+  // Also search our RSS cache for nearby fire news
+  try {
+    for (const [, cache] of osintCache) {
+      if (!cache || !cache.posts) continue;
+      for (const p of cache.posts.slice(0, 50)) {
+        const txt = `${p.title} ${p.description || ''}`;
+        if (/fire|wildfire|blaze|burn/i.test(txt)) {
+          const cause = classifyFireCause(txt);
+          if (cause !== 'Unknown / Under Investigation' && results.cause === 'Unknown / Under Investigation') {
+            results.cause = cause;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  fireCauseCache.set(cacheKey, { data: results, ts: Date.now() });
+  setTimeout(() => fireCauseCache.delete(cacheKey), 30 * 60 * 1000);
+  res.json(results);
+});
+
 const weatherCache = new Map();
 app.get('/api/weather', async (req, res) => {
   const lat=parseFloat(req.query.lat), lon=parseFloat(req.query.lon);
@@ -639,13 +724,36 @@ let jammingCache={data:null,ts:0,date:''};
 app.get('/api/jamming', async (req, res) => {
   const d=req.query.date||new Date(Date.now()-86400000).toISOString().substring(0,10);
   if (jammingCache.data&&jammingCache.date===d&&Date.now()-jammingCache.ts<3600000) return res.json(jammingCache.data);
-  try {
-    const r=await fetchUrl(`https://gpsjam.org/data/jamming-${d}.csv`);
-    if (r.status!==200) throw new Error(`HTTP ${r.status}`);
-    const hexes=r.data.trim().split('\n').filter(l=>l&&!l.startsWith('#')).map(l=>{const p=l.split(',');return{h:p[0]?.trim(),p:Math.round(parseFloat(p[1]))};}).filter(h=>h.h&&h.p>=2);
-    jammingCache={data:{date:d,count:hexes.length,hexes},ts:Date.now(),date:d};
-    res.set('Cache-Control','max-age=3600').json(jammingCache.data);
-  } catch(e) { res.status(503).json({error:e.message,hexes:[]}); }
+  // Try today, then yesterday, then two days ago — gpsjam.org publishes with a lag
+  const datesToTry = [d,
+    new Date(Date.now()-86400000).toISOString().substring(0,10),
+    new Date(Date.now()-172800000).toISOString().substring(0,10),
+  ];
+  let lastErr = 'no data';
+  for (const tryDate of datesToTry) {
+    try {
+      const r = await fetchUrl(`https://gpsjam.org/data/jamming-${tryDate}.csv`, {
+        headers: {
+          'Referer': 'https://gpsjam.org/',
+          'Origin':  'https://gpsjam.org',
+          'Accept':  'text/csv,text/plain,*/*',
+          'Sec-Fetch-Site': 'same-origin',
+          'Sec-Fetch-Mode': 'cors',
+        },
+      });
+      if (r.status !== 200) { lastErr = `HTTP ${r.status} for ${tryDate}`; continue; }
+      if (!r.data || r.data.length < 50) { lastErr = `empty response for ${tryDate}`; continue; }
+      const hexes = r.data.trim().split('\n')
+        .filter(l => l && !l.startsWith('#') && l.includes(','))
+        .map(l => { const p = l.split(','); return { h: p[0]?.trim(), p: Math.round(parseFloat(p[1])) }; })
+        .filter(h => h.h && !isNaN(h.p) && h.p >= 2);
+      if (hexes.length === 0) { lastErr = `0 hexes parsed for ${tryDate}`; continue; }
+      jammingCache = { data: { date: tryDate, count: hexes.length, hexes }, ts: Date.now(), date: tryDate };
+      console.log(`[Jamming] ${hexes.length} hexes for ${tryDate}`);
+      return res.set('Cache-Control','max-age=3600').json(jammingCache.data);
+    } catch(e) { lastErr = e.message; }
+  }
+  res.status(503).json({ error: lastErr, hexes: [], hint: 'gpsjam.org may be blocking server-side requests — try from a residential IP' });
 });
 
 app.get('/api/cctv', async (req,res) => {
