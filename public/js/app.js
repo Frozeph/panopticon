@@ -1162,19 +1162,19 @@ function renderFires(fires) {
 }
 
 // ─── GPS JAMMING ──────────────────────────────────────────────────────────────
-// Fetch directly from the browser (residential IP) to avoid WAF blocking that
-// hits server-side proxies going through Cloudflare tunnel / datacenter IPs.
-// gpsjam.org serves CSV files with CORS headers (their own Cesium app uses them).
+// GPS Jamming — two-path fetch strategy:
+//  1. Browser fetches CSV directly from gpsjam.org (residential IP, bypasses Cloudflare WAF),
+//     then POSTs raw hex IDs to /api/jamming/convert for server-side H3 boundary computation.
+//  2. Falls back to /api/jamming server proxy (single call: fetch + convert).
+// No h3-js browser library needed — all H3 computation is server-side.
 async function fetchJamming() {
   if (!S.layers.jamming) return;
 
-  // Try today, yesterday, 2 days ago — gpsjam.org publishes with a lag
+  // --- Attempt 1: browser fetches CSV → server converts hex IDs to polygons ---
   const dates = [0, 1, 2].map(n => {
     const d = new Date(Date.now() - n * 86400000);
     return d.toISOString().substring(0, 10);
   });
-
-  // --- Attempt 1: direct browser fetch (bypasses server-side WAF) ---
   for (const date of dates) {
     try {
       const r = await fetch(`https://gpsjam.org/data/jamming-${date}.csv`, { mode: 'cors' });
@@ -1185,75 +1185,72 @@ async function fetchJamming() {
         .filter(l => l && !l.startsWith('#') && l.includes(','))
         .map(l => { const p = l.split(','); return { h: p[0]?.trim(), p: Math.round(parseFloat(p[1])) }; })
         .filter(h => h.h && !isNaN(h.p) && h.p >= 2);
-      if (hexes.length > 0) {
-        renderJamming(hexes, date);
-        log(`GPS Jam: ${hexes.length} cells (direct) for ${date}`);
+      if (hexes.length === 0) continue;
+      // POST hex IDs to server for H3 → polygon conversion (no h3-js in browser)
+      const conv = await fetch('/api/jamming/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hexes }),
+      });
+      if (!conv.ok) throw new Error(`convert ${conv.status}`);
+      const { polygons } = await conv.json();
+      if (polygons && polygons.length > 0) {
+        renderJamming(polygons, date);
+        log(`GPS Jam: ${polygons.length} polygons (direct+convert) for ${date}`);
         return;
       }
-    } catch(_) { /* CORS blocked or network error — fall through to server proxy */ break; }
+    } catch(_) { break; }
   }
 
-  // --- Attempt 2: server proxy (works when direct fetch is CORS-blocked) ---
+  // --- Attempt 2: server proxy (fetches + converts in one hop) ---
   try {
     const r = await fetch('/api/jamming');
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
-    if ((data.hexes || []).length > 0) {
-      renderJamming(data.hexes, data.date);
-      log(`GPS Jam: ${data.count} cells (proxy) for ${data.date}`);
+    if ((data.polygons || []).length > 0) {
+      renderJamming(data.polygons, data.date);
+      log(`GPS Jam: ${data.count} polygons (proxy) for ${data.date}`);
     } else {
-      log(`GPS Jam: no data — ${data.error || 'empty response'}. gpsjam.org may be blocking server IP.`, 'warn');
+      log(`GPS Jam: no data — ${data.error || 'empty'}. gpsjam.org may be blocking server IP.`, 'warn');
     }
   } catch(e) { log(`Jamming fetch failed: ${e.message}`, 'warn'); }
 }
 
-function renderJamming(hexes, date) {
+// renderJamming — accepts polygons array from server: [{coords: [[lng,lat],...], p: number}]
+// No h3-js library needed in the browser — boundaries are pre-computed server-side.
+function renderJamming(polygons, date) {
   if (S.jammingDs) S.viewer.dataSources.remove(S.jammingDs, true);
   if (!S.layers.jamming) return;
 
   const ds = new Cesium.CustomDataSource('jamming');
-  const h3lib = window.h3; // loaded from h3-js CDN
-
-  if (!h3lib) {
-    log('H3 library not loaded — jamming layer unavailable', 'warn');
-    S.viewer.dataSources.add(ds); S.jammingDs = ds; return;
-  }
-
-  // Cap for performance — sort by probability desc, take top 600
-  const cappedHexes = hexes.length > 600
-    ? [...hexes].sort((a, b) => b.p - a.p).slice(0, 600)
-    : hexes;
-
   let rendered = 0;
-  for (const h of cappedHexes) {
-    try {
-      // h3-js v4: cellToBoundary returns [[lat, lng], [lat, lng], ...]
-      const boundary = h3lib.cellToBoundary(h.h);
-      if (!boundary || boundary.length < 3) continue;
-      // Validate all coords are finite — NaN causes wgs84To2DModelMatrix crash
-      if (boundary.some(([lat, lng]) => !isFinite(lat) || !isFinite(lng))) continue;
 
-      const pct  = Math.min(100, Math.max(0, h.p));
+  for (const poly of polygons) {
+    try {
+      const { coords, p } = poly;
+      if (!coords || coords.length < 3) continue;
+      // Validate all coords are finite — NaN causes wgs84To2DModelMatrix crash
+      if (coords.some(([lng, lat]) => !isFinite(lng) || !isFinite(lat))) continue;
+
+      const pct   = Math.min(100, Math.max(0, p));
       const alpha = 0.15 + (pct / 100) * 0.65;
       const color = pct > 70 ? '#ff2222' : pct > 40 ? '#ff6600' : '#ffcc00';
       const cesColor = Cesium.Color.fromCssColorString(color);
 
-      // Build degreesArray [lng, lat, lng, lat, ...] for PolygonHierarchy
-      const degArr = boundary.flatMap(([lat, lng]) => [lng, lat]);
+      // coords are already [lng, lat] — flatten to [lng, lat, lng, lat, ...] for fromDegreesArray
+      const degArr = coords.flatMap(([lng, lat]) => [lng, lat]);
 
       ds.entities.add({
-        id: `jam_${h.h}`,
         name: `GPS Jamming ${pct}%`,
         polygon: {
           hierarchy: new Cesium.PolygonHierarchy(
             Cesium.Cartesian3.fromDegreesArray(degArr)
           ),
           material:           cesColor.withAlpha(alpha * 0.6),
-          // NOTE: outline:true is INCOMPATIBLE with classificationType:TERRAIN — omit outline entirely.
-          // classificationType drapes the polygon over terrain correctly (no height needed).
+          // NOTE: outline:true is INCOMPATIBLE with classificationType:TERRAIN — omit outline.
           classificationType: Cesium.ClassificationType.TERRAIN,
         },
-        properties: { type: 'jamming', probability: pct, hexId: h.h },
+        properties: { type: 'jamming', probability: pct },
       });
       rendered++;
     } catch {}
@@ -1261,7 +1258,8 @@ function renderJamming(hexes, date) {
 
   S.viewer.dataSources.add(ds);
   S.jammingDs = ds;
-  log(`GPS Jamming: ${rendered} rendered (top ${cappedHexes.length} of ${hexes.length} total) — ${date}`);
+  scheduleRender();
+  log(`GPS Jamming: ${rendered} rendered of ${polygons.length} total — ${date}`);
 }
 
 // ─── MESHTASTIC ───────────────────────────────────────────────────────────────
@@ -2099,9 +2097,7 @@ async function initPlayback() {
 async function init() {
   log('NEXUS v7.0 initialising…');
 
-  // Verify H3 library loaded
-  if (window.h3) log(`H3 library ready (v${window.h3.UNITS||'?'})`);
-  else log('H3 library not loaded — GPS jamming layer unavailable', 'warn');
+  // H3 computation is server-side — no browser library required for GPS jamming layer
 
   // Polling intervals (layers auto-short-circuit if disabled)
   startPolling();

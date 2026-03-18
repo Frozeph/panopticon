@@ -13,6 +13,9 @@ const http      = require('http');
 const path      = require('path');
 const fs        = require('fs');
 const WebSocket = require('ws');
+// h3-js: server-side H3 hex boundary computation (avoids browser CDN MIME issues)
+let h3lib = null;
+try { h3lib = require('h3-js'); } catch(e) { console.warn('[H3] h3-js not installed — GPS jamming layer disabled. Run: npm install'); }
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -786,6 +789,34 @@ app.get('/api/weather', async (req, res) => {
   } catch(e) { res.status(503).json({error:e.message}); }
 });
 
+// Convert array of {h, p} hex objects to {polygons: [{coords:[[lng,lat],...], p}]} using server-side h3-js
+function hexesToPolygons(hexes) {
+  if (!h3lib) return null;
+  const top600 = hexes.length > 600 ? [...hexes].sort((a,b)=>b.p-a.p).slice(0,600) : hexes;
+  const polygons = [];
+  for (const h of top600) {
+    try {
+      // cellToBoundary returns [[lat,lng],...] in h3-js v4
+      const boundary = h3lib.cellToBoundary(h.h);
+      if (!boundary || boundary.length < 3) continue;
+      if (boundary.some(([lat,lng]) => !isFinite(lat)||!isFinite(lng))) continue;
+      // Reformat to [[lng,lat],...] for Cesium fromDegreesArray compat
+      polygons.push({ coords: boundary.map(([lat,lng])=>[lng,lat]), p: h.p });
+    } catch(_) {}
+  }
+  return polygons;
+}
+
+// POST /api/jamming/convert — client sends raw hex IDs (browser-fetched from gpsjam.org), server returns polygons
+app.use(express.json({ limit: '1mb' }));
+app.post('/api/jamming/convert', (req, res) => {
+  if (!h3lib) return res.status(503).json({ error: 'h3-js not installed on server' });
+  const hexes = req.body?.hexes;
+  if (!Array.isArray(hexes)) return res.status(400).json({ error: 'body.hexes must be array' });
+  const polygons = hexesToPolygons(hexes);
+  res.json({ polygons, count: polygons ? polygons.length : 0 });
+});
+
 let jammingCache={data:null,ts:0,date:''};
 app.get('/api/jamming', async (req, res) => {
   const d=req.query.date||new Date(Date.now()-86400000).toISOString().substring(0,10);
@@ -814,12 +845,19 @@ app.get('/api/jamming', async (req, res) => {
         .map(l => { const p = l.split(','); return { h: p[0]?.trim(), p: Math.round(parseFloat(p[1])) }; })
         .filter(h => h.h && !isNaN(h.p) && h.p >= 2);
       if (hexes.length === 0) { lastErr = `0 hexes parsed for ${tryDate}`; continue; }
-      jammingCache = { data: { date: tryDate, count: hexes.length, hexes }, ts: Date.now(), date: tryDate };
-      console.log(`[Jamming] ${hexes.length} hexes for ${tryDate}`);
+      // Convert to polygons server-side — browser needs no h3-js library
+      const polygons = hexesToPolygons(hexes);
+      if (!polygons) {
+        // h3-js not installed; fall back to shipping raw hex IDs (legacy)
+        jammingCache = { data: { date: tryDate, count: hexes.length, hexes, polygons: null }, ts: Date.now(), date: tryDate };
+      } else {
+        jammingCache = { data: { date: tryDate, count: polygons.length, polygons }, ts: Date.now(), date: tryDate };
+      }
+      console.log(`[Jamming] ${hexes.length} hexes → ${polygons ? polygons.length : 'raw'} polygons for ${tryDate}`);
       return res.set('Cache-Control','max-age=3600').json(jammingCache.data);
     } catch(e) { lastErr = e.message; }
   }
-  res.status(503).json({ error: lastErr, hexes: [], hint: 'gpsjam.org may be blocking server-side requests — try from a residential IP' });
+  res.status(503).json({ error: lastErr, polygons: [], hint: 'gpsjam.org may be blocking server-side requests' });
 });
 
 app.get('/api/cctv', async (req,res) => {
