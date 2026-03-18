@@ -102,10 +102,8 @@ S.viewer = new Cesium.Viewer('cesiumContainer', {
     subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
     credit: '© CARTO © OpenStreetMap contributors',
   }),
-  // Real 3D terrain — ESRI WorldElevation3D (free, no API key)
-  terrainProvider:        new Cesium.ArcGISTiledElevationTerrainProvider({
-    url: 'https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer',
-  }),
+  // Start with a flat ellipsoid; ESRI terrain loaded async below (Cesium 1.104+)
+  terrainProvider:        new Cesium.EllipsoidTerrainProvider(),
   timeline:               false,
   animation:              false,
   homeButton:             false,
@@ -120,6 +118,19 @@ S.viewer = new Cesium.Viewer('cesiumContainer', {
   skyAtmosphere:          new Cesium.SkyAtmosphere(),
   requestRenderMode:      false,
   scene3DOnly:            false,
+});
+
+// Load ESRI WorldElevation3D terrain asynchronously (required Cesium 1.104+
+// where ArcGISTiledElevationTerrainProvider became async — passing it directly
+// to the Viewer constructor breaks init entirely)
+Cesium.ArcGISTiledElevationTerrainProvider.fromUrl(
+  'https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer'
+).then(tp => {
+  S.viewer.terrainProvider = tp;
+  S._esriTerrainProvider = tp; // keep ref for applyBasemap() exaggeration
+  log('3D terrain loaded (ESRI WorldElevation3D)', 'ok');
+}).catch(e => {
+  console.warn('ESRI terrain unavailable, using ellipsoid:', e.message);
 });
 
 // Dark void background
