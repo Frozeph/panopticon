@@ -13,7 +13,8 @@
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const CFG = {
-  cesiumToken: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI1NGFiZGQxMy0zZDJjLTQ2OGYtYjFmNi02ZTQwMzM4NjNjN2EiLCJpZCI6Mjk0MjEsImlhdCI6MTU5MzI0OTM5Mn0.yAfCt9LQFf0j-bPJnBiVaAGVknQF1eFjPh1WNt_LCWY',
+  // Token injected from Docker env via /api/config.js → window.CESIUM_ION_TOKEN
+  cesiumToken: (typeof window !== 'undefined' && window.CESIUM_ION_TOKEN) ? window.CESIUM_ION_TOKEN : '',
   refreshFlights:   8000,
   refreshMilitary: 12000,
   refreshShips:    10000,
@@ -165,7 +166,10 @@ async function applyBasemap(mode) {
   const layers = S.viewer.imageryLayers;
 
   // Terrain exaggeration based on mode
-  try { S.viewer.scene.globe.terrainExaggeration = (mode === 'terrain') ? 2.5 : 1.0; } catch {}
+  // scene.verticalExaggeration replaces deprecated globe.terrainExaggeration (Cesium 1.113+)
+  try { S.viewer.scene.verticalExaggeration = (mode === 'terrain') ? 2.5 : 1.0; } catch {
+    try { S.viewer.scene.globe.terrainExaggeration = (mode === 'terrain') ? 2.5 : 1.0; } catch {}
+  }
 
   try {
     if (mode === 'dark') {
@@ -579,6 +583,7 @@ function renderSatFootprints(now) {
             outline:       true,
             outlineColor:  cesColor.withAlpha(0.60),   // was 0.22
             outlineWidth:  1.5,
+            height:        0,                          // required with heightReference:CLAMP_TO_GROUND
             heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           },
         });
@@ -596,6 +601,7 @@ function renderSatFootprints(now) {
             outline:       true,
             outlineColor:  cesColor.withAlpha(info.type === 'station' ? 0.95 : 0.85),  // was 0.85/0.5
             outlineWidth:  info.type === 'station' ? 2.5 : 1.5,
+            height:        0,                          // required with heightReference:CLAMP_TO_GROUND
             heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           },
         });
@@ -1080,11 +1086,8 @@ function renderJamming(hexes, date) {
             Cesium.Cartesian3.fromDegreesArray(degArr)
           ),
           material:           cesColor.withAlpha(alpha * 0.6),
-          outline:            true,
-          outlineColor:       cesColor.withAlpha(Math.min(1, alpha + 0.3)),
-          outlineWidth:       1.5,
-          // DO NOT set height:0 with terrain — polygons at height:0 go below terrain surface.
-          // classificationType drapes the polygon over terrain correctly.
+          // NOTE: outline:true is INCOMPATIBLE with classificationType:TERRAIN — omit outline entirely.
+          // classificationType drapes the polygon over terrain correctly (no height needed).
           classificationType: Cesium.ClassificationType.TERRAIN,
         },
         properties: { type: 'jamming', probability: pct, hexId: h.h },
@@ -2200,9 +2203,9 @@ async function checkTripwires() {
   if (!tripwireData.length) return;
   try {
     // Collect current entity arrays
-    const flights  = S.flightDs   ? [...S.flightDs.entities.values()].map(e => { const p = e.properties; return [p.icao?.getValue?.()||'', p.callsign?.getValue?.()||'', p.country?.getValue?.()||'', 0,0, p.lon?.getValue?.(),p.lat?.getValue?.(),p.altM?.getValue?.()]; }) : [];
-    const military = S.militaryDs ? [...S.militaryDs.entities.values()].map(e => { const p = e.properties; return [p.icao?.getValue?.()||'', p.callsign?.getValue?.()||'', p.country?.getValue?.()||'', 0,0, p.lon?.getValue?.(),p.lat?.getValue?.(),p.altM?.getValue?.()]; }) : [];
-    const ships    = S.shipDs     ? [...S.shipDs.entities.values()].map(e => { const p = e.properties; return { name: p.name?.getValue?.(), mmsi: p.mmsi?.getValue?.(), lat: p.lat?.getValue?.(), lon: p.lon?.getValue?.() }; }) : [];
+    const flights  = S.flightDs   ? [...S.flightDs.entities.values].map(e => { const p = e.properties; return [p.icao?.getValue?.()||'', p.callsign?.getValue?.()||'', p.country?.getValue?.()||'', 0,0, p.lon?.getValue?.(),p.lat?.getValue?.(),p.altM?.getValue?.()]; }) : [];
+    const military = S.militaryDs ? [...S.militaryDs.entities.values].map(e => { const p = e.properties; return [p.icao?.getValue?.()||'', p.callsign?.getValue?.()||'', p.country?.getValue?.()||'', 0,0, p.lon?.getValue?.(),p.lat?.getValue?.(),p.altM?.getValue?.()]; }) : [];
+    const ships    = S.shipDs     ? [...S.shipDs.entities.values].map(e => { const p = e.properties; return { name: p.name?.getValue?.(), mmsi: p.mmsi?.getValue?.(), lat: p.lat?.getValue?.(), lon: p.lon?.getValue?.() }; }) : [];
 
     const r = await fetch('/api/tripwires/check', {
       method: 'POST',
@@ -2240,7 +2243,7 @@ function openEntityGraph() {
   const processDS = (ds, entityType, color) => {
     if (!ds) return;
     let count = 0;
-    for (const entity of ds.entities.values()) {
+    for (const entity of ds.entities.values) {
       if (count++ > 60) break; // cap for performance
       const p = entity.properties;
       const id = entity.id;
@@ -2386,7 +2389,7 @@ function snapshotEntityPositions() {
   const now = Date.now();
   const dataSources = [S.flightDs, S.militaryDs, S.shipDs].filter(Boolean);
   for (const ds of dataSources) {
-    for (const entity of ds.entities.values()) {
+    for (const entity of ds.entities.values) {
       const p = entity.properties;
       const type = p.type?.getValue?.() || '';
       if (!['flight','military','ship'].includes(type)) continue;

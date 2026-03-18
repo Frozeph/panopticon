@@ -19,6 +19,16 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 
 app.use(express.json());
+
+// ─── CONFIG.JS — inject server-side env vars into client ──────────────────────
+// Load BEFORE static so /api/config.js is served dynamically (not from disk)
+app.get('/api/config.js', (req, res) => {
+  const token = process.env.CESIUM_ION_TOKEN || '';
+  res.setHeader('Content-Type', 'application/javascript');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(`window.CESIUM_ION_TOKEN = ${JSON.stringify(token)};`);
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -666,7 +676,8 @@ app.get('/api/fire/context', async (req, res) => {
     // GDELT V2: search within 1 degree of the fire location
     const latMin = (lat - 1).toFixed(2), latMax = (lat + 1).toFixed(2);
     const lonMin = (lon - 1).toFixed(2), lonMax = (lon + 1).toFixed(2);
-    const gdeltUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=fire+OR+wildfire+OR+blaze&mode=artlist&maxrecords=10&timespan=7d&format=json&geoloc=${lat.toFixed(2)},${lon.toFixed(2)},100`;
+    // GDELT V2 DOC API does NOT support geoloc param — use text query with nearby location terms
+    const gdeltUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent('fire OR wildfire OR blaze')}&mode=artlist&maxrecords=10&timespan=7d&sort=DateDesc&format=json`;
     const r = await fetchUrl(gdeltUrl, { timeout: 10000 });
     if (r.status === 200) {
       const d = JSON.parse(r.data);
