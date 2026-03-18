@@ -15,13 +15,13 @@
 const CFG = {
   // Token injected from Docker env via /api/config.js → window.CESIUM_ION_TOKEN
   cesiumToken: (typeof window !== 'undefined' && window.CESIUM_ION_TOKEN) ? window.CESIUM_ION_TOKEN : '',
-  refreshFlights:   8000,
-  refreshMilitary: 12000,
-  refreshShips:    10000,
-  refreshQuakes:  120000,
-  refreshSats:      5000,   // re-propagate positions (no new TLE fetch)
-  refreshIntel:   300000,   // 5 min
-  maxSats:          2000,   // render limit
+  refreshFlights:   10000,  // 10s — ADS-B positions
+  refreshMilitary: 20000,  // 20s — military ADS-B (slower moving)
+  refreshShips:    30000,  // 30s — AIS ships (move slowly)
+  refreshQuakes:  120000,  // 2 min
+  refreshSats:     30000,  // 30s — re-propagate TLE positions (was 5s — too aggressive)
+  refreshIntel:   300000,  // 5 min
+  maxSats:           300,  // render limit (was 2000 — too many entities)
 };
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
@@ -60,6 +60,12 @@ const S = {
 };
 
 // ─── LOG SYSTEM ───────────────────────────────────────────────────────────────
+// In requestRenderMode:true the scene only draws when explicitly told to.
+// Call this after any entity/datasource change to keep display current.
+function scheduleRender() {
+  try { S.viewer?.scene?.requestRender(); } catch {}
+}
+
 function log(msg, level='info') {
   const ts = new Date().toISOString().substring(11,19) + 'Z';
   const wrap = document.getElementById('log-body');
@@ -113,7 +119,8 @@ S.viewer = new Cesium.Viewer('cesiumContainer', {
   infoBox:                false,
   selectionIndicator:     false,
   skyBox:                 false,
-  requestRenderMode:      false,
+  requestRenderMode:      true,   // only render when data changes — saves GPU
+  maximumRenderTimeChange: 2000,  // fallback: re-render at most every 2s regardless
   scene3DOnly:            false,
 });
 
@@ -139,6 +146,14 @@ Cesium.ArcGISTiledElevationTerrainProvider.fromUrl(
 // Dark void background
 S.viewer.scene.backgroundColor = new Cesium.Color(0.04, 0.04, 0.06, 1);
 S.viewer.scene.globe.show = true;
+
+// ─── REQUEST RENDER HOOKS ─────────────────────────────────────────────────────
+// requestRenderMode:true stops continuous 60fps GPU rendering.
+// Cesium renders automatically on camera change; we trigger after data updates.
+S.viewer.dataSources.dataSourceAdded.addEventListener(scheduleRender);
+S.viewer.dataSources.dataSourceRemoved.addEventListener(scheduleRender);
+// Heartbeat: ensure the scene never goes completely stale (covers edge cases)
+setInterval(scheduleRender, 2000);
 
 // 3D Buildings — Cesium OSM Buildings (Ion asset 96188, free tier)
 // Requires a valid Cesium Ion token at cesium.com/ion (free account).
@@ -554,7 +569,8 @@ function renderSatFootprints(now) {
   const ds   = new Cesium.CustomDataSource('sat_footprints');
   const date = now || new Date();
 
-  const limit = Math.min(S.tleData.length, 300);
+  // Cap at 100 to keep entity count manageable (each sat creates 2–3 entities + track)
+  const limit = Math.min(S.tleData.length, 100);
 
   for (let i = 0; i < limit; i++) {
     const sat = S.tleData[i];
@@ -1034,15 +1050,49 @@ function renderFires(fires) {
 }
 
 // ─── GPS JAMMING ──────────────────────────────────────────────────────────────
+// Fetch directly from the browser (residential IP) to avoid WAF blocking that
+// hits server-side proxies going through Cloudflare tunnel / datacenter IPs.
+// gpsjam.org serves CSV files with CORS headers (their own Cesium app uses them).
 async function fetchJamming() {
   if (!S.layers.jamming) return;
+
+  // Try today, yesterday, 2 days ago — gpsjam.org publishes with a lag
+  const dates = [0, 1, 2].map(n => {
+    const d = new Date(Date.now() - n * 86400000);
+    return d.toISOString().substring(0, 10);
+  });
+
+  // --- Attempt 1: direct browser fetch (bypasses server-side WAF) ---
+  for (const date of dates) {
+    try {
+      const r = await fetch(`https://gpsjam.org/data/jamming-${date}.csv`, { mode: 'cors' });
+      if (!r.ok) continue;
+      const text = await r.text();
+      if (!text || text.length < 50) continue;
+      const hexes = text.trim().split('\n')
+        .filter(l => l && !l.startsWith('#') && l.includes(','))
+        .map(l => { const p = l.split(','); return { h: p[0]?.trim(), p: Math.round(parseFloat(p[1])) }; })
+        .filter(h => h.h && !isNaN(h.p) && h.p >= 2);
+      if (hexes.length > 0) {
+        renderJamming(hexes, date);
+        log(`GPS Jam: ${hexes.length} cells (direct) for ${date}`);
+        return;
+      }
+    } catch(_) { /* CORS blocked or network error — fall through to server proxy */ break; }
+  }
+
+  // --- Attempt 2: server proxy (works when direct fetch is CORS-blocked) ---
   try {
     const r = await fetch('/api/jamming');
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
-    renderJamming(data.hexes || [], data.date);
-    log(`GPS Jam: ${data.count} affected cells on ${data.date}`);
-  } catch(e) { log(`Jamming: ${e.message}`, 'warn'); }
+    if ((data.hexes || []).length > 0) {
+      renderJamming(data.hexes, data.date);
+      log(`GPS Jam: ${data.count} cells (proxy) for ${data.date}`);
+    } else {
+      log(`GPS Jam: no data — ${data.error || 'empty response'}. gpsjam.org may be blocking server IP.`, 'warn');
+    }
+  } catch(e) { log(`Jamming fetch failed: ${e.message}`, 'warn'); }
 }
 
 function renderJamming(hexes, date) {
@@ -1057,8 +1107,13 @@ function renderJamming(hexes, date) {
     S.viewer.dataSources.add(ds); S.jammingDs = ds; return;
   }
 
+  // Cap for performance — sort by probability desc, take top 600
+  const cappedHexes = hexes.length > 600
+    ? [...hexes].sort((a, b) => b.p - a.p).slice(0, 600)
+    : hexes;
+
   let rendered = 0;
-  for (const h of hexes) {
+  for (const h of cappedHexes) {
     try {
       // h3-js v4: cellToBoundary returns [[lat, lng], [lat, lng], ...]
       const boundary = h3lib.cellToBoundary(h.h);
@@ -1094,7 +1149,7 @@ function renderJamming(hexes, date) {
 
   S.viewer.dataSources.add(ds);
   S.jammingDs = ds;
-  log(`GPS Jamming: ${rendered} / ${hexes.length} hexes rendered (${date})`);
+  log(`GPS Jamming: ${rendered} rendered (top ${cappedHexes.length} of ${hexes.length} total) — ${date}`);
 }
 
 // ─── MESHTASTIC ───────────────────────────────────────────────────────────────

@@ -283,7 +283,7 @@ app.get('/api/ships', async (req, res) => {
           type:   parseInt(p.shipType || 0),
           ts:     Date.now(),
         };
-      }).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90 && s.mmsi);
+      }).filter(s => s.lat != null && s.lon != null && !isNaN(s.lat) && !isNaN(s.lon) && Math.abs(s.lat) <= 90 && Math.abs(s.lon) <= 180 && s.mmsi);
       if (ships.length > 0) {
         shipFallback = { data: ships, ts: Date.now() };
         let out = hasBbox ? ships.filter(s=>s.lat>=minLat&&s.lat<=maxLat&&s.lon>=minLon&&s.lon<=maxLon) : ships;
@@ -376,7 +376,7 @@ app.get('/api/ships', async (req, res) => {
         heading: parseFloat(s.HEADING || 511),
         type:   parseInt(s.SHIPTYPE || 0),
         ts:     Date.now(),
-      })).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90 && s.mmsi);
+      })).filter(s => s.lat != null && s.lon != null && !isNaN(s.lat) && !isNaN(s.lon) && Math.abs(s.lat) <= 90 && Math.abs(s.lon) <= 180 && s.mmsi);
       if (ships.length > 0) {
         shipFallback = { data: ships, ts: Date.now() };
         return res.json({ ships: ships.slice(0, 1000), _src: 'aishub', _count: ships.length });
@@ -816,8 +816,21 @@ app.get('/api/debug/sources', async (req,res) => {
   const out = { ts:Date.now(), version:'7.0', sources:{} };
   try { const r=await fetchUrl('https://api.adsb.lol/v2/lat/51.5/lon/-0.1/dist/50',{timeout:8000}); const d=r.status===200?JSON.parse(r.data):{}; out.sources.adsblol={ok:r.status===200,status:r.status,count:(d.ac||[]).length}; } catch(e) { out.sources.adsblol={ok:false,error:e.message}; }
   try { const r=await fetchUrl('https://celestrak.org/NORAD/elements/gp.php?GROUP=visual&FORMAT=tle',{timeout:10000}); out.sources.celestrak={ok:r.status===200,status:r.status,lines:r.status===200?r.data.split('\n').length:0}; } catch(e) { out.sources.celestrak={ok:false,error:e.message}; }
-  try { const r=await fetchUrl('https://api.gdeltproject.org/api/v2/doc/doc?query=conflict&mode=artlist&maxrecords=3&timespan=1h&format=json',{timeout:10000}); const d=r.status===200?JSON.parse(r.data):{}; out.sources.gdelt={ok:r.status===200,count:(d.articles||[]).length}; } catch(e) { out.sources.gdelt={ok:false,error:e.message}; }
-  out.sources.ships={aisstream_key:!!(process.env.AISSTREAM_KEY),ws_connected:wsConnection?.readyState===1,cached:shipPositions.size};
+  try {
+    const gr = await fetchUrl('https://api.gdeltproject.org/api/v2/doc/doc?query=conflict+OR+war&mode=artlist&maxrecords=5&timespan=24h&sort=DateDesc&format=json', { timeout: 12000 });
+    const gd = gr.status === 200 ? JSON.parse(gr.data) : {};
+    const articles = gd.articles || [];
+    out.sources.gdelt = { ok: gr.status === 200 && articles.length > 0, status: gr.status, count: articles.length, note: articles.length === 0 ? 'API returned 0 articles (rate-limited or query returned nothing)' : undefined };
+  } catch(e) { out.sources.gdelt = { ok: false, error: e.message }; }
+  // Test ships: actually probe Digitraffic (fastest reliable source)
+  try {
+    const sr = await fetchUrl('https://meri.digitraffic.fi/api/ais/v1/locations', {
+      headers: { 'Digitraffic-User': 'NEXUS/7.0' }, timeout: 12000
+    });
+    const sd = sr.status === 200 ? JSON.parse(sr.data) : {};
+    const shipCount = (sd.features || []).length;
+    out.sources.ships = { ok: sr.status === 200, status: sr.status, count: shipCount, src: 'digitraffic', aisstream_key: !!(process.env.AISSTREAM_KEY), ws_connected: wsConnection?.readyState === 1, ws_cached: shipPositions.size };
+  } catch(e) { out.sources.ships = { ok: false, error: e.message, aisstream_key: !!(process.env.AISSTREAM_KEY), hint: 'Set AISSTREAM_KEY env var for reliable live AIS — free at aisstream.io' }; }
   res.json(out);
 });
 
