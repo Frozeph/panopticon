@@ -567,6 +567,9 @@ function renderSatFootprints(now) {
       const isGEO = h > 35000;
       const info  = classifyReconSat(sat.name, h);
       const cesColor = Cesium.Color.fromCssColorString(info.color);
+      // Guard against NaN positions (failed SGP4 propagation) — NaN Cartesian3
+      // causes wgs84To2DModelMatrix to crash with "can't access property longitude"
+      if (!isFinite(pos.lng) || !isFinite(pos.lat)) continue;
       const groundPos = Cesium.Cartesian3.fromDegrees(pos.lng, pos.lat, 0);
 
       // ── ACCESS AREA — maximum off-nadir pointing circle
@@ -579,12 +582,11 @@ function renderSatFootprints(now) {
           ellipse: {
             semiMinorAxis: accessRadM,
             semiMajorAxis: accessRadM,
-            material:      cesColor.withAlpha(0.10),   // was 0.03 — much more visible
+            material:      cesColor.withAlpha(0.10),
             outline:       true,
-            outlineColor:  cesColor.withAlpha(0.60),   // was 0.22
+            outlineColor:  cesColor.withAlpha(0.60),
             outlineWidth:  1.5,
-            height:        0,                          // required with heightReference:CLAMP_TO_GROUND
-            heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            height:        0,  // ground level; no heightReference — avoids wgs84To2DModelMatrix crash
           },
         });
       }
@@ -597,12 +599,11 @@ function renderSatFootprints(now) {
           ellipse: {
             semiMinorAxis: isGEO ? 2500000 : swathRadM,
             semiMajorAxis: isGEO ? 2500000 : swathRadM,
-            material:      cesColor.withAlpha(info.type === 'station' ? 0.25 : 0.18),  // was 0.12/0.07
+            material:      cesColor.withAlpha(info.type === 'station' ? 0.25 : 0.18),
             outline:       true,
-            outlineColor:  cesColor.withAlpha(info.type === 'station' ? 0.95 : 0.85),  // was 0.85/0.5
+            outlineColor:  cesColor.withAlpha(info.type === 'station' ? 0.95 : 0.85),
             outlineWidth:  info.type === 'station' ? 2.5 : 1.5,
-            height:        0,                          // required with heightReference:CLAMP_TO_GROUND
-            heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            height:        0,  // ground level; no heightReference — avoids wgs84To2DModelMatrix crash
           },
         });
       }
@@ -625,7 +626,7 @@ function renderSatFootprints(now) {
           const t = new Date(date.getTime() - spanMs / 2 + (spanMs * s / 40));
           try {
             const tp = sgp4Position(sat.tle1, sat.tle2, t);
-            if (tp) trackPositions.push(Cesium.Cartesian3.fromDegrees(tp.lng, tp.lat, 0));
+            if (tp && isFinite(tp.lng) && isFinite(tp.lat)) trackPositions.push(Cesium.Cartesian3.fromDegrees(tp.lng, tp.lat, 0));
           } catch {}
         }
         if (trackPositions.length > 2) {
@@ -1062,20 +1063,15 @@ function renderJamming(hexes, date) {
       // h3-js v4: cellToBoundary returns [[lat, lng], [lat, lng], ...]
       const boundary = h3lib.cellToBoundary(h.h);
       if (!boundary || boundary.length < 3) continue;
-
-      // Build Cartesian3 positions for the hex polygon
-      const cartPositions = boundary.map(([lat, lng]) =>
-        Cesium.Cartesian3.fromDegrees(lng, lat, 200) // 200m elevation for visibility
-      );
-      // Close polygon
-      cartPositions.push(cartPositions[0]);
+      // Validate all coords are finite — NaN causes wgs84To2DModelMatrix crash
+      if (boundary.some(([lat, lng]) => !isFinite(lat) || !isFinite(lng))) continue;
 
       const pct  = Math.min(100, Math.max(0, h.p));
       const alpha = 0.15 + (pct / 100) * 0.65;
       const color = pct > 70 ? '#ff2222' : pct > 40 ? '#ff6600' : '#ffcc00';
       const cesColor = Cesium.Color.fromCssColorString(color);
 
-      // Build degreesArray for PolygonHierarchy
+      // Build degreesArray [lng, lat, lng, lat, ...] for PolygonHierarchy
       const degArr = boundary.flatMap(([lat, lng]) => [lng, lat]);
 
       ds.entities.add({
