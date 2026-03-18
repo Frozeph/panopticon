@@ -636,12 +636,14 @@ function renderSatFootprints(now) {
       }
 
       // ── SUB-SATELLITE POINT (nadir marker)
+      // No heightReference — avoids wgs84To2DModelMatrix crash with CLAMP_TO_GROUND.
+      // disableDepthTestDistance ensures the dot is always visible above terrain.
       ds.entities.add({
         position: groundPos,
         point: {
           pixelSize: info.type === 'station' ? 5 : 2,
           color: cesColor.withAlpha(0.8),
-          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+          disableDepthTestDistance: 1e9,
         },
       });
 
@@ -854,29 +856,30 @@ function renderFlights(states, isMilitary) {
   // Update existing or add new entities
   for (const [id, sp] of incoming) {
     const { icao, callsign, lon, lat, altM, altFt, spdKt, track, onGround, displayAlt, color, country, speed } = sp;
-    const cesColor   = Cesium.Color.fromCssColorString(color);
-    const labelText  = `${callsign||icao}\n${altFt ? altFt.toLocaleString()+'ft' : 'GND'} ${spdKt}kt`;
-    const newPos     = Cesium.Cartesian3.fromDegrees(lon, lat, displayAlt);
-    const hRef       = (altM || 0) < 50 ? Cesium.HeightReference.CLAMP_TO_GROUND : Cesium.HeightReference.NONE;
+    const cesColor  = Cesium.Color.fromCssColorString(color);
+    const labelText = `${callsign||icao}\n${altFt ? altFt.toLocaleString()+'ft' : 'GND'} ${spdKt}kt`;
+    const newPos    = Cesium.Cartesian3.fromDegrees(lon, lat, displayAlt);
+    // NOTE: No heightReference on ANY point entity — CLAMP_TO_GROUND triggers
+    // wgs84To2DModelMatrix which crashes with "can't access property longitude"
+    // when any position component is NaN. Use disableDepthTestDistance instead.
 
     const existing = ds.entities.getById(id);
     if (existing) {
       // ── Incremental update: only mutate what changes each cycle ──
-      existing.position  = newPos;
-      existing.name      = callsign || icao || 'Unknown';
-      existing.point.color              = cesColor.withAlpha(0.95);
-      existing.point.heightReference    = hRef;
-      existing.label.text               = labelText;
-      existing.label.fillColor          = cesColor.withAlpha(0.95);
+      existing.position        = newPos;
+      existing.name            = callsign || icao || 'Unknown';
+      existing.point.color     = cesColor.withAlpha(0.95);
+      existing.label.text      = labelText;
+      existing.label.fillColor = cesColor.withAlpha(0.95);
       // Update mutable properties
-      existing.properties.lat       = lat;
-      existing.properties.lon       = lon;
-      existing.properties.altM      = altM;
-      existing.properties.altFt     = altFt;
-      existing.properties.speed     = speed;
-      existing.properties.spdKt     = spdKt;
-      existing.properties.track     = track;
-      existing.properties.onGround  = onGround;
+      existing.properties.lat      = lat;
+      existing.properties.lon      = lon;
+      existing.properties.altM     = altM;
+      existing.properties.altFt    = altFt;
+      existing.properties.speed    = speed;
+      existing.properties.spdKt    = spdKt;
+      existing.properties.track    = track;
+      existing.properties.onGround = onGround;
     } else {
       // ── First time we see this aircraft ──
       ds.entities.add({
@@ -884,22 +887,22 @@ function renderFlights(states, isMilitary) {
         name: callsign || icao || 'Unknown',
         position: newPos,
         point: {
-          pixelSize:   isMilitary ? 7 : 5,
-          color:       cesColor.withAlpha(0.95),
+          pixelSize:    isMilitary ? 7 : 5,
+          color:        cesColor.withAlpha(0.95),
           outlineColor: Cesium.Color.BLACK.withAlpha(0.7),
           outlineWidth: isMilitary ? 2 : 1,
-          scaleByDistance: new Cesium.NearFarScalar(1e5, 1.8, 8e6, 0.5),
-          heightReference: hRef,
-          disableDepthTestDistance: 1e6,
+          scaleByDistance:          new Cesium.NearFarScalar(1e5, 1.8, 8e6, 0.5),
+          disableDepthTestDistance: 1e9,
         },
         label: {
-          text:     labelText,
-          font:     '10px JetBrains Mono, monospace',
+          text:      labelText,
+          font:      '10px JetBrains Mono, monospace',
           fillColor: cesColor.withAlpha(0.95),
           outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
-          style:    Cesium.LabelStyle.FILL_AND_OUTLINE,
+          style:     Cesium.LabelStyle.FILL_AND_OUTLINE,
           pixelOffset: new Cesium.Cartesian2(0, -18),
-          translucencyByDistance: new Cesium.NearFarScalar(5e5, 1, 3e6, 0),
+          translucencyByDistance:   new Cesium.NearFarScalar(5e5, 1, 3e6, 0),
+          disableDepthTestDistance: 1e9,
           backgroundColor: new Cesium.Color(0,0,0,0.45),
           showBackground: true,
         },
@@ -1168,7 +1171,9 @@ function renderShips(ships) {
         outlineColor: Cesium.Color.BLACK.withAlpha(0.6),
         outlineWidth: 1.5,
         scaleByDistance: new Cesium.NearFarScalar(1e4, 2, 3e6, 0.5),
-        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+        // No heightReference — CLAMP_TO_GROUND triggers wgs84To2DModelMatrix crash.
+        // disableDepthTestDistance keeps ships visible above terrain at all zoom levels.
+        disableDepthTestDistance: 1e9,
       },
       label: {
         text: name.length > 10 ? name.substring(0, 10) + '…' : name,
