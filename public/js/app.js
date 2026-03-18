@@ -741,13 +741,19 @@ async function fetchFlights() {
   if (!S.layers.flights) return;
   const { lat, lon } = getCameraInfo();
 
-  // Global view (camera > 3000km alt): fetch multi-region global data
-  if (S.cameraAlt > 3000000) {
+  // ── LOD tiers based on approximate viewport width ──────────────────────────
+  // viewWidthNm ≈ cameraAlt_m * 1.15 / 1852  (60° FOV approximation)
+  // Tier 1 — global (> ~1500km alt / ~930nm view): multi-region endpoint
+  // Tier 2 — regional (100–930nm view): radius-based with up to 250nm
+  // Tier 3 — local (< 100nm view): tight 50nm radius for maximum detail
+
+  if (S.cameraAlt > 1500000) {
+    // Global view — use pre-aggregated multi-region data
     try {
       const r = await fetch('/api/flights/global');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const data = await r.json();
-      const states = (data.states || []).filter(s => s[5]!=null && s[6]!=null);
+      const states = (data.states || []).filter(s => s[5] != null && s[6] != null);
       renderFlights(states, false);
       document.getElementById('cnt-air').textContent = states.length;
       if (data._src) log(`Flights (global): ${states.length} from ${data._src}`);
@@ -755,14 +761,27 @@ async function fetchFlights() {
     } catch(e) { log(`GlobalFlights: ${e.message}`, 'warn'); }
   }
 
-  // Zoomed-in regional view
-  const dist = Math.min(Math.max(S.cameraAlt / 1000 * 0.5, 100), 250);
+  // Compute viewport width in NM and choose dist accordingly
+  const viewWidthNm = S.cameraAlt * 1.15 / 1852;
+  let distNm;
+  if (viewWidthNm < 100) {
+    // High LOD — tight local area, full aircraft density
+    distNm = Math.max(Math.round(viewWidthNm / 2), 25);
+  } else if (viewWidthNm < 500) {
+    // Medium LOD — regional view
+    distNm = Math.min(Math.round(viewWidthNm / 2), 200);
+  } else {
+    // Wide regional — cap at 250nm (ADSBExchange max)
+    distNm = 250;
+  }
+
   try {
-    const r = await fetch(`/api/flights/opensky?lat=${lat.toFixed(2)}&lon=${lon.toFixed(2)}&dist=${Math.round(dist)}`);
+    const r = await fetch(`/api/flights/opensky?lat=${lat.toFixed(3)}&lon=${lon.toFixed(3)}&dist=${distNm}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     renderFlights(data.states || [], false);
     document.getElementById('cnt-air').textContent = (data.states || []).length;
+    if (data._src) log(`Flights: ${(data.states||[]).length} ac (${data._src}, ${distNm}nm radius)`);
   } catch(e) { log(`Flights: ${e.message}`, 'warn'); }
 }
 
@@ -866,8 +885,101 @@ function shipIcon(color, heading, type) {
   return `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${w}" viewBox="0 0 16 16"><g transform="rotate(${h},8,8)"><path d="M8 1 L11 12 L8 10 L5 12 Z" fill="${color}" stroke="#000" stroke-width="0.5"/></g></svg>`)}`;
 }
 
+// ─── AISSTREAM.IO CLIENT-SIDE WEBSOCKET ───────────────────────────────────────
+// Connects the browser directly to AISStream, bypassing the Cloudflare tunnel
+// IP issue that blocks server-side requests. Position data stored in S.aisCache.
+// Key injected server-side via /api/config.js → window.AISSTREAM_KEY.
+S.aisCache      = new Map(); // mmsi → ship object
+S.aisWs         = null;
+S.aisConnected  = false;
+S.aisReconnTimer = null;
+
+function initAISStream() {
+  const key = (typeof window !== 'undefined' && window.AISSTREAM_KEY) ? window.AISSTREAM_KEY : '';
+  if (!key) return; // no key — will use server REST fallback
+
+  clearTimeout(S.aisReconnTimer);
+  if (S.aisWs && S.aisWs.readyState <= 1) return; // already connecting or connected
+
+  try {
+    const ws = new WebSocket('wss://stream.aisstream.io/v0/stream');
+    S.aisWs = ws;
+
+    ws.onopen = () => {
+      S.aisConnected = true;
+      // Subscribe to all position reports — filter by viewport on render
+      ws.send(JSON.stringify({
+        APIKey: key,
+        BoundingBoxes: [[[-90, -180], [90, 180]]],
+        FilterMessageTypes: ['PositionReport', 'StandardClassBPositionReport'],
+      }));
+      log('AISStream connected (live ship feed)', 'ok');
+    };
+
+    ws.onmessage = (evt) => {
+      try {
+        const msg  = JSON.parse(evt.data);
+        const meta = msg.MetaData || {};
+        const pos  = msg.Message?.PositionReport || msg.Message?.StandardClassBPositionReport;
+        if (!pos) return;
+        const mmsi = String(meta.MMSI || pos.UserID || '');
+        if (!mmsi) return;
+        const lat = parseFloat(meta.latitude  ?? pos.Latitude  ?? NaN);
+        const lon = parseFloat(meta.longitude ?? pos.Longitude ?? NaN);
+        if (!isFinite(lat) || !isFinite(lon)) return;
+        S.aisCache.set(mmsi, {
+          mmsi, lat, lon,
+          name:    (meta.ShipName || '').trim(),
+          speed:   pos.Sog || 0,
+          course:  pos.Cog || 0,
+          heading: pos.TrueHeading || 511,
+          status:  pos.NavigationalStatus || 0,
+          type:    meta.ShipType || 0,
+          ts:      Date.now(),
+        });
+      } catch {}
+    };
+
+    ws.onclose = () => {
+      S.aisConnected = false;
+      S.aisWs = null;
+      // Reconnect after 30s
+      S.aisReconnTimer = setTimeout(initAISStream, 30000);
+    };
+
+    ws.onerror = () => { ws.close(); };
+  } catch(e) {
+    console.warn('[AISStream]', e.message);
+    S.aisReconnTimer = setTimeout(initAISStream, 60000);
+  }
+}
+
+// Prune stale AIS entries (>15 min old)
+setInterval(() => {
+  const cut = Date.now() - 15 * 60 * 1000;
+  for (const [k, v] of S.aisCache) if (v.ts < cut) S.aisCache.delete(k);
+}, 30000);
+
 async function fetchShips() {
   if (!S.layers.ships) return;
+
+  // ── Priority 1: live AISStream WebSocket cache (browser-direct connection)
+  if (S.aisConnected && S.aisCache.size > 0) {
+    const bbox = getViewportBbox();
+    let ships = [...S.aisCache.values()];
+    if (bbox && S.cameraAlt < 5000000) {
+      const pad = 2;
+      ships = ships.filter(s =>
+        s.lat >= bbox.minLat - pad && s.lat <= bbox.maxLat + pad &&
+        s.lon >= bbox.minLon - pad && s.lon <= bbox.maxLon + pad
+      );
+    }
+    renderShips(ships);
+    document.getElementById('cnt-ais').textContent = ships.length;
+    return;
+  }
+
+  // ── Priority 2: server REST endpoint (falls back through Digitraffic etc.)
   const bbox = getViewportBbox();
   let url = '/api/ships';
   if (bbox && S.cameraAlt < 5000000) {
@@ -1800,6 +1912,9 @@ document.getElementById('btn-fullscreen').addEventListener('click', () => {
 
 // ─── REFRESH INTERVALS ────────────────────────────────────────────────────────
 // Polling intervals run regardless, but fetch functions short-circuit if layer is off
+// AISStream connects immediately on startup — ships update in real-time when key present
+initAISStream();
+
 function startPolling() {
   S.intervals.flights  = setInterval(fetchFlights,  CFG.refreshFlights);
   S.intervals.military = setInterval(fetchMilitary, CFG.refreshMilitary);

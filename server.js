@@ -23,10 +23,16 @@ app.use(express.json());
 // ─── CONFIG.JS — inject server-side env vars into client ──────────────────────
 // Load BEFORE static so /api/config.js is served dynamically (not from disk)
 app.get('/api/config.js', (req, res) => {
-  const token = process.env.CESIUM_ION_TOKEN || '';
+  const cesiumToken  = process.env.CESIUM_ION_TOKEN    || '';
+  const aisstreamKey = process.env.AISSTREAM_KEY        || '';
+  const adsbxKey     = process.env.ADSBX_RAPIDAPI_KEY   || '';
   res.setHeader('Content-Type', 'application/javascript');
   res.setHeader('Cache-Control', 'no-store');
-  res.send(`window.CESIUM_ION_TOKEN = ${JSON.stringify(token)};`);
+  res.send([
+    `window.CESIUM_ION_TOKEN  = ${JSON.stringify(cesiumToken)};`,
+    `window.AISSTREAM_KEY     = ${JSON.stringify(aisstreamKey)};`,
+    `window.ADSBX_RAPIDAPI_KEY = ${JSON.stringify(adsbxKey)};`,
+  ].join('\n'));
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
@@ -83,68 +89,117 @@ try {
 } catch(e) { console.warn('[DB] SQLite unavailable:', e.message); }
 
 // ─── FLIGHTS ──────────────────────────────────────────────────────────────────
-let adsbCache = { data: null, ts: 0 };
+let adsbCache = { data: null, ts: 0, lat: 0, lon: 0, dist: 0 };
+const ADSBX_KEY  = () => process.env.ADSBX_RAPIDAPI_KEY || '';
+const ADSBX_HOST = 'adsbexchange-com1.p.rapidapi.com';
+
+// Map a raw readsb/adsb.exchange aircraft object → standard states array row
+function acToState(a, isMilitary = false) {
+  return [
+    (a.hex || a.icao || '').toLowerCase(),
+    (a.flight || a.callsign || '').trim(),
+    a.r || '',
+    Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000),
+    a.lon ?? a.lng ?? null,
+    a.lat ?? null,
+    a.alt_baro != null ? (a.alt_baro === 'ground' ? 0 : Math.round(a.alt_baro * 0.3048)) : null,
+    a.alt_baro === 'ground' || false,
+    a.gs != null ? Math.round(a.gs * 0.514444) : null,
+    a.track ?? null, null, null,
+    a.alt_geom != null ? Math.round(a.alt_geom * 0.3048) : null,
+    a.squawk || null, false, 0,
+    a.category || a.t || null,
+    isMilitary || a.military || a.mil || false,
+  ];
+}
 
 app.get('/api/flights/opensky', async (req, res) => {
-  const lat  = parseFloat(req.query.lat)  || 51.5;
-  const lon  = parseFloat(req.query.lon)  || -0.1;
-  const dist = Math.min(parseInt(req.query.dist) || 250, 250);
+  const lat  = parseFloat(req.query.lat) || 51.5;
+  const lon  = parseFloat(req.query.lon) || -0.1;
+  const dist = Math.min(parseInt(req.query.dist) || 250, 250); // NM
 
-  if (adsbCache.data && Date.now() - adsbCache.ts < 8000) return res.json(adsbCache.data);
+  // Short-circuit cache: same area, fresh enough
+  const moved = Math.abs(lat - adsbCache.lat) > 1 || Math.abs(lon - adsbCache.lon) > 1;
+  if (!moved && adsbCache.data && Date.now() - adsbCache.ts < 8000) return res.json(adsbCache.data);
 
+  // ── Priority 1: ADSBExchange via RapidAPI (set ADSBX_RAPIDAPI_KEY in Docker env)
+  if (ADSBX_KEY()) {
+    try {
+      const r = await fetchUrl(
+        `https://${ADSBX_HOST}/v2/lat/${lat.toFixed(4)}/lon/${lon.toFixed(4)}/dist/${dist}/`,
+        { headers: { 'x-rapidapi-key': ADSBX_KEY(), 'x-rapidapi-host': ADSBX_HOST, 'Accept': 'application/json' }, timeout: 10000 }
+      );
+      if (r.status === 200) {
+        const d = JSON.parse(r.data);
+        const states = (d.ac || []).map(a => acToState(a)).filter(s => s[5] != null && s[6] != null);
+        const payload = { states, _src: 'adsbexchange', _count: states.length, time: Math.floor(Date.now() / 1000) };
+        adsbCache = { data: payload, ts: Date.now(), lat, lon, dist };
+        return res.json(payload);
+      }
+      console.warn(`[Flights] ADSBExchange ${r.status}`);
+    } catch(e) { console.warn('[Flights] ADSBExchange:', e.message); }
+  }
+
+  // ── Priority 2: adsb.lol (free, no key)
   try {
     const r = await fetchUrl(`https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${dist}`, {
-      headers: { 'Accept': 'application/json' }
+      headers: { 'Accept': 'application/json' }, timeout: 10000
     });
     if (r.status === 200) {
       const d  = JSON.parse(r.data);
-      const ac = d.ac || d.aircraft || [];
-      const states = ac.map(a => [
-        (a.hex||a.icao||'').toLowerCase(),
-        (a.flight||a.callsign||'').trim(),
-        a.r||'',
-        Math.floor(Date.now()/1000), Math.floor(Date.now()/1000),
-        a.lon ?? a.lng ?? null,
-        a.lat ?? null,
-        a.alt_baro != null ? (a.alt_baro === 'ground' ? 0 : Math.round(a.alt_baro * 0.3048)) : null,
-        a.alt_baro === 'ground' || false,
-        a.gs != null ? Math.round(a.gs * 0.514444) : null,
-        a.track ?? null, null, null,
-        a.alt_geom != null ? Math.round(a.alt_geom * 0.3048) : null,
-        a.squawk||null, false, 0, a.category||a.t||null, a.military||false,
-      ]).filter(s => s[5] != null && s[6] != null);
-      const payload = { states, _src: 'adsblol', _count: states.length, time: Math.floor(Date.now()/1000) };
-      adsbCache = { data: payload, ts: Date.now() };
+      const states = (d.ac || d.aircraft || []).map(a => acToState(a)).filter(s => s[5] != null && s[6] != null);
+      const payload = { states, _src: 'adsblol', _count: states.length, time: Math.floor(Date.now() / 1000) };
+      adsbCache = { data: payload, ts: Date.now(), lat, lon, dist };
       return res.json(payload);
     }
     console.warn(`[Flights] adsb.lol ${r.status}`);
   } catch(e) { console.warn('[Flights] adsb.lol:', e.message); }
 
-  // OpenSky fallback
+  // ── Priority 3: OpenSky (anonymous, rate-limited)
   try {
-    const r = await fetchUrl('https://opensky-network.org/api/states/all');
+    const r = await fetchUrl('https://opensky-network.org/api/states/all', { timeout: 15000 });
     if (r.status === 200) return res.json({ ...JSON.parse(r.data), _src: 'opensky' });
   } catch(e) { console.warn('[Flights] OpenSky:', e.message); }
 
-  res.status(503).json({ states: [], error: 'All flight sources unavailable' });
+  res.status(503).json({ states: [], error: 'All flight sources unavailable. Set ADSBX_RAPIDAPI_KEY env var for reliable data.' });
 });
 
+// ─── MILITARY AIRCRAFT ────────────────────────────────────────────────────────
+// ADSBExchange /v2/mil returns all globally tagged military aircraft.
+// adsb.lol /v2/mil is the free fallback with the same format.
+let milCache = { data: null, ts: 0 };
 app.get('/api/flights/military', async (req, res) => {
+  if (milCache.data && Date.now() - milCache.ts < 15000) return res.json(milCache.data);
+
+  // ── Priority 1: ADSBExchange military endpoint
+  if (ADSBX_KEY()) {
+    try {
+      const r = await fetchUrl(`https://${ADSBX_HOST}/v2/mil/`, {
+        headers: { 'x-rapidapi-key': ADSBX_KEY(), 'x-rapidapi-host': ADSBX_HOST, 'Accept': 'application/json' }, timeout: 12000
+      });
+      if (r.status === 200) {
+        const d = JSON.parse(r.data);
+        const states = (d.ac || []).map(a => acToState(a, true)).filter(s => s[5] != null && s[6] != null);
+        const payload = { states, _src: 'adsbexchange_mil', _count: states.length };
+        milCache = { data: payload, ts: Date.now() };
+        return res.json(payload);
+      }
+      console.warn(`[MilFlights] ADSBExchange ${r.status}`);
+    } catch(e) { console.warn('[MilFlights] ADSBExchange:', e.message); }
+  }
+
+  // ── Priority 2: adsb.lol military (free fallback)
   try {
-    const r = await fetchUrl('https://api.adsb.lol/v2/mil', { headers: { 'Accept': 'application/json' } });
+    const r = await fetchUrl('https://api.adsb.lol/v2/mil', { headers: { 'Accept': 'application/json' }, timeout: 12000 });
     if (r.status === 200) {
       const d = JSON.parse(r.data);
-      const states = (d.ac||d.aircraft||[]).map(a => [
-        (a.hex||'').toLowerCase(), (a.flight||'').trim(), a.r||'',
-        Math.floor(Date.now()/1000), Math.floor(Date.now()/1000),
-        a.lon??a.lng??null, a.lat??null,
-        a.alt_baro != null ? (a.alt_baro === 'ground' ? 0 : Math.round(a.alt_baro*0.3048)) : null,
-        false, a.gs!=null?Math.round(a.gs*0.514444):null, a.track??null,
-        null, null, null, null, false, 0, a.t||null, true,
-      ]).filter(s => s[5]!=null && s[6]!=null);
-      return res.json({ states, _src:'adsblol_mil', _count:states.length });
+      const states = (d.ac || d.aircraft || []).map(a => acToState(a, true)).filter(s => s[5] != null && s[6] != null);
+      const payload = { states, _src: 'adsblol_mil', _count: states.length };
+      milCache = { data: payload, ts: Date.now() };
+      return res.json(payload);
     }
-  } catch(e) { console.warn('[MilFlights]:', e.message); }
+  } catch(e) { console.warn('[MilFlights] adsb.lol:', e.message); }
+
   res.json({ states: [], _count: 0 });
 });
 
