@@ -1,4 +1,4 @@
-/* ══ ARGUS v7 — Dark Ops Aesthetic ══════════════════════════════════════════ */
+/* ══ NEXUS v7 — Dark Ops Aesthetic ══════════════════════════════════════════ */
 :root {
   --bg:       #0a0b0d;
   --bg1:      #0e1014;
@@ -42,7 +42,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg);
 
 /* ── CESIUM ───────────────────────────────────────────────────────────────── */
 #cesiumContainer {
-  position: fixed; top: var(--topbar-h); left: var(--sb-w); right: var(--intel-w);
+  position: fixed; top: var(--topbar-h); left: var(--sb-w); right: 0;
   bottom: var(--log-h); z-index: 0;
 }
 .cesium-widget-credits, .cesium-credit-lightbox-overlay { display: none !important; }
@@ -636,6 +636,65 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg);
 .pol-ts { color: var(--amber); font-size: 10px; font-family: 'JetBrains Mono', monospace; white-space: nowrap; min-width: 80px; }
 .pol-detail { font-size: 11px; color: var(--text); }
 .pol-coord { font-size: 10px; color: var(--text-dd); font-family: 'JetBrains Mono', monospace; }
+
+/* ── ENTITY TRAIL OVERLAY ─────────────────────────────────────────────────── */
+#trail-info {
+  position: fixed; bottom: calc(var(--log-h) + 8px); left: calc(var(--sb-w) + 12px);
+  background: rgba(10,11,13,0.88); border: 1px solid var(--amber-d);
+  border-radius: 4px; padding: 5px 10px; font-size: 10px; font-family: 'JetBrains Mono', monospace;
+  color: var(--amber); z-index: 50; pointer-events: none;
+}
+
+/* ── OSINT CONFLICT FILTER + GEO BADGE ───────────────────────────────────── */
+.osftag[data-type="conflict"] { border-color: rgba(239,68,68,0.35); color: #f87171; }
+.osftag[data-type="conflict"].active { background: rgba(239,68,68,0.15); border-color: rgba(239,68,68,0.6); color: #ef4444; }
+
+#osint-geo-badge {
+  margin: 0 10px 6px; padding: 4px 8px;
+  background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3);
+  border-radius: 3px; font-size: 10px; color: var(--amber);
+  font-family: 'JetBrains Mono', monospace; display: flex; align-items: center; gap: 6px;
+}
+.osint-geo-active { display: flex !important; }
+
+#osint-loc-btn {
+  padding: 4px 7px; background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 3px; color: var(--text-d); cursor: pointer; font-size: 12px;
+  transition: all 0.15s;
+}
+#osint-loc-btn.active { background: rgba(245,158,11,0.15); border-color: var(--amber-d); color: var(--amber); }
+#osint-loc-btn:hover { border-color: var(--amber-d); color: var(--amber); }
+
+/* OSINT event type indicator */
+.osint-event-type {
+  display: inline-block; padding: 1px 5px; border-radius: 2px;
+  font-size: 9px; font-family: 'JetBrains Mono', monospace; font-weight: 600;
+  letter-spacing: 0.5px; margin-right: 4px;
+}
+.et-conflict  { background: rgba(239,68,68,0.15);  border: 1px solid rgba(239,68,68,0.4);  color: #ef4444; }
+.et-military  { background: rgba(245,158,11,0.15); border: 1px solid rgba(245,158,11,0.4); color: var(--amber); }
+.et-protest   { background: rgba(168,85,247,0.15); border: 1px solid rgba(168,85,247,0.4); color: var(--purple); }
+.et-disaster  { background: rgba(249,115,22,0.15); border: 1px solid rgba(249,115,22,0.4); color: #f97316; }
+.et-cyber     { background: rgba(6,182,212,0.15);  border: 1px solid rgba(6,182,212,0.4);  color: var(--cyan); }
+.et-default   { background: rgba(107,114,128,0.15);border: 1px solid rgba(107,114,128,0.4);color: var(--text-d); }
+
+/* Jamming info popup */
+.jam-popup {
+  position: fixed; bottom: calc(var(--log-h) + 8px); right: 12px;
+  background: rgba(10,11,13,0.9); border: 1px solid rgba(255,100,0,0.5);
+  border-radius: 4px; padding: 6px 10px; font-size: 10px;
+  font-family: 'JetBrains Mono', monospace; color: #ff9966; z-index: 50;
+  pointer-events: none;
+}
+
+/* GIBS satellite date badge */
+#gibs-date-badge {
+  position: fixed; bottom: calc(var(--log-h) + 8px); right: 12px;
+  background: rgba(6,182,212,0.12); border: 1px solid rgba(6,182,212,0.4);
+  border-radius: 3px; padding: 4px 8px; font-size: 10px;
+  font-family: 'JetBrains Mono', monospace; color: var(--cyan);
+  z-index: 50; pointer-events: none; display: none;
+}
 
 /* ── TOAST position when intel panel is open ──────────────────────────────── */
 #toasts { right: calc(var(--intel-w) + 10px); }

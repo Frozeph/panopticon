@@ -1,10 +1,13 @@
-/* ══ ARGUS v7 ══════════════════════════════════════════════════════════════════
+/* ══ NEXUS v7 ══════════════════════════════════════════════════════════════════
  * Geospatial Intelligence Dashboard
+ * (Also known as: SENTINEL, OVERSEER, VANTAGE, MERIDIAN, ORACLE, PARALLAX)
  * - satellite.js SGP4 propagation (accurate orbital mechanics)
  * - Viewport-frustum culling: only fetch what's in view
  * - GDELT intel feed: 100+ languages, corroboration scoring
  * - AI natural-language queries via Claude
- * - Fixed: flights (adsb.lol), ships (AIS/VF), satellites (visual group)
+ * - GPS jamming hex grid (H3 resolution 4, gpsjam.org data)
+ * - Entity track trails on click, OSINT geo-filtering, LiveUAMap-style feed
+ * - 3D terrain: ESRI WorldElevation3D (free, no token) + NASA GIBS live sat
  * ═══════════════════════════════════════════════════════════════════════════ */
 'use strict';
 
@@ -34,12 +37,16 @@ const S = {
   meshDs:      null,
   shodanDs:    null,
   intelDs:     null,   // GDELT event pins on map
+  trackDs:     null,   // entity trail polyline
+  osintMarkerDs: null, // OSINT geo-tagged map pins
   intervals:   {},
+  // All layers start OFF for performance — enable individually
   layers: {
-    satellites: true, flights: true, military: true, ships: true,
-    quakes: true, cctv: false, wildfires: false, jamming: false,
-    mesh: false, intel: true, osint: false, maven: false,
+    satellites: false, flights: false, military: false, ships: false,
+    quakes: false, cctv: false, wildfires: false, jamming: false,
+    mesh: false, intel: false, osint: false, maven: false,
   },
+  osintGeoBound: false, // whether OSINT is filtered to viewport
   activeSatGroups: new Set(['visual']),
   showFootprints:  false,
   intelArticles:  [],
@@ -95,7 +102,10 @@ S.viewer = new Cesium.Viewer('cesiumContainer', {
     subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
     credit: '© CARTO © OpenStreetMap contributors',
   }),
-  terrainProvider:        new Cesium.EllipsoidTerrainProvider(),
+  // Real 3D terrain — ESRI WorldElevation3D (free, no API key)
+  terrainProvider:        new Cesium.ArcGISTiledElevationTerrainProvider({
+    url: 'https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer',
+  }),
   timeline:               false,
   animation:              false,
   homeButton:             false,
@@ -119,12 +129,14 @@ S.viewer.scene.globe.show = true;
 // ─── BASEMAP ──────────────────────────────────────────────────────────────────
 // No Ion dependency — use free tile providers so it works without a Cesium token
 async function applyBasemap(mode) {
-  try {
-    S.viewer.imageryLayers.removeAll();
-    S.viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
-  } catch(e) { console.warn('Layer clear error:', String(e)); }
+  try { S.viewer.imageryLayers.removeAll(); } catch(e) { console.warn('Layer clear:', String(e)); }
+  const gibsBadge = document.getElementById('gibs-date-badge');
 
+  // Keep terrain provider intact — only swap imagery
   const layers = S.viewer.imageryLayers;
+
+  // Terrain exaggeration based on mode
+  try { S.viewer.scene.globe.terrainExaggeration = (mode === 'terrain') ? 2.5 : 1.0; } catch {}
 
   try {
     if (mode === 'dark') {
@@ -133,35 +145,58 @@ async function applyBasemap(mode) {
         subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
         credit: '© CARTO © OpenStreetMap contributors',
       }));
+      if (gibsBadge) gibsBadge.style.display = 'none';
 
     } else if (mode === 'satellite') {
-      // ESRI World Imagery — free, no API key, global high-res satellite
       layers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
         url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
         minimumLevel: 0, maximumLevel: 19,
         credit: '© Esri, Maxar, Earthstar Geographics',
       }));
+      if (gibsBadge) gibsBadge.style.display = 'none';
 
     } else if (mode === 'terrain') {
-      // ESRI satellite base + OpenTopoMap overlay for terrain context
       layers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
         url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        minimumLevel: 0, maximumLevel: 18,
-        credit: '© Esri, Maxar',
+        minimumLevel: 0, maximumLevel: 18, credit: '© Esri, Maxar',
       }));
-      // Add terrain provider (no Ion needed — use Cesium's ellipsoid with visual height exaggeration)
-      try {
-        S.viewer.scene.globe.terrainExaggeration = 2.0;
-      } catch {}
+      if (gibsBadge) gibsBadge.style.display = 'none';
+
+    } else if (mode === 'gibs_modis') {
+      // NASA GIBS MODIS Terra TrueColor — near-real-time, ~1-3 day lag
+      const yesterday = new Date(Date.now() - 86400000 * 2).toISOString().substring(0, 10);
+      layers.addImageryProvider(new Cesium.WebMapTileServiceImageryProvider({
+        url: 'https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/' + yesterday + '/250m/{TileMatrix}/{TileRow}/{TileCol}.jpg',
+        layer: 'MODIS_Terra_CorrectedReflectance_TrueColor',
+        style: 'default', format: 'image/jpeg',
+        tileMatrixSetID: '250m',
+        maximumLevel: 8,
+        tilingScheme: new Cesium.GeographicTilingScheme(),
+        credit: '© NASA/GSFC EOSDIS — MODIS Terra (' + yesterday + ')',
+      }));
+      if (gibsBadge) { gibsBadge.textContent = '🛰 MODIS Terra · ' + yesterday; gibsBadge.style.display = 'block'; }
+      log(`GIBS MODIS basemap: ${yesterday}`);
+
+    } else if (mode === 'gibs_viirs') {
+      // NASA GIBS VIIRS SNPP DayNightBand — shows city lights at night
+      const yesterday = new Date(Date.now() - 86400000 * 2).toISOString().substring(0, 10);
+      layers.addImageryProvider(new Cesium.WebMapTileServiceImageryProvider({
+        url: 'https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/VIIRS_SNPP_DayNightBand_AtSensor_Radiance/default/' + yesterday + '/500m/{TileMatrix}/{TileRow}/{TileCol}.tif',
+        layer: 'VIIRS_SNPP_DayNightBand_AtSensor_Radiance',
+        style: 'default', format: 'image/tiff',
+        tileMatrixSetID: '500m',
+        maximumLevel: 7,
+        tilingScheme: new Cesium.GeographicTilingScheme(),
+        credit: '© NASA/GSFC EOSDIS — VIIRS Night (' + yesterday + ')',
+      }));
+      if (gibsBadge) { gibsBadge.textContent = '🌃 VIIRS Night · ' + yesterday; gibsBadge.style.display = 'block'; }
     }
   } catch(e) {
-    // Fallback: always dark tiles if anything fails
     console.warn('Basemap error, falling back to dark tiles:', String(e));
     try {
       layers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
         url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-        subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
-        credit: '© CARTO',
+        subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19, credit: '© CARTO',
       }));
     } catch {}
   }
@@ -872,17 +907,60 @@ async function fetchJamming() {
 function renderJamming(hexes, date) {
   if (S.jammingDs) S.viewer.dataSources.remove(S.jammingDs, true);
   if (!S.layers.jamming) return;
-  // H3 hexagon approximate rendering as points
+
   const ds = new Cesium.CustomDataSource('jamming');
-  for (const h of hexes) {
-    // Simple visual: place a point (real H3 decoding would require h3-js)
-    const alpha = Math.min(0.9, h.p / 100);
-    const color = h.p > 50 ? '#ff0000' : h.p > 25 ? '#ff6600' : '#ffaa00';
-    // We'd need H3 JS to get lat/lon from hex ID — skip if h3 unavailable
-    // Placeholder: can't render without h3-js properly
+  const h3lib = window.h3; // loaded from h3-js CDN
+
+  if (!h3lib) {
+    log('H3 library not loaded — jamming layer unavailable', 'warn');
+    S.viewer.dataSources.add(ds); S.jammingDs = ds; return;
   }
+
+  let rendered = 0;
+  for (const h of hexes) {
+    try {
+      // h3-js v4: cellToBoundary returns [[lat, lng], [lat, lng], ...]
+      const boundary = h3lib.cellToBoundary(h.h);
+      if (!boundary || boundary.length < 3) continue;
+
+      // Build Cartesian3 positions for the hex polygon
+      const cartPositions = boundary.map(([lat, lng]) =>
+        Cesium.Cartesian3.fromDegrees(lng, lat, 200) // 200m elevation for visibility
+      );
+      // Close polygon
+      cartPositions.push(cartPositions[0]);
+
+      const pct  = Math.min(100, Math.max(0, h.p));
+      const alpha = 0.15 + (pct / 100) * 0.65;
+      const color = pct > 70 ? '#ff2222' : pct > 40 ? '#ff6600' : '#ffcc00';
+      const cesColor = Cesium.Color.fromCssColorString(color);
+
+      // Build degreesArray for PolygonHierarchy
+      const degArr = boundary.flatMap(([lat, lng]) => [lng, lat]);
+
+      ds.entities.add({
+        id: `jam_${h.h}`,
+        name: `GPS Jamming ${pct}%`,
+        polygon: {
+          hierarchy: new Cesium.PolygonHierarchy(
+            Cesium.Cartesian3.fromDegreesArray(degArr)
+          ),
+          material:         cesColor.withAlpha(alpha * 0.45),
+          outline:          true,
+          outlineColor:     cesColor.withAlpha(Math.min(1, alpha + 0.2)),
+          outlineWidth:     1.5,
+          height:           0,
+          heightReference:  Cesium.HeightReference.CLAMP_TO_GROUND,
+        },
+        properties: { type: 'jamming', probability: pct, hexId: h.h },
+      });
+      rendered++;
+    } catch {}
+  }
+
   S.viewer.dataSources.add(ds);
   S.jammingDs = ds;
+  log(`GPS Jamming: ${rendered} / ${hexes.length} hexes rendered (${date})`);
 }
 
 // ─── MESHTASTIC ───────────────────────────────────────────────────────────────
@@ -1197,6 +1275,16 @@ function showInfoPanel(entity) {
   body.innerHTML = rows.join('');
   box.classList.remove('hidden');
 
+  // Show trail button for flights and ships, auto-render trail
+  const trailBtn = document.getElementById('info-show-trail');
+  if (type === 'flight' || type === 'military' || type === 'ship') {
+    trailBtn.style.display = '';
+    showEntityTrack(entity);  // auto-draw trail
+  } else {
+    trailBtn.style.display = 'none';
+    clearEntityTrack();
+  }
+
   // Auto-enrich in background
   autoEnrich(entity, type, props);
 }
@@ -1300,7 +1388,84 @@ async function autoEnrich(entity, type, props) {
 
 document.getElementById('info-close').addEventListener('click', () => {
   document.getElementById('info-box').classList.add('hidden');
+  clearEntityTrack();
 });
+
+document.getElementById('info-show-trail').addEventListener('click', () => {
+  if (S.selectedEntity) showEntityTrack(S.selectedEntity);
+});
+
+// ─── ENTITY TRAIL (track history polyline) ────────────────────────────────
+function clearEntityTrack() {
+  if (S.trackDs) { S.viewer.dataSources.remove(S.trackDs, true); S.trackDs = null; }
+  const badge = document.getElementById('trail-info');
+  if (badge) badge.remove();
+}
+
+function showEntityTrack(entity) {
+  clearEntityTrack();
+  if (!entity) return;
+
+  const hist = polHistory.get(entity.id) || [];
+  if (hist.length < 2) {
+    // Not enough history yet — show current position with a pulsing ring
+    const props = entity.properties;
+    const lat = props.lat?.getValue?.() ?? props.lat;
+    const lon = props.lon?.getValue?.() ?? props.lon;
+    if (lat == null || lon == null) return;
+    toast('Track building — check back in a minute', 'info', 3000);
+    return;
+  }
+
+  const ds = new Cesium.CustomDataSource('track_trail');
+  const type  = entity.properties.type?.getValue?.() || entity.properties.type || '';
+  const color = type === 'ship' ? '#2299ff' : type === 'military' ? '#ff3333' : '#22cc88';
+  const cesColor = Cesium.Color.fromCssColorString(color);
+
+  // Full-history polyline (fades from dim to bright at newest end)
+  const positions = hist.map(p => Cesium.Cartesian3.fromDegrees(p.lon, p.lat, (p.alt || 0) * 0.3048));
+  ds.entities.add({
+    polyline: {
+      positions,
+      width:    2.5,
+      material: new Cesium.PolylineGlowMaterialProperty({
+        glowPower:  0.15,
+        color:      cesColor.withAlpha(0.85),
+        taperPower: 0.7,
+      }),
+      clampToGround: (type === 'ship'),
+      arcType:       Cesium.ArcType.GEODESIC,
+    },
+  });
+
+  // Waypoint dots along track
+  for (let i = 0; i < hist.length; i++) {
+    const p    = hist[i];
+    const frac = i / (hist.length - 1);
+    const alpha = 0.3 + frac * 0.65;
+    ds.entities.add({
+      position: Cesium.Cartesian3.fromDegrees(p.lon, p.lat, (p.alt || 0) * 0.3048),
+      point: {
+        pixelSize:  frac > 0.85 ? 5 : 3,
+        color:      cesColor.withAlpha(alpha),
+        outlineColor: Cesium.Color.BLACK.withAlpha(0.5),
+        outlineWidth: 1,
+        disableDepthTestDistance: 1e6,
+      },
+      properties: { ts: p.ts },
+    });
+  }
+
+  S.viewer.dataSources.add(ds);
+  S.trackDs = ds;
+
+  // Trail info badge
+  let badge = document.getElementById('trail-info');
+  if (!badge) { badge = document.createElement('div'); badge.id = 'trail-info'; document.body.appendChild(badge); }
+  const spanMin = Math.round((hist[hist.length-1].ts - hist[0].ts) / 60000);
+  badge.textContent = `〰 TRAIL · ${entity.name} · ${hist.length} pts · ${spanMin}m`;
+  log(`Trail: ${entity.name} — ${hist.length} positions over ${spanMin} min`);
+}
 document.getElementById('info-track').addEventListener('click', () => {
   if (S.selectedEntity) {
     if (S.viewer.trackedEntity === S.selectedEntity) {
@@ -1315,65 +1480,53 @@ document.getElementById('info-track').addEventListener('click', () => {
     }
   }
 });
-document.getElementById('info-shodan').addEventListener('click', () => {
-  if (!S.selectedEntity) return;
-  const props = S.selectedEntity.properties;
-  const country = props?.country?.getValue?.() || props?.country || '';
-  if (country) {
-    document.getElementById('shodan-preset').value = '';
-    document.getElementById('shodan-key').focus();
-    toast(`Set Shodan key then search for country:${country}`, 'info', 4000);
-  }
-});
-
-// ─── SHODAN ───────────────────────────────────────────────────────────────────
-document.getElementById('shodan-go').addEventListener('click', async () => {
-  const key   = document.getElementById('shodan-key').value.trim();
-  const query = document.getElementById('shodan-preset').value;
-  if (!query) { toast('Select a Shodan preset', 'warn'); return; }
-  if (!key)   { toast('Enter Shodan API key', 'warn'); return; }
-
-  if (S.shodanDs) { S.viewer.dataSources.remove(S.shodanDs, true); S.shodanDs = null; }
-  toast('Searching Shodan…', 'info', 3000);
-
-  try {
-    const r = await fetch(`/api/shodan/search?q=${encodeURIComponent(query)}`, {
-      headers: { 'x-shodan-key': key }
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = await r.json();
-    const matches = data.matches || [];
-
-    const ds = new Cesium.CustomDataSource('shodan');
-    for (const m of matches) {
-      if (!m.location?.latitude || !m.location?.longitude) continue;
-      ds.entities.add({
-        id: `shodan_${m.ip_str}`,
-        name: m.ip_str,
-        position: Cesium.Cartesian3.fromDegrees(m.location.longitude, m.location.latitude, 0),
-        point: {
-          pixelSize: 7,
-          color: Cesium.Color.fromCssColorString('#ff3300').withAlpha(0.9),
-          outlineColor: Cesium.Color.fromCssColorString('#ff3300').withAlpha(0.3),
-          outlineWidth: 5,
-        },
-        properties: { type: 'shodan', ip: m.ip_str, port: m.port, org: m.org, country: m.location?.country_name },
-      });
-    }
-    S.viewer.dataSources.add(ds);
-    S.shodanDs = ds;
-    toast(`Shodan: ${matches.length} results`, 'ok', 4000);
-    log(`Shodan: ${matches.length} matches for "${query}"`);
-  } catch(e) { toast(`Shodan: ${e.message}`, 'error'); }
-});
+// ─── SHODAN (UI removed — key configured via server env SHODAN_API_KEY) ────────
+// info-shodan button repurposed: trigger a Shodan search via server-side key
+(function() {
+  const btn = document.getElementById('info-shodan');
+  if (!btn) return; // element removed from UI
+  btn.addEventListener('click', async () => {
+    if (!S.selectedEntity) return;
+    const props = S.selectedEntity.properties;
+    const country = props?.country?.getValue?.() || props?.country || '';
+    if (!country) { toast('No country associated with this entity', 'warn'); return; }
+    if (S.shodanDs) { S.viewer.dataSources.remove(S.shodanDs, true); S.shodanDs = null; }
+    toast(`Querying Shodan: country:${country}…`, 'info', 3000);
+    try {
+      const r = await fetch(`/api/shodan/search?q=${encodeURIComponent('country:' + country)}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      const matches = data.matches || [];
+      const ds = new Cesium.CustomDataSource('shodan');
+      for (const m of matches) {
+        if (!m.location?.latitude || !m.location?.longitude) continue;
+        ds.entities.add({
+          id: `shodan_${m.ip_str}`,
+          name: m.ip_str,
+          position: Cesium.Cartesian3.fromDegrees(m.location.longitude, m.location.latitude, 0),
+          point: {
+            pixelSize: 7,
+            color: Cesium.Color.fromCssColorString('#ff3300').withAlpha(0.9),
+            outlineColor: Cesium.Color.fromCssColorString('#ff3300').withAlpha(0.3),
+            outlineWidth: 5,
+          },
+          properties: { type: 'shodan', ip: m.ip_str, port: m.port, org: m.org, country: m.location?.country_name },
+        });
+      }
+      S.viewer.dataSources.add(ds);
+      S.shodanDs = ds;
+      toast(`Shodan: ${matches.length} results for ${country}`, 'ok', 4000);
+      log(`Shodan: ${matches.length} matches for country:${country}`);
+    } catch(e) { toast(`Shodan: ${e.message}`, 'error'); }
+  });
+})();
 
 // ─── STATUS CHECK ─────────────────────────────────────────────────────────────
 async function checkStatus() {
   try {
     const r = await fetch('/api/status');
     const data = await r.json();
-    const aisPill   = document.getElementById('pill-aisstream');
-    const shodanPill= document.getElementById('pill-shodan');
+    const aisPill = document.getElementById('pill-aisstream');
 
     if (aisPill) {
       const dot = aisPill.querySelector('.dot');
@@ -1381,10 +1534,7 @@ async function checkStatus() {
       else if (data.aisstream) { dot.className='dot amber'; }
       else { dot.className='dot red'; }
     }
-    if (shodanPill) {
-      const dot = shodanPill.querySelector('.dot');
-      dot.className = data.shodan ? 'dot green' : 'dot red';
-    }
+    // Shodan pill removed from UI (key configured server-side via env)
   } catch {}
 }
 
@@ -1414,18 +1564,15 @@ document.getElementById('btn-fullscreen').addEventListener('click', () => {
 });
 
 // ─── REFRESH INTERVALS ────────────────────────────────────────────────────────
+// Polling intervals run regardless, but fetch functions short-circuit if layer is off
 function startPolling() {
-  fetchFlights();
-  fetchMilitary();
-  fetchShips();
-  fetchQuakes();
-
   S.intervals.flights  = setInterval(fetchFlights,  CFG.refreshFlights);
   S.intervals.military = setInterval(fetchMilitary, CFG.refreshMilitary);
   S.intervals.ships    = setInterval(fetchShips,    CFG.refreshShips);
   S.intervals.quakes   = setInterval(fetchQuakes,   CFG.refreshQuakes);
   S.intervals.status   = setInterval(checkStatus,   30000);
   S.intervals.intel    = setInterval(() => { if (S.layers.intel) fetchIntel(); }, CFG.refreshIntel);
+  S.intervals.osint    = setInterval(() => { if (S.layers.osint) fetchOsint(); }, 5 * 60000);
 }
 
 // On camera move stop, refresh viewport-dependent layers
@@ -1458,23 +1605,25 @@ async function initPlayback() {
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 async function init() {
-  log('ARGUS v7.0 initialising…');
+  log('NEXUS v7.0 initialising…');
 
-  // Load initial data
-  await loadSatellites();
+  // Verify H3 library loaded
+  if (window.h3) log(`H3 library ready (v${window.h3.UNITS||'?'})`);
+  else log('H3 library not loaded — GPS jamming layer unavailable', 'warn');
+
+  // Polling intervals (layers auto-short-circuit if disabled)
   startPolling();
   checkStatus();
-  fetchIntel();
   initPlayback();
 
-  // Fly to reasonable starting position
+  // Fly to starting position (Europe/Atlantic overview)
   S.viewer.camera.flyTo({
     destination: Cesium.Cartesian3.fromDegrees(10, 48, 12000000),
     duration: 2,
   });
 
-  log('All systems nominal', 'ok');
-  toast('ARGUS v7.0 online', 'ok', 3000);
+  log('All layers OFF — click layer buttons to enable individually', 'ok');
+  toast('NEXUS v7.0 online — select layers to begin', 'ok', 4000);
 }
 
 // ─── OSINT SOCIAL FEED ────────────────────────────────────────────────────────
@@ -1538,12 +1687,24 @@ document.getElementById('maven-close').addEventListener('click', () => {
 async function fetchOsint(query) {
   if (osintLoading) return;
   osintLoading = true;
-  const q = query || document.getElementById('osint-q').value.trim();
+  const q = query !== undefined ? query : document.getElementById('osint-q').value.trim();
   const list = document.getElementById('osint-items');
   list.innerHTML = `<div class="intel-loading"><div class="loading-spinner"></div><span>AGGREGATING PUBLIC SOURCES…</span></div>`;
 
   try {
-    const r = await fetch(`/api/osint/feed${q ? '?q='+encodeURIComponent(q) : ''}`);
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    // Include viewport bbox for geo-filtering when location lock is active
+    if (S.osintGeoBound) {
+      const bbox = getViewportBbox();
+      if (bbox) {
+        params.set('minLat', bbox.minLat.toFixed(2));
+        params.set('maxLat', bbox.maxLat.toFixed(2));
+        params.set('minLon', bbox.minLon.toFixed(2));
+        params.set('maxLon', bbox.maxLon.toFixed(2));
+      }
+    }
+    const r = await fetch(`/api/osint/feed?${params}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     osintPosts = data.posts || [];
@@ -1551,11 +1712,29 @@ async function fetchOsint(query) {
     document.getElementById('osint-last-update').textContent = new Date().toISOString().substring(11,16) + 'Z';
     document.getElementById('cnt-osint').textContent = data.count;
     renderOsint();
-    log(`OSINT: ${data.count} posts (${data.posts?.filter(p=>p.platform==='reddit').length||0} social, ${data.posts?.filter(p=>p.platform==='rss').length||0} news)`);
+    renderOsintMarkers(osintPosts);
+    const geoNote = data.geoFiltered ? ' 📍' : '';
+    log(`OSINT: ${data.count} posts${geoNote} (${data.posts?.filter(p=>p.platform==='reddit').length||0} social, ${data.posts?.filter(p=>p.platform==='rss').length||0} news)`);
   } catch(e) {
     list.innerHTML = `<div class="intel-empty">⚠ ${e.message}<br><small>Check server connection</small></div>`;
     log(`OSINT: ${e.message}`, 'error');
   } finally { osintLoading = false; }
+}
+
+// Event type classification (LiveUAMap-style)
+const OSINT_EVENT_PATTERNS = [
+  { type: 'conflict',  label: '💥 CONFLICT',  css: 'et-conflict',  re: /\b(attack|struck|strike|airstrike|missile|bomb|rocket|explosion|blast|shelling|drone|killed|casualties|dead|wounded|fighting|battle|troops|offensive|assault|invasion|war|combat|fire|artillery|mortar|ambush|clash|ceasefire|frontline|advance|withdraw|evacuate)\b/i },
+  { type: 'military',  label: '⚔ MILITARY',   css: 'et-military',  re: /\b(military|troops|soldiers|army|navy|air force|nato|forces|deployment|aircraft|carrier|tank|armored|navy|brigade|battalion|regiment|general|admiral|pentagon|defense|ministry of defense)\b/i },
+  { type: 'protest',   label: '✊ PROTEST',   css: 'et-protest',   re: /\b(protest|riot|demonstration|march|unrest|uprising|revolution|coup|civil|resistance|rebel|opposition)\b/i },
+  { type: 'disaster',  label: '⚠ DISASTER',   css: 'et-disaster',  re: /\b(earthquake|flood|tsunami|hurricane|typhoon|cyclone|tornado|wildfire|eruption|landslide|drought|famine|disaster|emergency|evacuation)\b/i },
+  { type: 'cyber',     label: '💻 CYBER',     css: 'et-cyber',     re: /\b(cyber|hack|ransomware|malware|breach|ddos|espionage|leak|intelligence|surveillance|intercept)\b/i },
+];
+
+function classifyEventType(title) {
+  for (const p of OSINT_EVENT_PATTERNS) {
+    if (p.re.test(title)) return p;
+  }
+  return null;
 }
 
 function renderOsint() {
@@ -1564,6 +1743,7 @@ function renderOsint() {
 
   if (osintFilter === 'social')    visible = osintPosts.filter(p => p.platform === 'reddit');
   else if (osintFilter === 'news') visible = osintPosts.filter(p => p.platform === 'rss');
+  else if (osintFilter === 'conflict') visible = osintPosts.filter(p => classifyEventType(p.title)?.type === 'conflict');
   else if (osintFilter === 'high-corr') visible = osintPosts.filter(p => (p.corroboration||1) >= 3);
 
   if (!visible.length) {
@@ -1578,8 +1758,12 @@ function renderOsint() {
     const timeAgo = timeAgoStr(post.date);
     const isNonEnglish = post.lang && post.lang !== 'en';
     const langBadge = isNonEnglish ? `<span class="osint-lang-badge">${post.lang.toUpperCase()}</span>` : '';
-    const platformBadge = `<span class="osint-platform">${post.platform === 'reddit' ? '🟠 '+post.source : '📰 '+post.source}</span>`;
+    const platformIcon = post.platform === 'reddit' ? '🟠' : '📰';
+    const platformBadge = `<span class="osint-platform">${platformIcon} ${post.source}</span>`;
     const scoreStr = post.platform === 'reddit' ? `<span class="osint-score">▲${(post.score||0).toLocaleString()} 💬${post.comments||0}</span>` : '';
+    const evType = classifyEventType(post.title);
+    const evBadge = evType ? `<span class="osint-event-type ${evType.css}">${evType.label}</span>` : '';
+    const geoBadge = post.geoCountry ? `<span class="osint-platform">📍 ${post.geoCountry}</span>` : '';
 
     const div = document.createElement('div');
     div.className = `osint-item ${corrClass} ${platformClass}`.trim();
@@ -1588,16 +1772,12 @@ function renderOsint() {
       <div class="osint-title">${escHtml(post.title)}</div>
       ${post._translated ? `<div class="osint-translated">${escHtml(post._translated)}</div>` : ''}
       <div class="osint-meta">
-        ${platformBadge}
-        ${langBadge}
-        ${scoreStr}
+        ${evBadge}${platformBadge}${geoBadge}${langBadge}${scoreStr}
         <span class="osint-date">${timeAgo}</span>
       </div>`;
 
-    // Click: open source URL
     div.addEventListener('click', () => window.open(post.permalink || post.url, '_blank'));
 
-    // Auto-translate non-English titles (deferred, on visibility)
     if (isNonEnglish && !post._translated) {
       const titleDiv = div.querySelector('.osint-title');
       translateText(post.title, post.lang).then(translated => {
@@ -1607,8 +1787,7 @@ function renderOsint() {
           if (transEl) { transEl.textContent = translated; }
           else {
             const t = document.createElement('div');
-            t.className = 'osint-translated';
-            t.textContent = translated;
+            t.className = 'osint-translated'; t.textContent = translated;
             titleDiv.insertAdjacentElement('afterend', t);
           }
         }
@@ -1617,6 +1796,55 @@ function renderOsint() {
 
     list.appendChild(div);
   }
+}
+
+// ─── OSINT MAP MARKERS (geo-tagged posts plotted on globe) ────────────────
+function renderOsintMarkers(posts) {
+  if (S.osintMarkerDs) { S.viewer.dataSources.remove(S.osintMarkerDs, true); S.osintMarkerDs = null; }
+  if (!S.layers.osint) return;
+
+  const ds = new Cesium.CustomDataSource('osint_markers');
+  let placed = 0;
+
+  for (const post of posts) {
+    if (!post.geoLat || !post.geoLon) continue;
+    const evType = classifyEventType(post.title);
+    const color = evType?.type === 'conflict' ? '#ef4444'
+                : evType?.type === 'military' ? '#f59e0b'
+                : evType?.type === 'protest'  ? '#a855f7'
+                : evType?.type === 'disaster' ? '#f97316'
+                : '#06b6d4';
+    const corr = post.corroboration || 1;
+    const size = Math.max(5, Math.min(14, 5 + corr * 2));
+
+    ds.entities.add({
+      id: `osint_${post.id}`,
+      name: post.title.substring(0, 40),
+      position: Cesium.Cartesian3.fromDegrees(post.geoLon, post.geoLat, 500),
+      point: {
+        pixelSize:   size,
+        color:       Cesium.Color.fromCssColorString(color).withAlpha(0.85),
+        outlineColor: Cesium.Color.fromCssColorString(color).withAlpha(0.3),
+        outlineWidth: corr > 2 ? 5 : 3,
+        disableDepthTestDistance: 1e6,
+      },
+      label: corr > 2 ? {
+        text: (evType?.label || '●').substring(0, 12),
+        font: '9px JetBrains Mono',
+        fillColor: Cesium.Color.fromCssColorString(color).withAlpha(0.9),
+        outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        pixelOffset: new Cesium.Cartesian2(0, -14),
+        translucencyByDistance: new Cesium.NearFarScalar(5e5, 1, 2e6, 0),
+      } : undefined,
+      properties: { type: 'osint_event', ...post },
+    });
+    placed++;
+  }
+
+  S.viewer.dataSources.add(ds);
+  S.osintMarkerDs = ds;
+  if (placed) log(`OSINT markers: ${placed} geo-tagged posts on map`);
 }
 
 // Translation cache (client-side)
@@ -1655,6 +1883,20 @@ document.querySelectorAll('.osftag').forEach(btn => {
     osintFilter = btn.dataset.type;
     renderOsint();
   });
+});
+
+// Geo-lock: filter OSINT to current map viewport
+document.getElementById('osint-loc-btn')?.addEventListener('click', () => {
+  S.osintGeoBound = !S.osintGeoBound;
+  document.getElementById('osint-loc-btn').classList.toggle('active', S.osintGeoBound);
+  document.getElementById('osint-geo-badge').style.display = S.osintGeoBound ? 'flex' : 'none';
+  fetchOsint();
+});
+document.getElementById('osint-geo-clear')?.addEventListener('click', () => {
+  S.osintGeoBound = false;
+  document.getElementById('osint-loc-btn').classList.remove('active');
+  document.getElementById('osint-geo-badge').style.display = 'none';
+  fetchOsint();
 });
 
 // ─── MAVEN — TRIPWIRE / ALERT SYSTEM ─────────────────────────────────────────

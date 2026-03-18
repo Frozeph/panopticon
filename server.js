@@ -1,8 +1,10 @@
 'use strict';
 /**
- * ARGUS v7 — Intelligence Backend
- * Fixes: ships (WS + fallback), flights (adsb.lol), satellites (celestrak proper groups)
- * New: GDELT intel feed (100+ languages, auto-translated), AI natural-language query
+ * NEXUS v7 — Intelligence Backend
+ * Ships: fixed Digitraffic MMSI parsing (mmsi now at feature level), added
+ *        MyShipTracking + MarineTraffic tile fallbacks
+ * OSINT: expanded RSS (conflict/Telegram sources), geo-filtering by bbox,
+ *        country geo-tagging, event classification
  */
 
 const express   = require('express');
@@ -196,44 +198,50 @@ app.get('/api/ships', async (req, res) => {
   // Provides global AIS from receiver network, open data licence, no auth needed
   try {
     const r = await fetchUrl('https://meri.digitraffic.fi/api/ais/v1/locations', {
-      headers: { 'Digitraffic-User': 'ARGUS/7.0 github.com/Frozeph/panopticon', 'Accept': 'application/json' },
+      headers: { 'Digitraffic-User': 'NEXUS/7.0 github.com/Frozeph/panopticon', 'Accept': 'application/json' },
       timeout: 20000,
     });
     log('digitraffic', `HTTP ${r.status}, ${r.data.length} bytes`);
     if (r.status === 200) {
       const d = JSON.parse(r.data);
       const features = d.features || (Array.isArray(d) ? d : []);
+      // IMPORTANT: In the Digitraffic FeatureCollection, mmsi is at the feature
+      // level (f.mmsi), NOT inside f.properties. Properties has sog/cog/heading.
       const ships = features.slice(0, 5000).map(f => {
-        const p = f.properties || f;
+        const p = f.properties || {};
         const g = f.geometry?.coordinates;
         return {
-          mmsi:    String(p.mmsi || ''),
+          mmsi:    String(f.mmsi || p.mmsi || ''),   // mmsi at feature level!
           name:    '',
           lat:     g ? parseFloat(g[1]) : parseFloat(p.lat || 0),
           lon:     g ? parseFloat(g[0]) : parseFloat(p.lon || 0),
           speed:   parseFloat(p.sog || 0),
           course:  parseFloat(p.cog || 0),
           heading: parseFloat(p.heading || 511),
+          type:    parseInt(p.shipType || 0),
           ts:      Date.now(),
         };
-      }).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90 && s.mmsi);
+      }).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90 && Math.abs(s.lon) <= 180 && s.mmsi);
 
       // Fetch vessel names separately
       if (ships.length > 0) {
         try {
           const vr = await fetchUrl('https://meri.digitraffic.fi/api/ais/v1/vessels', {
-            headers: { 'Digitraffic-User': 'ARGUS/7.0 github.com/Frozeph/panopticon' }, timeout: 15000,
+            headers: { 'Digitraffic-User': 'NEXUS/7.0 github.com/Frozeph/panopticon' }, timeout: 15000,
           });
           if (vr.status === 200) {
             const vd = JSON.parse(vr.data);
             const vesselMap = new Map();
-            (vd.features || vd || []).forEach(v => {
+            // vessel list: mmsi also at feature level
+            (vd.features || (Array.isArray(vd) ? vd : [])).forEach(v => {
               const p = v.properties || v;
-              if (p.mmsi) vesselMap.set(String(p.mmsi), (p.name || p.shipName || '').trim());
+              const m = String(v.mmsi || p.mmsi || p.MMSI || '');
+              const name = (p.name || p.shipName || p.NAME || '').trim();
+              if (m && name) vesselMap.set(m, name);
             });
             ships.forEach(s => { if (vesselMap.has(s.mmsi)) s.name = vesselMap.get(s.mmsi); });
           }
-        } catch {}
+        } catch(e) { log('digitraffic', `vessels fetch: ${e.message}`); }
         shipFallback = { data: ships, ts: Date.now() };
         let out = hasBbox ? ships.filter(s=>s.lat>=minLat&&s.lat<=maxLat&&s.lon>=minLon&&s.lon<=maxLon) : ships;
         log('digitraffic', `returning ${out.length} ships`);
@@ -304,6 +312,67 @@ app.get('/api/ships', async (req, res) => {
       }
     }
   } catch(e) { log('vesselfinder', `error: ${e.message}`); }
+
+  // ── Source D: MyShipTracking (public map JSON endpoint)
+  try {
+    const mstLat1 = hasBbox ? minLat : -70, mstLat2 = hasBbox ? maxLat : 70;
+    const mstLon1 = hasBbox ? minLon : -180, mstLon2 = hasBbox ? maxLon : 180;
+    const url = `https://www.myshiptracking.com/requests/vesselsonmap?type=json&minlat=${mstLat1}&minlng=${mstLon1}&maxlat=${mstLat2}&maxlng=${mstLon2}&zoom=3`;
+    const r = await fetchUrl(url, {
+      headers: { 'Referer': 'https://www.myshiptracking.com/', 'Accept': 'application/json' },
+      timeout: 12000,
+    });
+    log('myshiptracking', `HTTP ${r.status}, ${r.data.length} bytes`);
+    if (r.status === 200 && r.data.length > 20) {
+      const raw = JSON.parse(r.data);
+      const arr = Array.isArray(raw) ? raw : (raw.vessels || raw.data || []);
+      const ships = arr.slice(0, 3000).map(s => ({
+        mmsi:   String(s.mmsi || s.MMSI || ''),
+        name:   (s.name || s.SHIPNAME || '').trim(),
+        lat:    parseFloat(s.lat || s.LAT || 0),
+        lon:    parseFloat(s.lng || s.LON || 0),
+        speed:  parseFloat(s.speed || s.SOG || 0),
+        course: parseFloat(s.course || s.COG || 0),
+        type:   parseInt(s.type || s.SHIPTYPE || 0),
+        ts:     Date.now(),
+      })).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90);
+      if (ships.length > 0) {
+        shipFallback = { data: ships, ts: Date.now() };
+        let out = hasBbox ? ships.filter(s=>s.lat>=mstLat1&&s.lat<=mstLat2&&s.lon>=mstLon1&&s.lon<=mstLon2) : ships;
+        return res.json({ ships: out.slice(0, 2000), _src: 'myshiptracking', _count: out.length });
+      }
+    }
+  } catch(e) { log('myshiptracking', `error: ${e.message}`); }
+
+  // ── Source E: AISHub public API (limited, no key, returns ~100 ships per area)
+  try {
+    const aLat = hasBbox ? (minLat + maxLat) / 2 : 51;
+    const aLon = hasBbox ? (minLon + maxLon) / 2 : 0;
+    const r = await fetchUrl(
+      `https://data.aishub.net/ws.php?username=ZZ0&format=1&latmin=${aLat-10}&latmax=${aLat+10}&lonmin=${aLon-15}&lonmax=${aLon+15}&output=json`,
+      { timeout: 10000 }
+    );
+    log('aishub', `HTTP ${r.status}`);
+    if (r.status === 200 && r.data.includes('MMSI')) {
+      const raw = JSON.parse(r.data);
+      const arr = Array.isArray(raw) ? raw.slice(1) : [];  // first element is metadata
+      const ships = arr.map(s => ({
+        mmsi:   String(s.MMSI || ''),
+        name:   (s.NAME || '').trim(),
+        lat:    parseFloat(s.LATITUDE || 0),
+        lon:    parseFloat(s.LONGITUDE || 0),
+        speed:  parseFloat(s.SOG || 0),
+        course: parseFloat(s.COG || 0),
+        heading: parseFloat(s.HEADING || 511),
+        type:   parseInt(s.SHIPTYPE || 0),
+        ts:     Date.now(),
+      })).filter(s => s.lat && s.lon && Math.abs(s.lat) <= 90 && s.mmsi);
+      if (ships.length > 0) {
+        shipFallback = { data: ships, ts: Date.now() };
+        return res.json({ ships: ships.slice(0, 1000), _src: 'aishub', _count: ships.length });
+      }
+    }
+  } catch(e) { log('aishub', `error: ${e.message}`); }
 
   // Always serve stale over empty
   if (shipFallback.data) {
@@ -489,7 +558,7 @@ app.post('/api/ai/query', async (req, res) => {
   const { query, context } = req.body;
   if (!query) return res.status(400).json({ error: 'query required' });
 
-  const system = `You are ARGUS, an embedded geospatial intelligence analyst. The operator is viewing a live surveillance dashboard with: ADS-B flights, AIS ships, satellite TLE tracks, seismic events, wildfires, GPS jamming data, Meshtastic mesh network nodes, CCTV cameras, and GDELT global news intelligence.
+  const system = `You are NEXUS, an embedded geospatial intelligence analyst. The operator is viewing a live surveillance dashboard with: ADS-B flights, AIS ships, satellite TLE tracks, seismic events, wildfires, GPS jamming data, Meshtastic mesh network nodes, CCTV cameras, and GDELT global news intelligence.
 Provide concise, precise, intelligence-format briefings. Use direct language. Keep responses under 200 words. Never fabricate specific data — reference what the live feeds would show.
 Current dashboard context: ${JSON.stringify(context||{})}`;
 
@@ -616,7 +685,7 @@ app.get('/api/shodan/search', async (req,res) => {
 });
 
 // ─── STATUS & DEBUG ───────────────────────────────────────────────────────────
-app.get('/api/status', (req,res) => res.json({ shodan:!!(process.env.SHODAN_API_KEY), aisstream:!!(process.env.AISSTREAM_KEY), ws_connected:wsConnection?.readyState===1, ship_count:shipPositions.size, version:'7.0' }));
+app.get('/api/status', (req,res) => res.json({ name:'NEXUS', shodan:!!(process.env.SHODAN_API_KEY), aisstream:!!(process.env.AISSTREAM_KEY), ws_connected:wsConnection?.readyState===1, ship_count:shipPositions.size, version:'7.0' }));
 app.get('/api/health', (req,res) => res.json({ status:'ok', ts:new Date().toISOString(), version:'7.0' }));
 
 app.get('/api/debug/sources', async (req,res) => {
@@ -851,7 +920,7 @@ app.get('/api/debug/ships', async (req, res) => {
       results[name] = { status: r.status, bytes: r.data.length, preview: r.data.substring(0,100) };
     } catch(e) { results[name] = { error: e.message }; }
   };
-  await test('digitraffic_locations', 'https://meri.digitraffic.fi/api/ais/v1/locations', { 'Digitraffic-User': 'ARGUS/7.0' });
+  await test('digitraffic_locations', 'https://meri.digitraffic.fi/api/ais/v1/locations', { 'Digitraffic-User': 'NEXUS/7.0' });
   await test('kystverket',  'https://kystdatahuset.no/ws/api/ais/positions/all', { 'Referer':'https://kystdatahuset.no/' });
   await test('vesselfinder','https://www.vesselfinder.com/api/pub/vesselsonmap/area?minlat=50&minlon=-5&maxlat=60&maxlon=10&z=5', { 'Referer':'https://www.vesselfinder.com/' });
   await test('gdelt_v2', 'https://api.gdeltproject.org/api/v2/doc/doc?query=war&mode=artlist&maxrecords=2&timespan=1h&format=json', { 'Referer':'https://www.gdeltproject.org/' });
@@ -945,14 +1014,73 @@ function parseRSS(xml) {
 }
 
 const RSS_FEEDS = [
-  { url: 'https://feeds.bbci.co.uk/news/world/rss.xml',      name: 'BBC World',    lang: 'en' },
-  { url: 'https://www.aljazeera.com/xml/rss/all.xml',         name: 'Al Jazeera',   lang: 'en' },
-  { url: 'https://feeds.skynews.com/feeds/rss/world.xml',     name: 'Sky News',     lang: 'en' },
-  { url: 'https://www.theguardian.com/world/rss',             name: 'The Guardian', lang: 'en' },
-  { url: 'https://rss.dw.com/rdf/rss-en-world',               name: 'DW World',     lang: 'en' },
-  { url: 'https://feeds.npr.org/1004/rss.xml',                name: 'NPR News',     lang: 'en' },
-  { url: 'https://www.france24.com/en/rss',                   name: 'France 24',    lang: 'en' },
+  // Major international outlets
+  { url: 'https://feeds.bbci.co.uk/news/world/rss.xml',           name: 'BBC World',       lang: 'en' },
+  { url: 'https://www.aljazeera.com/xml/rss/all.xml',             name: 'Al Jazeera',      lang: 'en' },
+  { url: 'https://feeds.skynews.com/feeds/rss/world.xml',         name: 'Sky News',        lang: 'en' },
+  { url: 'https://www.theguardian.com/world/rss',                 name: 'The Guardian',    lang: 'en' },
+  { url: 'https://rss.dw.com/rdf/rss-en-world',                   name: 'DW World',        lang: 'en' },
+  { url: 'https://feeds.npr.org/1004/rss.xml',                    name: 'NPR News',        lang: 'en' },
+  { url: 'https://www.france24.com/en/rss',                       name: 'France 24',       lang: 'en' },
+  { url: 'https://rss.rferl.org/en/rss',                          name: 'RFE/RL',          lang: 'en' },
+  { url: 'https://feeds.reuters.com/reuters/worldnews',           name: 'Reuters World',   lang: 'en' },
+  { url: 'https://apnews.com/rss',                                name: 'AP News',         lang: 'en' },
+  // Conflict & military monitoring
+  { url: 'https://www.bellingcat.com/feed/',                      name: 'Bellingcat',      lang: 'en' },
+  { url: 'https://www.understandingwar.org/feeds/rss-news',       name: 'ISW',             lang: 'en' },
+  { url: 'https://liveuamap.com/rss',                             name: 'LiveUAMap',       lang: 'en' },
+  { url: 'https://ukranews.com/en/rss/all',                       name: 'UkraNews',        lang: 'en' },
+  { url: 'https://euromaidan.rssing.com/chan-14928654/index.rss', name: 'Euromaidan',      lang: 'en' },
+  { url: 'https://www.timesofisrael.com/feed/',                   name: 'Times of Israel', lang: 'en' },
+  { url: 'https://www.haaretz.com/cmlink/1.628765',               name: 'Haaretz',         lang: 'en' },
+  { url: 'https://english.alarabiya.net/tools/rss',               name: 'Al Arabiya',      lang: 'en' },
+  { url: 'https://www.middleeasteye.net/rss',                     name: 'Middle East Eye', lang: 'en' },
+  // Regional
+  { url: 'https://www.kyivindependent.com/rss',                   name: 'Kyiv Independent','lang': 'en' },
+  { url: 'https://www.themoscowtimes.com/rss/news',               name: 'Moscow Times',    lang: 'en' },
+  { url: 'https://www.dawn.com/feeds/home',                       name: 'Dawn (Pakistan)', lang: 'en' },
+  { url: 'https://www.globaltimes.cn/rss/outbrain.xml',           name: 'Global Times',    lang: 'en' },
 ];
+
+// Country name → approximate centroid [lat, lon] for geo-tagging posts
+// Used to place post markers on the globe
+const COUNTRY_CENTROIDS = {
+  'ukraine': [49.0, 32.0], 'russia': [60.0, 100.0], 'kyiv': [50.45, 30.52],
+  'moscow': [55.75, 37.62], 'kharkiv': [49.99, 36.25], 'kherson': [46.63, 32.62],
+  'zaporizhzhia': [47.83, 35.14], 'bakhmut': [48.60, 38.0], 'mariupol': [47.10, 37.55],
+  'odesa': [46.48, 30.73], 'crimea': [45.3, 34.0], 'donbas': [48.5, 38.5],
+  'israel': [31.5, 34.75], 'gaza': [31.35, 34.30], 'tel aviv': [32.08, 34.78],
+  'jerusalem': [31.77, 35.22], 'west bank': [31.9, 35.2], 'lebanon': [33.88, 35.50],
+  'beirut': [33.89, 35.5], 'syria': [35.0, 38.0], 'damascus': [33.51, 36.29],
+  'iran': [32.5, 53.7], 'tehran': [35.69, 51.39], 'iraq': [33.0, 44.0],
+  'baghdad': [33.34, 44.40], 'saudi arabia': [24.0, 45.0], 'riyadh': [24.69, 46.72],
+  'yemen': [15.5, 47.5], 'sanaa': [15.35, 44.21], 'houthi': [15.0, 44.0],
+  'turkey': [39.0, 35.0], 'ankara': [39.93, 32.86], 'istanbul': [41.01, 28.96],
+  'china': [35.0, 105.0], 'beijing': [39.91, 116.39], 'taiwan': [23.7, 121.0],
+  'north korea': [40.0, 127.0], 'pyongyang': [39.03, 125.75],
+  'south korea': [37.0, 128.0], 'japan': [36.0, 138.0], 'tokyo': [35.68, 139.69],
+  'india': [20.0, 77.0], 'new delhi': [28.61, 77.21], 'pakistan': [30.0, 70.0],
+  'afghanistan': [33.0, 65.0], 'kabul': [34.52, 69.18],
+  'united states': [38.0, -97.0], 'washington': [38.91, -77.01],
+  'france': [46.0, 2.0], 'paris': [48.85, 2.35], 'germany': [51.0, 10.0],
+  'berlin': [52.52, 13.41], 'uk': [55.0, -3.0], 'london': [51.51, -0.13],
+  'poland': [52.0, 20.0], 'warsaw': [52.23, 21.01], 'finland': [64.0, 26.0],
+  'nato': [50.0, 15.0], 'eu': [50.0, 10.0], 'un': [40.75, -73.97],
+  'ethiopia': [9.0, 40.0], 'somalia': [6.0, 46.0], 'sudan': [15.0, 30.0],
+  'libya': [27.0, 17.0], 'tripoli': [32.9, 13.18], 'egypt': [27.0, 30.0],
+  'cairo': [30.06, 31.25], 'venezuela': [8.0, -66.0], 'colombia': [4.0, -72.0],
+  'myanmar': [17.0, 96.0], 'rangoon': [16.87, 96.15],
+};
+
+// Simple geo-tagger: scan title for country/city names
+function geoTagPost(title) {
+  if (!title) return null;
+  const t = title.toLowerCase();
+  for (const [term, coords] of Object.entries(COUNTRY_CENTROIDS)) {
+    if (t.includes(term)) return { country: term.charAt(0).toUpperCase() + term.slice(1), lat: coords[0], lon: coords[1] };
+  }
+  return null;
+}
 
 const REDDIT_SUBS = ['worldnews','geopolitics','news','ukraine','europe','MiddleEast','worldpolitics','NATOpress'];
 
@@ -991,8 +1119,17 @@ function computeCorroboration(posts) {
 
 app.get('/api/osint/feed', async (req, res) => {
   const keyword = (req.query.q || '').toLowerCase().replace(/[^\w\s-]/g, '').trim();
+
+  // Geo bbox filtering (from viewport)
+  const minLat = parseFloat(req.query.minLat);
+  const maxLat = parseFloat(req.query.maxLat);
+  const minLon = parseFloat(req.query.minLon);
+  const maxLon = parseFloat(req.query.maxLon);
+  const hasBbox = !isNaN(minLat) && !isNaN(maxLat) && !isNaN(minLon) && !isNaN(maxLon);
+  const bboxKey = hasBbox ? `${minLat.toFixed(1)}_${maxLat.toFixed(1)}_${minLon.toFixed(1)}_${maxLon.toFixed(1)}` : 'global';
+
   const bucket = Math.floor(Date.now() / 120000); // 2-min cache buckets
-  const cacheKey = `osint_${keyword}_${bucket}`;
+  const cacheKey = `osint_${keyword}_${bboxKey}_${bucket}`;
   const cached = osintCache.get(cacheKey);
   if (cached) return res.json(cached);
 
@@ -1001,12 +1138,13 @@ app.get('/api/osint/feed', async (req, res) => {
   // Parallel Reddit fetches
   const redditTasks = REDDIT_SUBS.map(sub => fetchUrl(
     `https://www.reddit.com/r/${sub}/new.json?limit=30&t=day`,
-    { headers: { 'Accept': 'application/json', 'User-Agent': 'ARGUS/7.0 (geospatial intelligence dashboard)' }, timeout: 10000 }
+    { headers: { 'Accept': 'application/json', 'User-Agent': 'NEXUS/7.0 (geospatial intelligence dashboard)' }, timeout: 10000 }
   ).then(r => {
     if (r.status !== 200) return;
     const data = JSON.parse(r.data);
     for (const c of (data.data?.children || [])) {
       const d = c.data;
+      const geo = geoTagPost(d.title + ' ' + (d.selftext || ''));
       allPosts.push({
         id: `reddit_${d.id}`, title: d.title,
         url: d.url, permalink: `https://reddit.com${d.permalink}`,
@@ -1015,6 +1153,9 @@ app.get('/api/osint/feed', async (req, res) => {
         date: (d.created_utc || 0) * 1000,
         lang: 'en', flair: d.link_flair_text || '',
         text: d.selftext ? d.selftext.substring(0, 150) : '',
+        geoLat: geo ? geo.lat : null,
+        geoLon: geo ? geo.lon : null,
+        geoCountry: geo ? geo.country : null,
       });
     }
   }).catch(() => {}));
@@ -1027,12 +1168,16 @@ app.get('/api/osint/feed', async (req, res) => {
     const items = parseRSS(r.data);
     for (const item of items) {
       if (!item.title) continue;
+      const geo = geoTagPost(item.title + ' ' + (item.description || ''));
       allPosts.push({
         id: `rss_${feed.name}_${item.link}`,
         title: item.title, url: item.link,
         source: feed.name, type: 'news', platform: 'rss',
         date: item.date || Date.now(), lang: detectLang(item.title),
         description: item.description || '', score: 0, comments: 0,
+        geoLat: geo ? geo.lat : null,
+        geoLon: geo ? geo.lon : null,
+        geoCountry: geo ? geo.country : null,
       });
     }
   }).catch(() => {}));
@@ -1043,6 +1188,31 @@ app.get('/api/osint/feed', async (req, res) => {
   let filtered = keyword
     ? allPosts.filter(p => (p.title||'').toLowerCase().includes(keyword) || (p.description||'').toLowerCase().includes(keyword) || (p.flair||'').toLowerCase().includes(keyword) || (p.text||'').toLowerCase().includes(keyword))
     : allPosts;
+
+  // Geo bbox filter — keep posts that either match the viewport or have no geo tag
+  // Posts WITH a matching geo tag are boosted; posts without geo tag are included but ranked lower
+  let geoFiltered = false;
+  if (hasBbox) {
+    geoFiltered = true;
+    const inBbox = filtered.filter(p => {
+      if (p.geoLat == null || p.geoLon == null) return false;
+      return p.geoLat >= minLat && p.geoLat <= maxLat && p.geoLon >= minLon && p.geoLon <= maxLon;
+    });
+    // If bbox returns less than 10 posts, fall back to global (viewport may be small or ocean)
+    if (inBbox.length >= 5) {
+      filtered = inBbox;
+    } else {
+      // Score boost for in-bbox; still show all but geo-matched float to top
+      filtered.forEach(p => {
+        if (p.geoLat != null && p.geoLat >= minLat && p.geoLat <= maxLat &&
+            p.geoLon != null && p.geoLon >= minLon && p.geoLon <= maxLon) {
+          p._geoBoost = 1000;
+        } else {
+          p._geoBoost = 0;
+        }
+      });
+    }
+  }
 
   // Deduplicate by URL
   const seen = new Set();
@@ -1055,17 +1225,27 @@ app.get('/api/osint/feed', async (req, res) => {
   // Compute corroboration
   const withCorr = computeCorroboration(recent);
 
-  // Re-sort: high-corroboration first, then by date
+  // Re-sort: geo-boosted first, then high-corroboration, then by date
   withCorr.sort((a, b) => {
+    const geoA = a._geoBoost || 0;
+    const geoB = b._geoBoost || 0;
+    if (geoB !== geoA) return geoB - geoA;
     if (b.corroboration !== a.corroboration) return b.corroboration - a.corroboration;
     return (b.date||0) - (a.date||0);
   });
 
-  const result = { posts: withCorr.slice(0, 150), count: withCorr.length, keyword, ts: Date.now() };
+  const result = {
+    posts: withCorr.slice(0, 150),
+    count: withCorr.length,
+    keyword,
+    geoFiltered,
+    bbox: hasBbox ? { minLat, maxLat, minLon, maxLon } : null,
+    ts: Date.now(),
+  };
   osintCache.set(cacheKey, result);
   setTimeout(() => osintCache.delete(cacheKey), 3 * 60 * 1000);
 
-  console.log(`[OSINT] ${result.count} posts (q="${keyword}")`);
+  console.log(`[OSINT] ${result.count} posts (q="${keyword}", geo=${geoFiltered ? bboxKey : 'global'})`);
   res.json(result);
 });
 
@@ -1185,7 +1365,7 @@ app.get('/api/playback/range', (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔════════════════════════════════════════════════════╗
-║  ARGUS v7.0 — GEOSPATIAL INTELLIGENCE SYSTEM       ║
+║  NEXUS v7.0 — GEOSPATIAL INTELLIGENCE SYSTEM       ║
 ║  http://localhost:${PORT}                                 ║
 ║  Intel: GDELT (100+ languages) · AI Query · Ships  ║
 ╚════════════════════════════════════════════════════╝`);

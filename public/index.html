@@ -3,10 +3,22 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ARGUS v7 — Geospatial Intelligence</title>
+<!--
+  NAME ALTERNATIVES (pick one, update logo-text + title):
+    NEXUS     — connection/intelligence hub
+    SENTINEL  — watchful guardian
+    OVERSEER  — all-seeing observer
+    VANTAGE   — elevated viewpoint
+    MERIDIAN  — geospatial reference line
+    ORACLE    — intelligence & foresight
+    PARALLAX  — multiple perspectives on same event
+-->
+<title>NEXUS — Geospatial Intelligence</title>
 <link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
 <script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/satellite.js/4.1.3/satellite.min.js"></script>
+<!-- H3 hexagonal grid library — used for GPS jamming layer -->
+<script src="https://unpkg.com/h3-js@4.1.0/dist/browser/h3-js.umd.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="css/style.css">
 </head>
@@ -16,7 +28,7 @@
   <div id="tb-left">
     <div class="logo">
       <svg width="20" height="20" viewBox="0 0 20 20"><polygon points="10,1 19,18 1,18" fill="none" stroke="#f59e0b" stroke-width="1.5"/><circle cx="10" cy="10" r="3" fill="#f59e0b"/><line x1="10" y1="4" x2="10" y2="7" stroke="#f59e0b" stroke-width="1"/><line x1="10" y1="13" x2="10" y2="16" stroke="#f59e0b" stroke-width="1"/><line x1="4" y1="10" x2="7" y2="10" stroke="#f59e0b" stroke-width="1"/><line x1="13" y1="10" x2="16" y2="10" stroke="#f59e0b" stroke-width="1"/></svg>
-      <span class="logo-text">ARGUS</span>
+      <span class="logo-text">NEXUS</span>
       <span class="logo-ver">7.0</span>
     </div>
     <div class="tb-divider"></div>
@@ -26,16 +38,17 @@
   </div>
 
   <div id="tb-layers">
-    <button class="lbtn on" data-layer="satellites">SAT <span class="lbtn-count" id="cnt-sat">0</span></button>
-    <button class="lbtn on" data-layer="flights">AIR <span class="lbtn-count" id="cnt-air">0</span></button>
-    <button class="lbtn on" data-layer="military">MIL <span class="lbtn-count" id="cnt-mil">0</span></button>
-    <button class="lbtn on" data-layer="ships">AIS <span class="lbtn-count" id="cnt-ais">0</span></button>
-    <button class="lbtn on" data-layer="quakes">SEIS <span class="lbtn-count" id="cnt-quake">0</span></button>
+    <!-- All layers start OFF — enable individually to control performance -->
+    <button class="lbtn" data-layer="satellites">SAT <span class="lbtn-count" id="cnt-sat">0</span></button>
+    <button class="lbtn" data-layer="flights">AIR <span class="lbtn-count" id="cnt-air">0</span></button>
+    <button class="lbtn" data-layer="military">MIL <span class="lbtn-count" id="cnt-mil">0</span></button>
+    <button class="lbtn" data-layer="ships">AIS <span class="lbtn-count" id="cnt-ais">0</span></button>
+    <button class="lbtn" data-layer="quakes">SEIS <span class="lbtn-count" id="cnt-quake">0</span></button>
     <button class="lbtn" data-layer="cctv">CCTV <span class="lbtn-count" id="cnt-cctv">0</span></button>
     <button class="lbtn" data-layer="wildfires">FIRE <span class="lbtn-count" id="cnt-fire">0</span></button>
     <button class="lbtn" data-layer="jamming">JAM</button>
     <button class="lbtn" data-layer="mesh">MESH <span class="lbtn-count" id="cnt-mesh">0</span></button>
-    <button class="lbtn on" data-layer="intel">INTEL</button>
+    <button class="lbtn" data-layer="intel">INTEL</button>
     <button class="lbtn" data-layer="osint">OSINT <span class="lbtn-count" id="cnt-osint">0</span></button>
     <button class="lbtn" data-layer="maven">MAVEN</button>
   </div>
@@ -43,9 +56,6 @@
   <div id="tb-right">
     <div class="status-pill" id="pill-aisstream" title="AISStream WebSocket">
       <span class="dot red"></span>AIS
-    </div>
-    <div class="status-pill" id="pill-shodan" title="Shodan API">
-      <span class="dot red"></span>SDN
     </div>
     <div class="tb-divider"></div>
     <button class="icon-btn" id="btn-settings" title="Settings">⚙</button>
@@ -71,8 +81,10 @@
     <div class="sb-label">BASEMAP</div>
     <select id="basemap-sel" class="sb-sel">
       <option value="dark">Dark Tile</option>
-      <option value="satellite">Satellite (Ion)</option>
+      <option value="satellite">Satellite (ESRI)</option>
       <option value="terrain">Terrain + Elevation</option>
+      <option value="gibs_modis">Live Sat — MODIS (NASA)</option>
+      <option value="gibs_viirs">Live Sat — VIIRS Night (NASA)</option>
     </select>
   </div>
 
@@ -94,22 +106,6 @@
       ground track ±20 min
     </div>
     <button class="sb-btn mt4" id="reload-sats">↺ RELOAD TLE</button>
-  </div>
-
-  <div class="sb-block">
-    <div class="sb-label">SHODAN</div>
-    <input type="password" id="shodan-key" class="sb-input" placeholder="API key">
-    <select id="shodan-preset" class="sb-sel mt4">
-      <option value="">Preset query…</option>
-      <option value="has_screenshot:true product:webcam">IP Cameras</option>
-      <option value="port:102 product:S7">SCADA/S7</option>
-      <option value="tag:ics">Industrial Control</option>
-      <option value="port:3389 os:Windows">Exposed RDP</option>
-      <option value="authentication disabled port:5900">VNC No Auth</option>
-      <option value="port:30003 dump1090">ADS-B Receivers</option>
-      <option value="SolarEdge tag:iot">Solar Inverters</option>
-    </select>
-    <button class="sb-btn mt4" id="shodan-go">⌕ SEARCH</button>
   </div>
 
   <div class="sb-block">
@@ -146,13 +142,14 @@
       <span class="panel-title">OSINT FEED</span>
     </div>
     <div class="panel-hdr-right">
-      <span id="osint-src-badge" class="badge">REDDIT · RSS · 100+ SOURCES</span>
+      <span id="osint-src-badge" class="badge">SOCIAL · NEWS · CONFLICT</span>
       <button class="icon-btn" id="osint-close">✕</button>
     </div>
   </div>
 
   <div id="osint-search">
-    <input type="text" id="osint-q" class="intel-input" placeholder="Search all local social media in English…">
+    <input type="text" id="osint-q" class="intel-input" placeholder="Search across all sources in English…">
+    <button id="osint-loc-btn" class="intel-btn" title="Filter to current map view">📍</button>
     <button id="osint-go" class="intel-btn">⌕</button>
   </div>
 
@@ -160,7 +157,12 @@
     <button class="osftag active" data-type="">ALL</button>
     <button class="osftag" data-type="social">SOCIAL</button>
     <button class="osftag" data-type="news">NEWS</button>
+    <button class="osftag" data-type="conflict">CONFLICT</button>
     <button class="osftag" data-type="high-corr">CORROBORATED</button>
+  </div>
+
+  <div id="osint-geo-badge" style="display:none" class="osint-geo-active">
+    📍 Filtered to map view &nbsp;<button id="osint-geo-clear" class="tiny-btn">× CLEAR</button>
   </div>
 
   <div id="osint-items"></div>
@@ -225,14 +227,14 @@
   <!-- LINK ANALYSIS -->
   <div class="maven-section">
     <div class="maven-section-hdr"><span>🔗 ENTITY GRAPH</span></div>
-    <div class="dim tiny" style="padding:4px 0 6px">Click any tracked entity on the globe, then press the button below to analyse links between entities and their shared attributes.</div>
+    <div class="dim tiny" style="padding:4px 0 6px">Force-directed link analysis of all tracked entities and their shared attributes.</div>
     <button class="maven-btn" id="btn-entity-graph" style="width:100%">⬡ OPEN LINK GRAPH</button>
   </div>
 
   <!-- PATTERN OF LIFE -->
   <div class="maven-section">
     <div class="maven-section-hdr"><span>📊 PATTERN OF LIFE</span></div>
-    <div class="dim tiny" style="padding:4px 0 6px">Track and analyse entity behaviour over time. Click an entity on the globe then use Track, then view its timeline.</div>
+    <div class="dim tiny" style="padding:4px 0 6px">Click an entity on the globe, then view its movement timeline.</div>
     <button class="maven-btn" id="btn-pol" style="width:100%">📈 TIMELINE VIEW</button>
   </div>
 </div>
@@ -249,8 +251,8 @@
   </div>
 </div>
 
-<!-- INTEL PANEL (right) -->
-<div id="intel-panel">
+<!-- INTEL PANEL (right) — hidden by default, enabled via INTEL button -->
+<div id="intel-panel" style="display:none">
   <div class="panel-hdr">
     <div class="panel-hdr-left">
       <span class="panel-icon">◈</span>
@@ -295,7 +297,7 @@
 
 <!-- AI QUERY -->
 <div id="ai-bar">
-  <div class="ai-prefix">◈ ARGUS AI</div>
+  <div class="ai-prefix">◈ NEXUS AI</div>
   <input type="text" id="ai-in" placeholder="Natural language query… (e.g. 'What's happening over the Mediterranean?')">
   <button id="ai-send">ASK</button>
 </div>
@@ -318,7 +320,7 @@
   <div id="info-body"></div>
   <div id="info-actions">
     <button class="act-btn" id="info-track">📍 TRACK</button>
-    <button class="act-btn" id="info-shodan">🔍 SHODAN</button>
+    <button class="act-btn" id="info-show-trail" style="display:none">〰 TRAIL</button>
   </div>
 </div>
 
