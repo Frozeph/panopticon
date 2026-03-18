@@ -824,14 +824,36 @@ app.get('/api/jamming', async (req, res) => {
 
 app.get('/api/cctv', async (req,res) => {
   const lat=parseFloat(req.query.lat)||51.5, lon=parseFloat(req.query.lon)||-0.1;
-  const r2=Math.min(parseInt(req.query.radius)||3000,8000);
+  const r2=Math.min(parseInt(req.query.radius)||4000,8000);
+  // out body; returns id, lat, lon, and all tags
   const q=`[out:json][timeout:25];(node["man_made"="surveillance"](around:${r2},${lat},${lon}););out body;`;
   try {
     const r=await fetchUrl(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(q)}`);
-    if (r.status!==200) throw new Error();
+    if (r.status!==200) throw new Error(`HTTP ${r.status}`);
     const d=JSON.parse(r.data);
-    res.set('Cache-Control','max-age=600').json(d.elements.filter(n=>n.lat&&n.lon).map(n=>({id:n.id,lat:n.lat,lon:n.lon,type:n.tags?.surveillance||'fixed',operator:n.tags?.operator||''})));
-  } catch { res.json([]); }
+    res.set('Cache-Control','max-age=600').json(d.elements.filter(n=>n.lat&&n.lon).map(n=>{
+      const t = n.tags || {};
+      // Prefer explicit stream/feed URL; fall back to website tag
+      const feedUrl = t.url || t['contact:website'] || t.website || t['stream:url'] || null;
+      // Direction the camera points (degrees clockwise from north)
+      const direction = t['camera:direction'] != null ? parseFloat(t['camera:direction']) : null;
+      return {
+        id:          n.id,
+        lat:         n.lat,
+        lon:         n.lon,
+        name:        t.name        || null,
+        operator:    t.operator    || t['operator:en'] || null,
+        type:        t.surveillance || 'outdoor',
+        surv_type:   t['surveillance:type'] || null, // public, private, community
+        camera_type: t['camera:type'] || null,       // dome, fixed, ptz
+        direction:   isFinite(direction) ? direction : null,
+        height:      t.height      || t['camera:mount'] || null,
+        description: t.description || t.note || null,
+        url:         feedUrl,
+        osm_url:     `https://www.openstreetmap.org/node/${n.id}`,
+      };
+    }));
+  } catch(e) { console.warn('[CCTV]', e.message); res.json([]); }
 });
 
 let meshCache={nodes:null,ts:0};

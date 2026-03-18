@@ -430,6 +430,46 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg);
 /* ── INFO BOX — taller for enrichment data ────────────────────────────────── */
 #info-body { max-height: 380px; }
 
+/* ── CCTV FEED EMBED ──────────────────────────────────────────────────────── */
+/* Widen the info box when a live stream is embedded */
+#info-box.cctv-feed-active {
+  width: 360px;
+}
+#info-box.cctv-feed-active #info-body {
+  max-height: 520px;
+}
+.cctv-feed-wrap {
+  margin: 6px 0;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid rgba(34,197,94,0.25);
+  background: #000;
+}
+.cctv-feed-controls {
+  display: flex;
+  gap: 6px;
+  padding: 5px 6px;
+  background: rgba(0,0,0,0.4);
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+.cctv-rtsp-note {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 0;
+}
+.cctv-url-code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--amber);
+  background: rgba(245,158,11,0.08);
+  border: 1px solid rgba(245,158,11,0.2);
+  border-radius: 3px;
+  padding: 3px 5px;
+  word-break: break-all;
+  user-select: all;
+}
+
 /* ── OSINT PANEL ──────────────────────────────────────────────────────────── */
 #osint-panel {
   position: fixed; top: var(--topbar-h); right: 0; width: var(--intel-w);

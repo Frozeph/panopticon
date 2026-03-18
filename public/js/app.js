@@ -1416,6 +1416,11 @@ function escHtml(str) {
   return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+function compassBearing(deg) {
+  const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+  return dirs[Math.round((deg % 360) / 22.5) % 16];
+}
+
 // Intel search interaction
 document.getElementById('intel-go').addEventListener('click', () => {
   fetchIntel(document.getElementById('intel-q').value, document.getElementById('intel-span').value);
@@ -1570,6 +1575,27 @@ function showInfoPanel(entity) {
     R('PLACE',   props.place?.getValue?.() || props.place);
     const time = props.time?.getValue?.() || props.time;
     if (time) R('TIME', new Date(time).toUTCString().substring(0,25));
+  } else if (type === 'cctv') {
+    const camName    = props.name?.getValue?.()        || props.name;
+    const operator   = props.operator?.getValue?.()    || props.operator;
+    const camType    = props.camera_type?.getValue?.() || props.camera_type;
+    const survType   = props.surv_type?.getValue?.()   || props.surv_type;
+    const direction  = props.direction?.getValue?.()   ?? props.direction;
+    const height     = props.height?.getValue?.()      || props.height;
+    const desc       = props.description?.getValue?.() || props.description;
+    const feedUrl    = (props.url?.getValue?.()        || props.url || '').trim();
+    if (camName)   R('NAME',      camName);
+    if (operator)  R('OPERATOR',  operator);
+    R('CATEGORY',  camType || survType || 'outdoor');
+    if (direction != null) R('DIRECTION', `${Math.round(direction)}° (${compassBearing(direction)})`);
+    if (height)    R('MOUNT',     height);
+    if (desc)      R('NOTE',      desc.substring(0, 80));
+    // Signal whether a live feed URL is available
+    if (feedUrl) {
+      rows.push(`<div class="info-row" style="margin-top:3px"><span class="info-key">STREAM</span><span class="info-val" style="color:#22c55e">● AVAILABLE</span></div>`);
+    } else {
+      rows.push(`<div class="info-row" style="margin-top:3px"><span class="info-key">STREAM</span><span class="info-val" style="color:#475569">○ NOT MAPPED</span></div>`);
+    }
   } else if (type === 'fire') {
     const frp = props.frp?.getValue?.() ?? props.frp;
     const brightness = props.brightness?.getValue?.() ?? props.brightness;
@@ -1595,6 +1621,21 @@ function showInfoPanel(entity) {
     trailBtn.style.display = 'none';
     clearEntityTrack();
   }
+
+  // CCTV: show 📺 FEED button in actions bar, hide on other entity types
+  const feedBtn = document.getElementById('info-cctv-feed');
+  if (feedBtn) {
+    if (type === 'cctv') {
+      feedBtn.style.display = '';
+      const hasFeed = !!(props.url?.getValue?.() || props.url);
+      feedBtn.textContent = hasFeed ? '📺 FEED' : '🔍 FIND FEED';
+    } else {
+      feedBtn.style.display = 'none';
+    }
+  }
+
+  // Remove any stale CCTV-wide info-box class from prior selection
+  document.getElementById('info-box').classList.remove('cctv-feed-active');
 
   // Auto-enrich in background
   autoEnrich(entity, type, props);
@@ -1623,6 +1664,72 @@ async function autoEnrich(entity, type, props) {
       const noradId = tleEntry.tle1.substring(2,7).trim();
       if (noradId) url = `/api/enrich/satellite/${noradId}`;
     }
+  }
+
+  // CCTV: show feed embed + links
+  if (type === 'cctv') {
+    const feedUrl  = (props.url?.getValue?.()     || props.url     || '').trim();
+    const osmId    = props.id?.getValue?.()       || props.id;
+    const osmUrl   = props.osm_url?.getValue?.()  || props.osm_url || (osmId ? `https://www.openstreetmap.org/node/${osmId}` : '');
+    const lat      = props.lat?.getValue?.()      ?? props.lat;
+    const lon      = props.lon?.getValue?.()      ?? props.lon;
+
+    const rows = [];
+
+    // ── Live feed embed ───────────────────────────────────────────────────────
+    if (feedUrl && !feedUrl.startsWith('rtsp://') && !feedUrl.startsWith('rtmp://')) {
+      // HTTP/HTTPS stream or web page — try iframe embed
+      rows.push(`
+        <div class="enrich-section-hdr">🔴 LIVE FEED</div>
+        <div id="cctv-feed-wrap" class="cctv-feed-wrap">
+          <iframe
+            id="cctv-iframe"
+            src="${escHtml(feedUrl)}"
+            width="100%" height="168" frameborder="0"
+            allow="autoplay; fullscreen"
+            sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-presentation"
+            loading="lazy"
+            style="background:#000;display:block;border-radius:3px"
+          ></iframe>
+          <div class="cctv-feed-controls">
+            <a href="${escHtml(feedUrl)}" target="_blank" class="enrich-link">🔗 OPEN DIRECTLY</a>
+            <button class="enrich-link" style="cursor:pointer;border:none;background:none" onclick="(function(){var f=document.getElementById('cctv-iframe');f.src=f.src})()">↺ RELOAD</button>
+          </div>
+        </div>`);
+    } else if (feedUrl) {
+      // RTSP/RTMP — can't embed in browser, show protocol note
+      rows.push(`
+        <div class="enrich-section-hdr">STREAM</div>
+        <div class="cctv-rtsp-note">
+          <span class="dim tiny">RTSP/RTMP stream — use VLC or an IP camera viewer:</span>
+          <code class="cctv-url-code">${escHtml(feedUrl)}</code>
+          <a href="${escHtml(feedUrl)}" target="_blank" class="enrich-link" style="margin-top:4px">📋 COPY / OPEN</a>
+        </div>`);
+    } else {
+      // No feed URL — helpful search links
+      rows.push(`<div class="dim tiny" style="padding:2px 0 4px">No stream URL in OpenStreetMap data for this camera.</div>`);
+      if (lat != null && lon != null) {
+        const insecamSearch = `https://www.insecam.org/en/bycountry/`;
+        rows.push(`<div class="dim tiny" style="padding:1px 0">Nearby open streams may be findable on Insecam or Worldcam.</div>`);
+      }
+    }
+
+    // ── Quick links ───────────────────────────────────────────────────────────
+    rows.push(`<div class="enrich-links" style="margin-top:8px">`);
+    if (osmUrl) rows.push(`<a href="${escHtml(osmUrl)}" target="_blank" class="enrich-link">📍 OSM NODE</a>`);
+    if (lat != null && lon != null) {
+      rows.push(`<a href="https://www.google.com/maps?q=&layer=c&cbll=${lat.toFixed(6)},${lon.toFixed(6)}&cbp=11,0,,0,0" target="_blank" class="enrich-link">🌐 STREET VIEW</a>`);
+      rows.push(`<a href="https://www.insecam.org/en/" target="_blank" class="enrich-link">📡 INSECAM</a>`);
+      rows.push(`<a href="https://www.worldcam.eu/" target="_blank" class="enrich-link">🌍 WORLDCAM</a>`);
+    }
+    rows.push(`</div>`);
+
+    enrichDiv.innerHTML = rows.join('');
+    // Make info-box wider when a feed is shown
+    if (feedUrl && !feedUrl.startsWith('rtsp://') && !feedUrl.startsWith('rtmp://')) {
+      document.getElementById('info-box').classList.add('cctv-feed-active');
+    }
+    return;
   }
 
   // Fire: fetch GDELT cause-analysis context
@@ -1815,6 +1922,7 @@ function showEntityTrack(entity) {
 }
 document.getElementById('info-track').addEventListener('click', () => {
   if (S.selectedEntity) {
+    const entityType = S.selectedEntity.properties?.type?.getValue?.() || S.selectedEntity.properties?.type;
     if (S.viewer.trackedEntity === S.selectedEntity) {
       // Already tracking — untrack
       S.viewer.trackedEntity = undefined;
@@ -1824,9 +1932,43 @@ document.getElementById('info-track').addEventListener('click', () => {
       S.viewer.trackedEntity = S.selectedEntity;
       document.getElementById('info-track').textContent = '⏹ UNTRACK';
       toast(`Tracking: ${S.selectedEntity.name}`, 'info', 2000);
+
+      // CCTV: when tracking a camera, make info-box wider to show the feed embed
+      if (entityType === 'cctv') {
+        document.getElementById('info-box').classList.add('cctv-feed-active');
+        // Scroll info body to show the feed (it will be rendered by autoEnrich)
+        setTimeout(() => {
+          const fw = document.getElementById('cctv-feed-wrap');
+          if (fw) fw.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }, 400);
+      }
     }
   }
 });
+// ─── CCTV FEED BUTTON ────────────────────────────────────────────────────────
+document.getElementById('info-cctv-feed')?.addEventListener('click', () => {
+  if (!S.selectedEntity) return;
+  const props = S.selectedEntity.properties;
+  const feedUrl = (props?.url?.getValue?.() || props?.url || '').trim();
+  if (feedUrl && !feedUrl.startsWith('rtsp://') && !feedUrl.startsWith('rtmp://')) {
+    // Open in a small popup window sized for the stream
+    const popup = window.open(feedUrl, 'cctv_feed',
+      'width=800,height=600,menubar=no,toolbar=no,location=yes,status=no,resizable=yes,scrollbars=yes'
+    );
+    if (!popup) toast('Allow pop-ups to open the feed in a separate window', 'warn', 4000);
+  } else if (feedUrl) {
+    // RTSP — can't open in browser, copy to clipboard
+    navigator.clipboard?.writeText(feedUrl).then(() => toast('RTSP URL copied to clipboard', 'ok', 2500))
+      .catch(() => toast(`RTSP: ${feedUrl}`, 'info', 6000));
+  } else {
+    // No feed — scroll to search links in info panel
+    const lat = props?.lat?.getValue?.() ?? props?.lat;
+    const lon = props?.lon?.getValue?.() ?? props?.lon;
+    const url = `https://www.insecam.org/en/`;
+    window.open(url, '_blank');
+  }
+});
+
 // ─── SHODAN (UI removed — key configured via server env SHODAN_API_KEY) ────────
 // info-shodan button repurposed: trigger a Shodan search via server-side key
 (function() {
