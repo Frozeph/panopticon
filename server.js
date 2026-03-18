@@ -387,13 +387,18 @@ app.get('/api/ships', async (req, res) => {
 
 
 // ─── TLE / SATELLITES ─────────────────────────────────────────────────────────
-// ONLY 'visual' group by default (~150 sats) — fast, reliable
-// 'active' has 9000+ sats; only load if explicitly requested
+// 'recon' maps to CelesTrak 'military' group — publicly tracked military
+// payloads including USA (NRO), Yaogan (China), Persona (Russia), Helios
+// (France), Ofek (Israel), COSMO-SkyMed (Italy), SAR-Lupe (Germany).
 const TLE_GROUPS = {
   'stations':'space-stations','space-stations':'space-stations',
   'visual':'visual','starlink':'starlink','weather':'weather',
   'gps':'gps-ops','gps-ops':'gps-ops','geo':'geo',
   'iridium':'iridium-next','active':'active',
+  // Reconnaissance / intelligence satellites (publicly tracked)
+  'recon':'military','spy':'military','military':'military',
+  'radar':'radar',       // SAR + radar-cal sats (often dual-use recon)
+  'analyst':'analyst',   // Space-Track analyst catalog (gray/unclassified objects)
 };
 const tleCache = new Map();
 

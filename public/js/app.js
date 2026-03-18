@@ -47,7 +47,7 @@ const S = {
     mesh: false, intel: false, osint: false, maven: false,
   },
   osintGeoBound: false, // whether OSINT is filtered to viewport
-  activeSatGroups: new Set(['visual']),
+  activeSatGroups: new Set(['recon']),
   showFootprints:  false,
   intelArticles:  [],
   intelFilter:    '',
@@ -94,16 +94,13 @@ setInterval(updateClock, 1000);
 updateClock();
 
 // ─── CESIUM INIT ─────────────────────────────────────────────────────────────
+// NOTE: Cesium 1.107 removed imageryProvider + terrainProvider from the Viewer
+// constructor. Use baseLayer:false to suppress Ion/Bing default, then add
+// imagery and terrain manually after init.
 Cesium.Ion.defaultAccessToken = CFG.cesiumToken;
 
 S.viewer = new Cesium.Viewer('cesiumContainer', {
-  imageryProvider:        new Cesium.UrlTemplateImageryProvider({
-    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-    subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
-    credit: '© CARTO © OpenStreetMap contributors',
-  }),
-  // Start with a flat ellipsoid; ESRI terrain loaded async below (Cesium 1.104+)
-  terrainProvider:        new Cesium.EllipsoidTerrainProvider(),
+  baseLayer:              false,   // suppress default Ion Bing imagery (token-gated)
   timeline:               false,
   animation:              false,
   homeButton:             false,
@@ -115,19 +112,24 @@ S.viewer = new Cesium.Viewer('cesiumContainer', {
   infoBox:                false,
   selectionIndicator:     false,
   skyBox:                 false,
-  skyAtmosphere:          new Cesium.SkyAtmosphere(),
   requestRenderMode:      false,
   scene3DOnly:            false,
 });
 
-// Load ESRI WorldElevation3D terrain asynchronously (required Cesium 1.104+
-// where ArcGISTiledElevationTerrainProvider became async — passing it directly
-// to the Viewer constructor breaks init entirely)
+// Add CARTO dark basemap (no token required)
+S.viewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
+  url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  subdomains: 'abcd', minimumLevel: 0, maximumLevel: 19,
+  credit: '© CARTO © OpenStreetMap contributors',
+}));
+
+// Load ESRI WorldElevation3D terrain asynchronously
+// (ArcGISTiledElevationTerrainProvider became async in Cesium 1.104+)
 Cesium.ArcGISTiledElevationTerrainProvider.fromUrl(
   'https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer'
 ).then(tp => {
   S.viewer.terrainProvider = tp;
-  S._esriTerrainProvider = tp; // keep ref for applyBasemap() exaggeration
+  S._esriTerrainProvider = tp;
   log('3D terrain loaded (ESRI WorldElevation3D)', 'ok');
 }).catch(e => {
   console.warn('ESRI terrain unavailable, using ellipsoid:', e.message);
@@ -394,9 +396,11 @@ function renderSatellites() {
       if (!pos) continue;
       rendered++;
 
-      const isStation = sat.name.match(/ISS|TIANGONG|CSS/i);
+      const isStation = sat.name.match(/ISS|TIANGONG|CSS|NAUKA/i);
       const isStarlink = sat.name.includes('STARLINK');
-      const color = isStation ? '#ff6600' : isStarlink ? '#4488ff' : '#00ffaa';
+      const reconInfo = classifyReconSat(sat.name, pos.alt);
+      // Use recon type colour if it's a known recon type; green fallback otherwise
+      const color = isStation ? '#ff6600' : isStarlink ? '#4488ff' : reconInfo.type !== 'generic' ? reconInfo.color : '#00ffaa';
 
       ds.entities.add({
         id: `sat_${i}`,
@@ -431,87 +435,174 @@ function renderSatellites() {
 }
 
 // ─── SATELLITE FOOTPRINTS ─────────────────────────────────────────────────────
-// Visualises sensor coverage for the visual (brightest) satellite group
-// Inner amber ring  = nadir sensor swath (~5° half-angle: high-res imaging zone)
-// Outer cyan ring   = wide-area coverage (~25° half-angle: off-nadir observable)
-// Ground track line = predicted orbit path ±20 minutes
+// Coverage model based on publicly available orbital and sensor parameters.
+//
+// Each satellite is classified into a sensor type by name matching:
+//
+//  OPTICAL-HI  (KH-11/Crystal class, USA-NRO, Ofek, Helios, Pleiades Neo)
+//    Altitude:  ~300–500 km (from publicly published TLE apogee/perigee)
+//    Swath:     ~15 km (estimated from published resolution + aperture)
+//    Off-nadir: ±30° max agile pointing → access radius = h × tan(30°)
+//    Colour:    amber
+//
+//  SAR-RECON  (Lacrosse/Onyx, Yaogan SAR, COSMO-SkyMed, SAR-Lupe, Sentinel-1)
+//    Altitude:  ~500–800 km
+//    Swath:     ~30–80 km (stripmap mode — publicly documented for Sentinel-1)
+//    Off-nadir: typically ±20–30°; access radius = h × tan(25°)
+//    Colour:    purple
+//
+//  ELINT/SIGINT (USA-XXX high-altitude SIGINT, POPPY, Trumpet, Mercury)
+//    Altitude:  ~1000 km+
+//    No optical swath — broad electronic collection area modelled as wide cone
+//    Off-nadir: ±60° (SIGINT has wider effective collection)
+//    Colour:    red
+//
+//  SPACE-STATION (ISS, Tiangong) — special case, wide swath crew photography
+//    Colour: orange
+//
+//  GENERIC MILITARY — fallback for unclassified military payloads
+//    Uses altitude-derived estimate (off-nadir ±20° access, 5° sensor)
+//    Colour: amber (dim)
+
+function classifyReconSat(name, altKm) {
+  const n = name.toUpperCase();
+
+  // Space stations
+  if (/ISS|ZARYA|TIANGONG|CSS|NAUKA/.test(n))
+    return { type: 'station', swathKm: 20, accessDeg: 51, color: '#ff6600', label: 'ISS/Station' };
+
+  // SAR satellites — publicly documented
+  if (/LACROSSE|ONYX/.test(n))
+    return { type: 'sar', swathKm: 50, accessDeg: 28, color: '#a855f7', label: 'SAR (Lacrosse/Onyx)' };
+  if (/COSMO.?SKY|COSMOSKY/.test(n))
+    return { type: 'sar', swathKm: 40, accessDeg: 30, color: '#a855f7', label: 'SAR (COSMO-SkyMed)' };
+  if (/SAR.?LUPE/.test(n))
+    return { type: 'sar', swathKm: 35, accessDeg: 30, color: '#a855f7', label: 'SAR (SAR-Lupe)' };
+  if (/SENTINEL.?1/.test(n))
+    return { type: 'sar', swathKm: 80, accessDeg: 35, color: '#a855f7', label: 'SAR (Sentinel-1)' };
+  if (/YAOGAN/.test(n) && altKm > 450)
+    return { type: 'sar', swathKm: 45, accessDeg: 27, color: '#a855f7', label: 'SAR (Yaogan)' };
+  if (/KONDOR/.test(n))
+    return { type: 'sar', swathKm: 30, accessDeg: 25, color: '#a855f7', label: 'SAR (Kondor)' };
+  if (/PAZ|SAOCOM/.test(n))
+    return { type: 'sar', swathKm: 40, accessDeg: 30, color: '#a855f7', label: 'SAR (PAZ/SAOCOM)' };
+
+  // Optical reconnaissance — high resolution
+  if (/OFEK/.test(n))
+    return { type: 'optical', swathKm: 12, accessDeg: 30, color: '#f59e0b', label: 'Optical (Ofek)' };
+  if (/HELIOS/.test(n))
+    return { type: 'optical', swathKm: 18, accessDeg: 28, color: '#f59e0b', label: 'Optical (Helios)' };
+  if (/PLEIAD|PLEIADES/.test(n))
+    return { type: 'optical', swathKm: 20, accessDeg: 30, color: '#f59e0b', label: 'Optical (Pléiades)' };
+  if (/SPOT/.test(n))
+    return { type: 'optical', swathKm: 60, accessDeg: 27, color: '#f59e0b', label: 'Optical (SPOT)' };
+  if (/YAOGAN/.test(n) && altKm <= 450)
+    return { type: 'optical', swathKm: 15, accessDeg: 30, color: '#f59e0b', label: 'Optical (Yaogan)' };
+  if (/ELECTRO.?L|KANOPUS/.test(n))
+    return { type: 'optical', swathKm: 60, accessDeg: 25, color: '#f59e0b', label: 'Optical (Electro/Kanopus)' };
+  if (/BARS.?M/.test(n))
+    return { type: 'optical', swathKm: 20, accessDeg: 30, color: '#f59e0b', label: 'Optical (Bars-M)' };
+  if (/RESURS/.test(n))
+    return { type: 'optical', swathKm: 30, accessDeg: 25, color: '#f59e0b', label: 'Optical (Resurs)' };
+  if (/SENTINEL.?2/.test(n))
+    return { type: 'optical', swathKm: 290, accessDeg: 20, color: '#f59e0b', label: 'Optical (Sentinel-2)' };
+  if (/WORLDVIEW|GEOEYE|MAXAR/.test(n))
+    return { type: 'optical', swathKm: 13, accessDeg: 45, color: '#f59e0b', label: 'Optical (WorldView)' };
+  if (/SKYSAT|SKYSATC/.test(n))
+    return { type: 'optical', swathKm: 6, accessDeg: 45, color: '#f59e0b', label: 'Optical (SkySat)' };
+  // USA-NRO satellites (KH-11 Crystal/Kennan class): publicly tracked NORAD objects
+  // These are at low perigee (~290–400 km) with high eccentricity or SSO orbits
+  if (/^USA-/.test(n) && altKm < 600)
+    return { type: 'optical', swathKm: 15, accessDeg: 32, color: '#f59e0b', label: 'Optical (NRO USA-class)' };
+  if (/^USA-/.test(n) && altKm >= 600)
+    return { type: 'elint', swathKm: 0, accessDeg: 55, color: '#ef4444', label: 'SIGINT/ELINT (NRO)' };
+
+  // SIGINT / ELINT
+  if (/TRUMPET|MERCURY|MENTOR|ADVANCED ORION|JUMPSEAT|AQUACADE/.test(n))
+    return { type: 'elint', swathKm: 0, accessDeg: 60, color: '#ef4444', label: 'SIGINT' };
+  if (/TRUMPET/.test(n))
+    return { type: 'elint', swathKm: 0, accessDeg: 60, color: '#ef4444', label: 'SIGINT (Trumpet)' };
+
+  // Generic military — unknown payload
+  return { type: 'generic', swathKm: altKm * Math.tan(5 * Math.PI / 180), accessDeg: 20, color: '#94a3b8', label: 'Military (unknown)' };
+}
+
 function renderSatFootprints(now) {
   if (satFootprintDs) S.viewer.dataSources.remove(satFootprintDs, true);
   if (!S.tleData.length) return;
 
   const ds   = new Cesium.CustomDataSource('sat_footprints');
   const date = now || new Date();
-  const R    = 6371;  // Earth radius km
 
-  // Only render footprints for the first 200 sats (visual group + stations)
-  const limit = Math.min(S.tleData.length, 200);
+  const limit = Math.min(S.tleData.length, 300);
 
   for (let i = 0; i < limit; i++) {
     const sat = S.tleData[i];
     try {
       const pos = sgp4Position(sat.tle1, sat.tle2, date);
       if (!pos) continue;
-      const h   = pos.alt;          // km above ellipsoid
-      if (h < 100 || h > 40000) continue; // skip if out of range
+      const h = pos.alt;  // km above ellipsoid
+      if (h < 100 || h > 42000) continue;
 
-      const isGEO     = h > 35000;
-      const isStation = sat.name.match(/ISS|TIANGONG|CSS/i);
-
-      // ── Inner sensor swath (nadir, ~5° half-angle)
-      const sensorRad  = h * Math.tan(5  * Math.PI / 180) * 1000; // metres
-      // ── Outer coverage (~25° off-nadir)
-      const coverageRad= h * Math.tan(25 * Math.PI / 180) * 1000;
-
+      const isGEO = h > 35000;
+      const info  = classifyReconSat(sat.name, h);
+      const cesColor = Cesium.Color.fromCssColorString(info.color);
       const groundPos = Cesium.Cartesian3.fromDegrees(pos.lng, pos.lat, 0);
 
-      // Outer coverage zone — dim cyan ring
-      if (!isGEO) {
+      // ── ACCESS AREA — maximum off-nadir pointing circle
+      // Radius = h × tan(accessDeg) in km → metres
+      const accessRadM = h * Math.tan(info.accessDeg * Math.PI / 180) * 1000;
+
+      if (!isGEO && accessRadM > 0) {
         ds.entities.add({
           position: groundPos,
           ellipse: {
-            semiMinorAxis: coverageRad,
-            semiMajorAxis: coverageRad,
-            material:      Cesium.Color.fromCssColorString('#06b6d4').withAlpha(0.04),
+            semiMinorAxis: accessRadM,
+            semiMajorAxis: accessRadM,
+            material:      cesColor.withAlpha(0.03),
             outline:       true,
-            outlineColor:  Cesium.Color.fromCssColorString('#06b6d4').withAlpha(0.25),
+            outlineColor:  cesColor.withAlpha(0.22),
             outlineWidth:  1,
             heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           },
         });
       }
 
-      // Inner sensor footprint — amber
-      const innerAlpha = isStation ? 0.15 : 0.08;
-      ds.entities.add({
-        position: groundPos,
-        ellipse: {
-          semiMinorAxis: isGEO ? 2000000 : sensorRad,  // GEO gets fixed large footprint
-          semiMajorAxis: isGEO ? 2000000 : sensorRad,
-          material:      Cesium.Color.fromCssColorString('#f59e0b').withAlpha(innerAlpha),
-          outline:       true,
-          outlineColor:  Cesium.Color.fromCssColorString('#f59e0b').withAlpha(isStation ? 0.8 : 0.45),
-          outlineWidth:  isStation ? 2 : 1,
-          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-        },
-      });
+      // ── SENSOR SWATH / INSTANTANEOUS FOOTPRINT
+      // For optical/SAR: known swath width (km) → metres radius
+      // For SIGINT/ELINT: no discrete swath, skip inner ring
+      if (info.type !== 'elint' && info.swathKm > 0) {
+        const swathRadM = (info.swathKm / 2) * 1000;
+        ds.entities.add({
+          position: groundPos,
+          ellipse: {
+            semiMinorAxis: isGEO ? 2500000 : swathRadM,
+            semiMajorAxis: isGEO ? 2500000 : swathRadM,
+            material:      cesColor.withAlpha(info.type === 'station' ? 0.12 : 0.07),
+            outline:       true,
+            outlineColor:  cesColor.withAlpha(info.type === 'station' ? 0.85 : 0.5),
+            outlineWidth:  info.type === 'station' ? 2 : 1,
+            heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+          },
+        });
+      }
 
-      // Sub-satellite crosshair point (brighter dot at nadir)
+      // ── SUB-SATELLITE POINT (nadir marker)
       ds.entities.add({
         position: groundPos,
         point: {
-          pixelSize: isStation ? 5 : 2,
-          color: Cesium.Color.fromCssColorString('#f59e0b').withAlpha(0.7),
+          pixelSize: info.type === 'station' ? 5 : 2,
+          color: cesColor.withAlpha(0.8),
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
         },
       });
 
-      // Ground track line (projected orbit ±20 min) — only for LEO
+      // ── GROUND TRACK ±20 min (LEO only)
       if (!isGEO) {
         const trackPositions = [];
-        const steps = 40;
         const spanMs = 20 * 60 * 1000;
-        for (let s = 0; s <= steps; s++) {
-          const t = new Date(date.getTime() - spanMs/2 + (spanMs * s / steps));
+        for (let s = 0; s <= 40; s++) {
+          const t = new Date(date.getTime() - spanMs / 2 + (spanMs * s / 40));
           try {
             const tp = sgp4Position(sat.tle1, sat.tle2, t);
             if (tp) trackPositions.push(Cesium.Cartesian3.fromDegrees(tp.lng, tp.lat, 0));
@@ -520,12 +611,10 @@ function renderSatFootprints(now) {
         if (trackPositions.length > 2) {
           ds.entities.add({
             polyline: {
-              positions:      trackPositions,
-              width:          isStation ? 1.5 : 0.8,
-              material:       new Cesium.ColorMaterialProperty(
-                Cesium.Color.fromCssColorString(isStation ? '#ff6600' : '#f59e0b').withAlpha(0.3)
-              ),
-              clampToGround:  true,
+              positions:  trackPositions,
+              width:      info.type === 'station' ? 1.5 : 0.7,
+              material:   new Cesium.ColorMaterialProperty(cesColor.withAlpha(0.28)),
+              clampToGround: true,
             },
           });
         }

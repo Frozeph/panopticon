@@ -90,20 +90,28 @@
 
   <div class="sb-block">
     <div class="sb-label">SATELLITE GROUPS</div>
-    <label class="chk"><input type="checkbox" checked data-satgrp="visual"> Visual (~150)</label>
-    <label class="chk"><input type="checkbox" data-satgrp="space-stations"> Stations</label>
-    <label class="chk"><input type="checkbox" data-satgrp="starlink"> Starlink</label>
+    <div class="dim tiny" style="padding:0 0 4px 0;color:#f59e0b;letter-spacing:.05em;">— RECONNAISSANCE —</div>
+    <label class="chk" title="Publicly tracked military/intelligence satellites: NRO (USA), Yaogan (China), Persona (Russia), Helios (France), Ofek (Israel), COSMO-SkyMed (Italy), SAR-Lupe (Germany)">
+      <input type="checkbox" checked data-satgrp="recon"> Military / Recon
+    </label>
+    <label class="chk" title="SAR and radar calibration satellites — often dual-use reconnaissance">
+      <input type="checkbox" data-satgrp="radar"> SAR / Radar
+    </label>
+    <label class="chk" title="Analyst catalog — gray/unclassified objects tracked by Space-Track analyst community">
+      <input type="checkbox" data-satgrp="analyst"> Analyst Catalog
+    </label>
+    <div class="dim tiny" style="padding:6px 0 4px 0;color:#888;letter-spacing:.05em;">— OTHER —</div>
+    <label class="chk"><input type="checkbox" data-satgrp="space-stations"> Space Stations</label>
     <label class="chk"><input type="checkbox" data-satgrp="weather"> Weather</label>
-    <label class="chk"><input type="checkbox" data-satgrp="gps"> GPS/GNSS</label>
     <label class="chk"><input type="checkbox" data-satgrp="geo"> GEO Belt</label>
     <div class="sb-divider"></div>
-    <label class="chk" title="Show sensor swath, coverage zone and ground track for each satellite">
+    <label class="chk" title="Show sensor footprint and access-area coverage for recon satellites">
       <input type="checkbox" id="toggle-footprints"> Coverage Footprints
     </label>
-    <div class="dim tiny" style="padding:2px 0 0 18px;line-height:1.4;">
-      <span style="color:#f59e0b">▪</span> sensor swath &nbsp;
-      <span style="color:#06b6d4">▪</span> coverage zone<br>
-      ground track ±20 min
+    <div class="dim tiny" style="padding:2px 0 0 18px;line-height:1.5;">
+      <span style="color:#f59e0b">▪</span> sensor swath (imaging strip)<br>
+      <span style="color:#06b6d4">▪</span> access area (max off-nadir)<br>
+      <span style="color:#a855f7">▪</span> SAR swath
     </div>
     <button class="sb-btn mt4" id="reload-sats">↺ RELOAD TLE</button>
   </div>
