@@ -1613,6 +1613,66 @@ app.get('/api/playback/range', (req, res) => {
   } catch { res.json({ available: false }); }
 });
 
+// ─── H3 VENDOR BOOTSTRAP ─────────────────────────────────────────────────────
+// The browser cannot load h3-js from CDN because the Cloudflare tunnel proxy
+// strips correct MIME types on passthrough responses (nosniff blocks execution).
+// Solution: server downloads the UMD bundle once and serves it locally.
+// Express serves .js files as application/javascript — no MIME mismatch.
+const H3_VENDOR_DIR  = path.join(__dirname, 'public', 'js', 'vendor');
+const H3_VENDOR_FILE = path.join(H3_VENDOR_DIR, 'h3.umd.js');
+const H3_CDN_URLS    = [
+  'https://cdn.jsdelivr.net/npm/h3-js@4.1.0/dist/browser/h3-js.umd.js',
+  'https://unpkg.com/h3-js@4.1.0/dist/browser/h3-js.umd.js',
+];
+
+function downloadH3Vendor() {
+  if (fs.existsSync(H3_VENDOR_FILE)) {
+    console.log('[H3] Vendor bundle already cached at public/js/vendor/h3.umd.js');
+    return;
+  }
+  fs.mkdirSync(H3_VENDOR_DIR, { recursive: true });
+
+  function tryUrl(urlList) {
+    if (!urlList.length) { console.warn('[H3] All CDN URLs failed — GPS jamming layer will use server-side h3 only'); return; }
+    const url = urlList[0];
+    console.log(`[H3] Downloading vendor bundle from ${url} ...`);
+    const tmpFile = H3_VENDOR_FILE + '.tmp';
+    const file    = fs.createWriteStream(tmpFile);
+
+    function doGet(getUrl, hops) {
+      if (hops > 5) { file.destroy(); fs.unlink(tmpFile, ()=>{}); tryUrl(urlList.slice(1)); return; }
+      const mod = getUrl.startsWith('https') ? https : http;
+      mod.get(getUrl, { headers: { 'User-Agent': 'NEXUS/7 node/' + process.version } }, res => {
+        if (res.statusCode === 301 || res.statusCode === 302) { return doGet(res.headers.location, hops + 1); }
+        if (res.statusCode !== 200) {
+          console.warn(`[H3] HTTP ${res.statusCode} from ${getUrl}`);
+          file.destroy(); fs.unlink(tmpFile, ()=>{}); tryUrl(urlList.slice(1)); return;
+        }
+        res.pipe(file);
+        file.on('finish', () => {
+          file.close(() => {
+            const size = fs.existsSync(tmpFile) ? fs.statSync(tmpFile).size : 0;
+            if (size < 100000) {
+              console.warn(`[H3] Downloaded file too small (${size}B) — retrying next URL`);
+              fs.unlink(tmpFile, ()=>{}); tryUrl(urlList.slice(1));
+            } else {
+              fs.renameSync(tmpFile, H3_VENDOR_FILE);
+              console.log(`[H3] h3-js vendor bundle cached (${Math.round(size/1024)}KB) — GPS jamming layer ready`);
+              // Also load server-side if npm h3-js isn't installed
+              if (!h3lib) {
+                try { h3lib = require(H3_VENDOR_FILE); console.log('[H3] Loaded server-side h3 from vendor bundle'); } catch {}
+              }
+            }
+          });
+        });
+        file.on('error', e => { console.warn('[H3] Write error:', e.message); fs.unlink(tmpFile, ()=>{}); tryUrl(urlList.slice(1)); });
+      }).on('error', e => { console.warn('[H3] Request error:', e.message); fs.unlink(tmpFile, ()=>{}); tryUrl(urlList.slice(1)); });
+    }
+    doGet(url, 0);
+  }
+  tryUrl(H3_CDN_URLS);
+}
+
 // ─── START ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
@@ -1621,4 +1681,6 @@ app.listen(PORT, '0.0.0.0', () => {
 ║  http://localhost:${PORT}                                 ║
 ║  Intel: GDELT (100+ languages) · AI Query · Ships  ║
 ╚════════════════════════════════════════════════════╝`);
+  // Download h3-js vendor bundle asynchronously after boot (non-blocking)
+  setTimeout(downloadH3Vendor, 2000);
 });

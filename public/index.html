@@ -17,7 +17,10 @@
 <link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
 <script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/satellite.js/4.1.3/satellite.min.js"></script>
-<!-- H3 library removed — hex boundary computation is now server-side via /api/jamming/convert -->
+<!-- H3 served from local vendor path — server downloads it to public/js/vendor/h3.umd.js
+     on first boot, avoiding CDN MIME-type issues through Cloudflare tunnel proxy.
+     Falls back gracefully to server-side /api/jamming/convert if not yet available. -->
+<script src="/js/vendor/h3.umd.js" onerror="console.info('[H3] Vendor not yet downloaded — server-side convert will be used')"></script>
 <link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="css/style.css">
 </head>

@@ -156,20 +156,31 @@ S.viewer.dataSources.dataSourceRemoved.addEventListener(scheduleRender);
 setInterval(scheduleRender, 2000);
 
 // 3D Buildings — Cesium OSM Buildings (Ion asset 96188, free tier)
-// Requires a valid Cesium Ion token at cesium.com/ion (free account).
-// Fails silently if the token in CFG.cesiumToken is expired/invalid.
-Cesium.createOsmBuildingsAsync().then(tileset => {
-  S.osmBuildingsTileset = S.viewer.scene.primitives.add(tileset);
-  // Slight style: dim buildings slightly so they don't overpower the dark basemap
-  tileset.style = new Cesium.Cesium3DTileStyle({
-    color: 'color("rgb(60,65,80)", 1.0)',
+// Requirements:
+//   1. Free Cesium Ion account at cesium.com/ion
+//   2. Add CESIUM_ION_TOKEN to Docker environment variables
+//   3. Asset 96188 must be added to your Ion account:
+//      → Go to https://ion.cesium.com/assets/96188 and click "Add to my assets"
+if (CFG.cesiumToken) {
+  Cesium.createOsmBuildingsAsync().then(tileset => {
+    S.osmBuildingsTileset = S.viewer.scene.primitives.add(tileset);
+    // Style: keep buildings subtle against the dark basemap
+    tileset.style = new Cesium.Cesium3DTileStyle({
+      color: 'color("rgb(55,62,78)", 1.0)',
+    });
+    log('OSM 3D Buildings loaded', 'ok');
+  }).catch(e => {
+    const msg = e?.message || String(e);
+    console.warn('[Buildings] OSM Buildings failed:', msg);
+    if (msg.includes('403') || msg.includes('Unauthorized') || msg.includes('token')) {
+      log('3D buildings: Ion token invalid or asset 96188 not added to your account → cesium.com/ion', 'warn');
+    } else {
+      log(`3D buildings unavailable: ${msg}`, 'warn');
+    }
   });
-  log('OSM Buildings loaded', 'ok');
-}).catch(() => {
-  // Silently skip — token likely expired. User can update CFG.cesiumToken
-  // with a free token from https://cesium.com/ion/tokens
-  console.info('[Buildings] OSM Buildings unavailable — update CFG.cesiumToken with a free Ion token');
-});
+} else {
+  console.info('[Buildings] Skipping OSM Buildings — no CESIUM_ION_TOKEN set. Add it to Docker env to enable 3D buildings.');
+}
 
 // ─── BASEMAP ──────────────────────────────────────────────────────────────────
 // No Ion dependency — use free tile providers so it works without a Cesium token
@@ -797,67 +808,112 @@ async function fetchMilitary() {
 }
 
 function renderFlights(states, isMilitary) {
-  const dsKey = isMilitary ? 'militaryDs' : 'flightDs';
-  if (S[dsKey]) S.viewer.dataSources.remove(S[dsKey], true);
-  if (!S.layers[isMilitary ? 'military' : 'flights']) return;
+  const dsKey    = isMilitary ? 'militaryDs' : 'flightDs';
+  const layerKey = isMilitary ? 'military'   : 'flights';
+  const prefix   = isMilitary ? 'mil'        : 'ac';
 
-  const ds = new Cesium.CustomDataSource(isMilitary ? 'military' : 'flights');
+  // Snapshot trail positions on every render cycle
+  snapshotFlightTrails(states);
+
+  if (!S.layers[layerKey]) {
+    if (S[dsKey]) { S.viewer.dataSources.remove(S[dsKey], true); S[dsKey] = null; }
+    renderTrails();
+    return;
+  }
+
   const bbox = getViewportBbox();
 
+  // Build map of valid states for this cycle
+  const incoming = new Map();
   for (const s of states) {
     const icao = s[0], callsign = (s[1]||'').trim(), lon = s[5], lat = s[6];
     const altM = s[7] ?? s[13] ?? 0;
-    const speed = s[9] ?? 0;
-    const track = s[10] ?? 0;
-    const onGround = s[8];
-
+    const speed = s[9] ?? 0, track = s[10] ?? 0, onGround = s[8];
     if (lon == null || lat == null || isNaN(lon) || isNaN(lat)) continue;
-    // Viewport cull for civil flights only (military data is always global)
     if (!isMilitary && bbox && S.cameraAlt < 3000000 &&
-        (lat < bbox.minLat || lat > bbox.maxLat || lon < bbox.minLon || lon > bbox.maxLon)) {
-      continue;
-    }
-
-    const color = isMilitary ? '#ff3333' : altColor(altM);
+        (lat < bbox.minLat || lat > bbox.maxLat || lon < bbox.minLon || lon > bbox.maxLon)) continue;
     const altFt = Math.round((altM || 0) * 3.28084);
     const spdKt = Math.round((speed || 0) * 1.944);
-
-    const cesColor = Cesium.Color.fromCssColorString(color);
-    const displayAlt = Math.max(altM || 0, 10); // keep at least 10m so entity shows above terrain
-    ds.entities.add({
-      id: `${isMilitary?'mil':'ac'}_${icao}`,
-      name: callsign || icao || 'Unknown',
-      position: Cesium.Cartesian3.fromDegrees(lon, lat, displayAlt),
-      // Use point + label — more reliable than SVG billboard in Cesium 1.107+
-      point: {
-        pixelSize: isMilitary ? 7 : 5,
-        color: cesColor.withAlpha(0.95),
-        outlineColor: Cesium.Color.BLACK.withAlpha(0.7),
-        outlineWidth: isMilitary ? 2 : 1,
-        scaleByDistance: new Cesium.NearFarScalar(1e5, 1.8, 8e6, 0.5),
-        heightReference: (altM || 0) < 50 ? Cesium.HeightReference.CLAMP_TO_GROUND : Cesium.HeightReference.NONE,
-      },
-      label: {
-        text: `${callsign||icao}\n${altFt ? altFt.toLocaleString()+'ft' : 'GND'} ${spdKt}kt`,
-        font: '10px JetBrains Mono, monospace',
-        fillColor: cesColor.withAlpha(0.95),
-        outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
-        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset: new Cesium.Cartesian2(0, -18),
-        translucencyByDistance: new Cesium.NearFarScalar(5e5, 1, 3e6, 0),
-        backgroundColor: new Cesium.Color(0,0,0,0.45),
-        showBackground: true,
-      },
-      properties: {
-        type: isMilitary ? 'military' : 'flight',
-        icao, callsign, lat, lon, altM, altFt, speed, spdKt, track,
-        onGround, country: s[2],
-      },
-    });
+    const displayAlt = Math.max(altM || 0, 10);
+    const color = isMilitary ? '#ff3333' : altColor(altM);
+    incoming.set(`${prefix}_${icao}`, { icao, callsign, lon, lat, altM, altFt, speed, spdKt, track, onGround, displayAlt, color, country: s[2] });
   }
 
-  S.viewer.dataSources.add(ds);
-  S[dsKey] = ds;
+  // Create DataSource on first call (never removed unless layer disabled)
+  if (!S[dsKey]) {
+    S[dsKey] = new Cesium.CustomDataSource(isMilitary ? 'military' : 'flights');
+    S.viewer.dataSources.add(S[dsKey]);
+  }
+  const ds = S[dsKey];
+
+  // Remove stale entities (aircraft no longer in data)
+  const toRemove = [];
+  for (const e of ds.entities.values) { if (!incoming.has(e.id)) toRemove.push(e); }
+  toRemove.forEach(e => ds.entities.remove(e));
+
+  // Update existing or add new entities
+  for (const [id, sp] of incoming) {
+    const { icao, callsign, lon, lat, altM, altFt, spdKt, track, onGround, displayAlt, color, country, speed } = sp;
+    const cesColor   = Cesium.Color.fromCssColorString(color);
+    const labelText  = `${callsign||icao}\n${altFt ? altFt.toLocaleString()+'ft' : 'GND'} ${spdKt}kt`;
+    const newPos     = Cesium.Cartesian3.fromDegrees(lon, lat, displayAlt);
+    const hRef       = (altM || 0) < 50 ? Cesium.HeightReference.CLAMP_TO_GROUND : Cesium.HeightReference.NONE;
+
+    const existing = ds.entities.getById(id);
+    if (existing) {
+      // ── Incremental update: only mutate what changes each cycle ──
+      existing.position  = newPos;
+      existing.name      = callsign || icao || 'Unknown';
+      existing.point.color              = cesColor.withAlpha(0.95);
+      existing.point.heightReference    = hRef;
+      existing.label.text               = labelText;
+      existing.label.fillColor          = cesColor.withAlpha(0.95);
+      // Update mutable properties
+      existing.properties.lat       = lat;
+      existing.properties.lon       = lon;
+      existing.properties.altM      = altM;
+      existing.properties.altFt     = altFt;
+      existing.properties.speed     = speed;
+      existing.properties.spdKt     = spdKt;
+      existing.properties.track     = track;
+      existing.properties.onGround  = onGround;
+    } else {
+      // ── First time we see this aircraft ──
+      ds.entities.add({
+        id,
+        name: callsign || icao || 'Unknown',
+        position: newPos,
+        point: {
+          pixelSize:   isMilitary ? 7 : 5,
+          color:       cesColor.withAlpha(0.95),
+          outlineColor: Cesium.Color.BLACK.withAlpha(0.7),
+          outlineWidth: isMilitary ? 2 : 1,
+          scaleByDistance: new Cesium.NearFarScalar(1e5, 1.8, 8e6, 0.5),
+          heightReference: hRef,
+          disableDepthTestDistance: 1e6,
+        },
+        label: {
+          text:     labelText,
+          font:     '10px JetBrains Mono, monospace',
+          fillColor: cesColor.withAlpha(0.95),
+          outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
+          style:    Cesium.LabelStyle.FILL_AND_OUTLINE,
+          pixelOffset: new Cesium.Cartesian2(0, -18),
+          translucencyByDistance: new Cesium.NearFarScalar(5e5, 1, 3e6, 0),
+          backgroundColor: new Cesium.Color(0,0,0,0.45),
+          showBackground: true,
+        },
+        properties: {
+          type: isMilitary ? 'military' : 'flight',
+          icao, callsign, lat, lon, altM, altFt, speed, spdKt, track, onGround, country,
+        },
+      });
+    }
+  }
+
+  // Rebuild trail polylines for all visible aircraft
+  renderTrails();
+  scheduleRender();
 }
 
 // ─── SHIPS ────────────────────────────────────────────────────────────────────
@@ -883,6 +939,92 @@ function shipIcon(color, heading, type) {
   const isPassenger = (type >= 60 && type <= 69);
   const w = isTanker ? 18 : isPassenger ? 16 : 14;
   return `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${w}" viewBox="0 0 16 16"><g transform="rotate(${h},8,8)"><path d="M8 1 L11 12 L8 10 L5 12 Z" fill="${color}" stroke="#000" stroke-width="0.5"/></g></svg>`)}`;
+}
+
+// ─── FLIGHT TRAIL STORE ───────────────────────────────────────────────────────
+// ADS-B Exchange style: always-on trail polylines for each aircraft.
+// Position history is accumulated on every fetchFlights/fetchMilitary cycle (10s).
+// renderTrails() draws a fading polyline behind each aircraft visible in the viewport.
+S.flightTrailStore = new Map(); // icao → [{lat, lon, altM, ts}]
+S.trailDs          = null;
+const TRAIL_MAX_PTS   = 30;          // keep last 30 positions (~5 minutes at 10s refresh)
+const TRAIL_MAX_AGE   = 12 * 60000;  // purge points older than 12 min
+const TRAIL_MAX_ALT   = 1200000;     // hide trails when camera is too far out (>1200km)
+
+function snapshotFlightTrails(states) {
+  const now = Date.now();
+  for (const s of states) {
+    const icao = s[0];
+    const lon  = s[5], lat = s[6], altM = s[7] ?? 0;
+    if (!icao || !isFinite(lat) || !isFinite(lon)) continue;
+    if (!S.flightTrailStore.has(icao)) S.flightTrailStore.set(icao, []);
+    const trail = S.flightTrailStore.get(icao);
+    const last  = trail[trail.length - 1];
+    if (last && now - last.ts < 8000) continue; // rate-limit: 1 point per 8s minimum
+    trail.push({ lat, lon, altM, ts: now });
+    if (trail.length > TRAIL_MAX_PTS) trail.shift();
+  }
+  // Prune stale trails for aircraft no longer seen
+  const cutoff = now - TRAIL_MAX_AGE;
+  for (const [icao, trail] of S.flightTrailStore) {
+    while (trail.length && trail[0].ts < cutoff) trail.shift();
+    if (!trail.length) S.flightTrailStore.delete(icao);
+  }
+}
+
+function renderTrails() {
+  if (S.cameraAlt > TRAIL_MAX_ALT || (!S.layers.flights && !S.layers.military)) {
+    if (S.trailDs) { S.viewer.dataSources.remove(S.trailDs, true); S.trailDs = null; }
+    return;
+  }
+  if (!S.trailDs) {
+    S.trailDs = new Cesium.CustomDataSource('trails');
+    S.viewer.dataSources.add(S.trailDs);
+  }
+
+  const ds  = S.trailDs;
+  const ids = new Set();
+
+  for (const [icao, trail] of S.flightTrailStore) {
+    if (trail.length < 2) continue;
+    const trailId = `trail_${icao}`;
+    ids.add(trailId);
+
+    // Determine color from the most recent position's altitude
+    const last     = trail[trail.length - 1];
+    const isMil    = !!S.militaryDs?.entities.getById(`mil_${icao}`);
+    const color    = isMil ? '#ff4444' : altColor(last.altM);
+    const cesColor = Cesium.Color.fromCssColorString(color);
+    const positions = trail.map(p => Cesium.Cartesian3.fromDegrees(p.lon, p.lat, Math.max(p.altM || 0, 10)));
+
+    const existing = ds.entities.getById(trailId);
+    if (existing) {
+      // Update polyline positions in-place
+      existing.polyline.positions = new Cesium.ConstantProperty(positions);
+      existing.polyline.material  = new Cesium.ConstantProperty(
+        new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.08, color: cesColor.withAlpha(0.75), taperPower: 0.9 })
+      );
+    } else {
+      ds.entities.add({
+        id: trailId,
+        polyline: {
+          positions,
+          width:    1.5,
+          material: new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.08, color: cesColor.withAlpha(0.75), taperPower: 0.9 }),
+          arcType:  Cesium.ArcType.GEODESIC,
+        },
+      });
+    }
+  }
+
+  // Remove trails for aircraft no longer in store
+  const toRemove = [];
+  for (const e of ds.entities.values) {
+    if (!ids.has(e.id)) toRemove.push(e);
+  }
+  toRemove.forEach(e => ds.entities.remove(e));
+
+  scheduleRender();
 }
 
 // ─── AISSTREAM.IO CLIENT-SIDE WEBSOCKET ───────────────────────────────────────
@@ -1162,19 +1304,19 @@ function renderFires(fires) {
 }
 
 // ─── GPS JAMMING ──────────────────────────────────────────────────────────────
-// GPS Jamming — two-path fetch strategy:
-//  1. Browser fetches CSV directly from gpsjam.org (residential IP, bypasses Cloudflare WAF),
-//     then POSTs raw hex IDs to /api/jamming/convert for server-side H3 boundary computation.
-//  2. Falls back to /api/jamming server proxy (single call: fetch + convert).
-// No h3-js browser library needed — all H3 computation is server-side.
+// Three-path strategy (best to worst):
+//  1. window.h3 available (vendor bundle downloaded): browser fetches CSV + renders directly
+//  2. window.h3 unavailable: browser fetches CSV → POST to /api/jamming/convert (server-side h3)
+//  3. All direct fetches fail: GET /api/jamming (server-side fetch + convert in one call)
 async function fetchJamming() {
   if (!S.layers.jamming) return;
 
-  // --- Attempt 1: browser fetches CSV → server converts hex IDs to polygons ---
   const dates = [0, 1, 2].map(n => {
     const d = new Date(Date.now() - n * 86400000);
     return d.toISOString().substring(0, 10);
   });
+
+  // --- Attempt 1 & 2: browser direct fetch from gpsjam.org (residential IP) ---
   for (const date of dates) {
     try {
       const r = await fetch(`https://gpsjam.org/data/jamming-${date}.csv`, { mode: 'cors' });
@@ -1186,69 +1328,92 @@ async function fetchJamming() {
         .map(l => { const p = l.split(','); return { h: p[0]?.trim(), p: Math.round(parseFloat(p[1])) }; })
         .filter(h => h.h && !isNaN(h.p) && h.p >= 2);
       if (hexes.length === 0) continue;
-      // POST hex IDs to server for H3 → polygon conversion (no h3-js in browser)
-      const conv = await fetch('/api/jamming/convert', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hexes }),
-      });
-      if (!conv.ok) throw new Error(`convert ${conv.status}`);
-      const { polygons } = await conv.json();
-      if (polygons && polygons.length > 0) {
-        renderJamming(polygons, date);
-        log(`GPS Jam: ${polygons.length} polygons (direct+convert) for ${date}`);
+
+      if (window.h3) {
+        // Path 1: client-side h3 (vendor bundle loaded) — fastest, no server round-trip
+        renderJamming({ hexes }, date);
+        log(`GPS Jam: ${hexes.length} cells (direct+h3) for ${date}`);
         return;
+      } else {
+        // Path 2: server-side H3 conversion — h3.umd.js not yet downloaded
+        try {
+          const conv = await fetch('/api/jamming/convert', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hexes }),
+          });
+          if (!conv.ok) throw new Error(`convert ${conv.status}`);
+          const { polygons } = await conv.json();
+          if (polygons && polygons.length > 0) {
+            renderJamming({ polygons }, date);
+            log(`GPS Jam: ${polygons.length} polygons (direct+server-convert) for ${date}`);
+            return;
+          }
+        } catch(convErr) {
+          log(`GPS Jam: server convert failed (${convErr.message}) — trying proxy`, 'warn');
+          break;
+        }
       }
-    } catch(_) { break; }
+    } catch(_) { break; } // CORS blocked or network error — fall through
   }
 
-  // --- Attempt 2: server proxy (fetches + converts in one hop) ---
+  // --- Attempt 3: server proxy (fetches CSV + converts in one hop) ---
   try {
     const r = await fetch('/api/jamming');
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     if ((data.polygons || []).length > 0) {
-      renderJamming(data.polygons, data.date);
+      renderJamming({ polygons: data.polygons }, data.date);
       log(`GPS Jam: ${data.count} polygons (proxy) for ${data.date}`);
+    } else if ((data.hexes || []).length > 0 && window.h3) {
+      renderJamming({ hexes: data.hexes }, data.date);
+      log(`GPS Jam: ${data.hexes.length} cells (proxy+h3) for ${data.date}`);
     } else {
-      log(`GPS Jam: no data — ${data.error || 'empty'}. gpsjam.org may be blocking server IP.`, 'warn');
+      log(`GPS Jam: no data — ${data.error || 'empty'}. Try restarting to re-download h3 vendor bundle.`, 'warn');
     }
   } catch(e) { log(`Jamming fetch failed: ${e.message}`, 'warn'); }
 }
 
-// renderJamming — accepts polygons array from server: [{coords: [[lng,lat],...], p: number}]
-// No h3-js library needed in the browser — boundaries are pre-computed server-side.
-function renderJamming(polygons, date) {
+// renderJamming — accepts { hexes } (client-side h3) OR { polygons } (pre-computed server-side)
+function renderJamming({ hexes, polygons }, date) {
   if (S.jammingDs) S.viewer.dataSources.remove(S.jammingDs, true);
   if (!S.layers.jamming) return;
-
   const ds = new Cesium.CustomDataSource('jamming');
   let rendered = 0;
 
-  for (const poly of polygons) {
-    try {
+  // Build a unified list of { degArr, pct } regardless of input format
+  const items = [];
+  if (polygons) {
+    for (const poly of polygons) {
       const { coords, p } = poly;
       if (!coords || coords.length < 3) continue;
-      // Validate all coords are finite — NaN causes wgs84To2DModelMatrix crash
       if (coords.some(([lng, lat]) => !isFinite(lng) || !isFinite(lat))) continue;
+      items.push({ degArr: coords.flatMap(([lng, lat]) => [lng, lat]), pct: Math.min(100, Math.max(0, p)) });
+    }
+  } else if (hexes && window.h3) {
+    const h3lib = window.h3;
+    const capped = hexes.length > 600 ? [...hexes].sort((a,b)=>b.p-a.p).slice(0,600) : hexes;
+    for (const h of capped) {
+      try {
+        const boundary = h3lib.cellToBoundary(h.h); // [[lat,lng],...]
+        if (!boundary || boundary.length < 3) continue;
+        if (boundary.some(([lat, lng]) => !isFinite(lat) || !isFinite(lng))) continue;
+        items.push({ degArr: boundary.flatMap(([lat, lng]) => [lng, lat]), pct: Math.min(100, Math.max(0, h.p)) });
+      } catch {}
+    }
+  }
 
-      const pct   = Math.min(100, Math.max(0, p));
-      const alpha = 0.15 + (pct / 100) * 0.65;
-      const color = pct > 70 ? '#ff2222' : pct > 40 ? '#ff6600' : '#ffcc00';
+  for (const { degArr, pct } of items) {
+    try {
+      const alpha    = 0.15 + (pct / 100) * 0.65;
+      const color    = pct > 70 ? '#ff2222' : pct > 40 ? '#ff6600' : '#ffcc00';
       const cesColor = Cesium.Color.fromCssColorString(color);
-
-      // coords are already [lng, lat] — flatten to [lng, lat, lng, lat, ...] for fromDegreesArray
-      const degArr = coords.flatMap(([lng, lat]) => [lng, lat]);
-
       ds.entities.add({
         name: `GPS Jamming ${pct}%`,
         polygon: {
-          hierarchy: new Cesium.PolygonHierarchy(
-            Cesium.Cartesian3.fromDegreesArray(degArr)
-          ),
+          hierarchy:          new Cesium.PolygonHierarchy(Cesium.Cartesian3.fromDegreesArray(degArr)),
           material:           cesColor.withAlpha(alpha * 0.6),
-          // NOTE: outline:true is INCOMPATIBLE with classificationType:TERRAIN — omit outline.
-          classificationType: Cesium.ClassificationType.TERRAIN,
+          classificationType: Cesium.ClassificationType.TERRAIN, // outline omitted — incompatible with TERRAIN
         },
         properties: { type: 'jamming', probability: pct },
       });
@@ -1259,7 +1424,7 @@ function renderJamming(polygons, date) {
   S.viewer.dataSources.add(ds);
   S.jammingDs = ds;
   scheduleRender();
-  log(`GPS Jamming: ${rendered} rendered of ${polygons.length} total — ${date}`);
+  log(`GPS Jamming: ${rendered} rendered of ${items.length} total — ${date}`);
 }
 
 // ─── MESHTASTIC ───────────────────────────────────────────────────────────────
@@ -2097,7 +2262,9 @@ async function initPlayback() {
 async function init() {
   log('NEXUS v7.0 initialising…');
 
-  // H3 computation is server-side — no browser library required for GPS jamming layer
+  // H3 vendor bundle — downloaded by server on first boot, served from /js/vendor/h3.umd.js
+  if (window.h3) log('H3 ready — GPS jamming layer will use client-side hex rendering', 'ok');
+  else log('H3 vendor not yet loaded — jamming will use server-side convert endpoint', 'info');
 
   // Polling intervals (layers auto-short-circuit if disabled)
   startPolling();
